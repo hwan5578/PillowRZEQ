@@ -8,6 +8,7 @@
 namespace pillow::ids
 {
     // 전역
+    inline constexpr const char* quality = "quality";   // v0.3: 0 = ZERO LATENCY, 1 = HQ
     inline constexpr const char* routing = "routing";
     inline constexpr const char* link    = "link";
     inline constexpr const char* steps   = "steps";
@@ -53,11 +54,12 @@ namespace pillow
 }
 
 //==============================================================================
-class PillowRZAudioProcessor : public juce::AudioProcessor
+class PillowRZAudioProcessor : public juce::AudioProcessor,
+                               private juce::AsyncUpdater
 {
 public:
     PillowRZAudioProcessor();
-    ~PillowRZAudioProcessor() override = default;
+    ~PillowRZAudioProcessor() override;
 
     //==========================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -66,7 +68,7 @@ public:
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     using juce::AudioProcessor::processBlock;
 
-    // 호스트 바이패스 시에도 오버샘플링 지연만큼 똑같이 지연시켜야 클릭/콤필터가 안 생김
+    // 호스트 바이패스 시에도 (HQ 모드면) 오버샘플링 지연만큼 똑같이 지연시켜야 클릭/콤필터가 안 생김
     void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     using juce::AudioProcessor::processBlockBypassed;
 
@@ -95,13 +97,25 @@ public:
     bool isSteppedMode() const noexcept { return paramSteps->load() >= 0.5f; }
     int getNumChannelsInUse() const noexcept { return numChannelsInUse.load(); }
 
-    // 응답 곡선 계산용 처리 레이트 (오버샘플링 포함). 아직 준비 전이면 48k 기준.
+    // 응답 곡선 계산용 처리 레이트 (지금 소리를 내는 모드 기준). 아직 준비 전이면 48k 기준.
     double getProcessingRate() const noexcept { return processingRate.load(); }
+
+    // 지금 소리를 내는 모드 (전환 페이드가 끝난 뒤 바뀜)
+    bool isHqActive() const noexcept { return activeHq.load(); }
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     juce::AudioProcessorValueTreeState apvts;
 
 private:
+    // 모드 전환: 5 ms 페이드아웃 -> (블록 경계에서) 경로 교체·초기화 -> 5 ms 페이드인
+    enum class Fade { None, Out, In };
+
+    void handleAsyncUpdate() override;            // 레이턴시 보고 (메시지 스레드)
+    int latencyFor (bool hq) const noexcept;
+    void switchPath (bool toHq) noexcept;         // 오디오 스레드
+    void runActivePath (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
+    void applyFade (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
+
     struct ModulePtrs
     {
         std::atomic<float>* mode = nullptr;
@@ -117,6 +131,7 @@ private:
         std::atomic<float>* output = nullptr;
     };
 
+    std::atomic<float>* paramQuality = nullptr;
     std::atomic<float>* paramRouting = nullptr;
     std::atomic<float>* paramLink    = nullptr;
     std::atomic<float>* paramSteps   = nullptr;
@@ -129,12 +144,24 @@ private:
     std::atomic<float>* paramXfHigh  = nullptr;
     std::array<ModulePtrs, 2> modulePtrs;
 
-    pillow::rz::Engine engine;
-    std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
+    // ZERO LATENCY: 세션 레이트 그대로 (ADAA 안티에일리어싱 + 매칭 EQ), 레이턴시 0
+    // HQ: 오버샘플링 (44.1/48k 4배, 88.2/96k 2배, 그 위는 그대로), 레이턴시 = 오버샘플링 필터 지연
+    pillow::rz::Engine engineZero, engineHq;
+    std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;   // HQ에서 배율이 1보다 클 때만
+    double baseRate = 48000.0;
+    int hqOrder = 0;
     int maxBlockSize = 0;
     int numProcessChannels = 0;
-    std::atomic<int> numChannelsInUse { 2 };
-    std::atomic<double> processingRate { pillow::rz::processingRateFor (48000.0) };
+    bool prepared = false;
+
+    bool  hq = false;                 // 오디오 스레드 전용: 지금 쓰는 경로
+    Fade  fade = Fade::None;
+    float fadeGain = 1.0f, fadeStep = 0.0f;
+
+    std::atomic<bool>   activeHq { false };
+    std::atomic<int>    pendingLatency { 0 };
+    std::atomic<int>    numChannelsInUse { 2 };
+    std::atomic<double> processingRate { 48000.0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PillowRZAudioProcessor)
 };

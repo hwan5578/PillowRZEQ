@@ -68,6 +68,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
     // ── 전역 ────────────────────────────────────────────────────────────────
+    // 레이턴시가 바뀌는 설정이라 자동화는 막아 둠 (재생 중 전환 자체는 페이드로 안전)
+    layout.add (std::make_unique<juce::AudioParameterChoice> (
+        juce::ParameterID { pillow::ids::quality, 3 }, "Quality",
+        juce::StringArray { "Zero Latency", "HQ (Oversampled)" }, 0,
+        juce::AudioParameterChoiceAttributes().withAutomatable (false)));
+
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         juce::ParameterID { pillow::ids::routing, 2 }, "Routing",
         juce::StringArray { "Stereo (L/R)", "Mid / Side" }, 0));
@@ -165,6 +171,7 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
+    paramQuality = apvts.getRawParameterValue (pillow::ids::quality);
     paramRouting = apvts.getRawParameterValue (pillow::ids::routing);
     paramLink    = apvts.getRawParameterValue (pillow::ids::link);
     paramSteps   = apvts.getRawParameterValue (pillow::ids::steps);
@@ -196,9 +203,14 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
                  && p.presQ != nullptr && p.drive != nullptr && p.output != nullptr);
     }
 
-    jassert (paramRouting != nullptr && paramLink != nullptr && paramSteps != nullptr && paramEqOn != nullptr
-             && paramDriveOn != nullptr && paramFocus != nullptr && paramMix != nullptr
+    jassert (paramQuality != nullptr && paramRouting != nullptr && paramLink != nullptr && paramSteps != nullptr
+             && paramEqOn != nullptr && paramDriveOn != nullptr && paramFocus != nullptr && paramMix != nullptr
              && paramXfLow != nullptr && paramXfMid != nullptr && paramXfHigh != nullptr);
+}
+
+PillowRZAudioProcessor::~PillowRZAudioProcessor()
+{
+    cancelPendingUpdate();
 }
 
 //==============================================================================
@@ -238,28 +250,76 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
 //==============================================================================
 void PillowRZAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    const int order = rz::oversamplingOrderFor (sampleRate);
+    prepared = false;
+    baseRate = sampleRate > 0.0 ? sampleRate : 48000.0;
+    hqOrder  = rz::oversamplingOrderFor (baseRate);
 
     numProcessChannels = juce::jlimit (1, 2, getTotalNumOutputChannels());
     numChannelsInUse.store (numProcessChannels);
     maxBlockSize = juce::jmax (1, samplesPerBlock);
 
-    // EQ·튜브·트랜스포머를 모두 오버샘플된 레이트에서 처리 (IIR 하프밴드: 지연이 짧고 아날로그 같은 위상)
-    oversampler = std::make_unique<juce::dsp::Oversampling<float>> (
-        (size_t) numProcessChannels, (size_t) order,
-        juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR,
-        true,    // 최고 품질
-        true);   // 정수 레이턴시 (호스트 지연 보상이 정확해짐)
-    oversampler->initProcessing ((size_t) maxBlockSize);   // 내부에서 reset 포함
+    // HQ: IIR 하프밴드 오버샘플링 (지연이 짧고 아날로그 같은 위상)
+    if (hqOrder > 0)
+    {
+        oversampler = std::make_unique<juce::dsp::Oversampling<float>> (
+            (size_t) numProcessChannels, (size_t) hqOrder,
+            juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR,
+            true,    // 최고 품질
+            true);   // 정수 레이턴시 (호스트 지연 보상이 정확해짐)
+        oversampler->initProcessing ((size_t) maxBlockSize);   // 내부에서 reset 포함
+    }
+    else
+    {
+        oversampler.reset();
+    }
 
-    const double rate = sampleRate * (double) (1 << order);
-    processingRate.store (rate);
+    // 두 경로 모두 미리 준비 (전환할 때 오디오 스레드에서 메모리 할당이 없도록)
+    const auto params = readParams();
+    engineZero.prepare (baseRate, numProcessChannels, maxBlockSize);
+    engineHq.prepare (baseRate * (double) (1 << hqOrder), numProcessChannels, maxBlockSize << hqOrder);
+    for (auto* e : { &engineZero, &engineHq })
+    {
+        e->setParams (params);
+        e->reset();
+    }
 
-    engine.prepare (rate, numProcessChannels, maxBlockSize << order);
+    hq = paramQuality->load() >= 0.5f;
+    fade = Fade::None;
+    fadeGain = 1.0f;
+    fadeStep = (float) (1.0 / (0.005 * baseRate));   // 5 ms
+    activeHq.store (hq);
+    processingRate.store (hq ? baseRate * (double) (1 << hqOrder) : baseRate);
+
+    const int latency = latencyFor (hq);
+    pendingLatency.store (latency);
+    setLatencySamples (latency);
+    prepared = true;
+}
+
+int PillowRZAudioProcessor::latencyFor (bool useHq) const noexcept
+{
+    return (useHq && oversampler != nullptr) ? (int) std::lround (oversampler->getLatencyInSamples()) : 0;
+}
+
+void PillowRZAudioProcessor::handleAsyncUpdate()
+{
+    setLatencySamples (pendingLatency.load());
+}
+
+// 경로 교체 (오디오 스레드, 소리가 0인 순간에만 호출)
+void PillowRZAudioProcessor::switchPath (bool toHq) noexcept
+{
+    hq = toHq;
+    auto& engine = hq ? engineHq : engineZero;
     engine.setParams (readParams());
-    engine.reset();
+    engine.reset();                          // 오래된 필터 상태가 튀어나오지 않게
+    if (hq && oversampler != nullptr)
+        oversampler->reset();
 
-    setLatencySamples ((int) std::lround (oversampler->getLatencyInSamples()));
+    activeHq.store (hq);
+    processingRate.store (hq ? baseRate * (double) (1 << hqOrder) : baseRate);
+    pendingLatency.store (latencyFor (hq));
+    triggerAsyncUpdate();                    // 호스트에 새 레이턴시 알림은 메시지 스레드에서
 }
 
 bool PillowRZAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -270,6 +330,45 @@ bool PillowRZAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts)
     return layouts.getMainInputChannelSet() == out;
 }
 
+void PillowRZAudioProcessor::runActivePath (juce::dsp::AudioBlock<float>& block, int numCh) noexcept
+{
+    std::array<float*, 2> ptrs {};
+
+    if (hq && oversampler != nullptr)
+    {
+        auto osBlock = oversampler->processSamplesUp (block);
+        for (int c = 0; c < numCh; ++c)
+            ptrs[(size_t) c] = osBlock.getChannelPointer ((size_t) c);
+        engineHq.process (ptrs.data(), numCh, (int) osBlock.getNumSamples());
+        oversampler->processSamplesDown (block);
+    }
+    else
+    {
+        for (int c = 0; c < numCh; ++c)
+            ptrs[(size_t) c] = block.getChannelPointer ((size_t) c);
+        (hq ? engineHq : engineZero).process (ptrs.data(), numCh, (int) block.getNumSamples());
+    }
+}
+
+void PillowRZAudioProcessor::applyFade (juce::dsp::AudioBlock<float>& block, int numCh) noexcept
+{
+    if (fade == Fade::None)
+        return;
+
+    const int n = (int) block.getNumSamples();
+    for (int i = 0; i < n; ++i)
+    {
+        if (fade == Fade::Out)      fadeGain = juce::jmax (0.0f, fadeGain - fadeStep);
+        else if (fade == Fade::In)  fadeGain = juce::jmin (1.0f, fadeGain + fadeStep);
+
+        for (int c = 0; c < numCh; ++c)
+            block.getChannelPointer ((size_t) c)[i] *= fadeGain;
+    }
+
+    if (fade == Fade::In && fadeGain >= 1.0f)
+        fade = Fade::None;
+}
+
 void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
@@ -278,14 +377,31 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
         buffer.clear (ch, 0, numSamples);
 
-    if (oversampler == nullptr || numSamples == 0)
+    if (! prepared || numSamples == 0)
         return;
-
-    engine.setParams (readParams());
 
     const int numCh = juce::jmin (numProcessChannels, buffer.getNumChannels());
     if (numCh <= 0)
         return;
+
+    // 모드 전환: 페이드아웃이 끝났으면(소리 0) 이 블록부터 새 경로
+    const bool wantHq = paramQuality->load() >= 0.5f;
+    if (fade == Fade::Out && fadeGain <= 0.0f)
+    {
+        if (wantHq != hq)
+            switchPath (wantHq);
+        fade = Fade::In;
+    }
+    else if (wantHq != hq)
+    {
+        fade = Fade::Out;                    // 페이드인 도중이면 지금 크기에서 다시 내려감
+    }
+    else if (fade == Fade::Out)
+    {
+        fade = Fade::In;                     // 페이드아웃 도중에 원래대로 돌려놓으면 바로 복귀
+    }
+
+    (hq ? engineHq : engineZero).setParams (readParams());
 
     juce::dsp::AudioBlock<float> fullBlock (buffer.getArrayOfWritePointers(),
                                             (size_t) numCh, (size_t) numSamples);
@@ -295,16 +411,8 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     {
         const int len = juce::jmin (maxBlockSize, numSamples - start);
         auto block = fullBlock.getSubBlock ((size_t) start, (size_t) len);
-
-        auto osBlock = oversampler->processSamplesUp (block);
-
-        std::array<float*, 2> ptrs {};
-        for (int c = 0; c < numCh; ++c)
-            ptrs[(size_t) c] = osBlock.getChannelPointer ((size_t) c);
-
-        engine.process (ptrs.data(), numCh, (int) osBlock.getNumSamples());
-
-        oversampler->processSamplesDown (block);
+        runActivePath (block, numCh);
+        applyFade (block, numCh);
     }
 }
 
@@ -316,8 +424,18 @@ void PillowRZAudioProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
         buffer.clear (ch, 0, numSamples);
 
-    if (oversampler == nullptr || numSamples == 0)
+    if (! prepared || numSamples == 0)
         return;
+
+    // 바이패스 중에 모드를 바꾸면 바로 적용 (레이턴시도 바로 맞춤)
+    const bool wantHq = paramQuality->load() >= 0.5f;
+    if (wantHq != hq)
+        switchPath (wantHq);
+    fade = Fade::None;
+    fadeGain = 1.0f;
+
+    if (! hq || oversampler == nullptr)
+        return;   // ZERO LATENCY: 원신호 그대로
 
     const int numCh = juce::jmin (numProcessChannels, buffer.getNumChannels());
     if (numCh <= 0)
@@ -326,7 +444,7 @@ void PillowRZAudioProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     juce::dsp::AudioBlock<float> fullBlock (buffer.getArrayOfWritePointers(),
                                             (size_t) numCh, (size_t) numSamples);
 
-    // EQ/튜브는 건너뛰고 같은 오버샘플링 필터만 통과 -> 처리할 때와 똑같은 지연
+    // HQ: EQ/튜브는 건너뛰고 같은 오버샘플링 필터만 통과 -> 처리할 때와 똑같은 지연
     for (int start = 0; start < numSamples; start += maxBlockSize)
     {
         const int len = juce::jmin (maxBlockSize, numSamples - start);

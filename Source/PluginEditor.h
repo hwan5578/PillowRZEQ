@@ -178,9 +178,9 @@ private:
     pillow::ui::ResponseView response;
     pillow::ui::ModulePanel module1, module2;
     pillow::ui::GlobalPanel global;
-    juce::ToggleButton routingSwitch, linkSwitch, stepsSwitch;
+    juce::ToggleButton qualitySwitch, routingSwitch, linkSwitch, stepsSwitch;
 
-    std::unique_ptr<pillow::ui::ButtonAttachment> routingAttachment, linkAttachment, stepsAttachment;
+    std::unique_ptr<pillow::ui::ButtonAttachment> qualityAttachment, routingAttachment, linkAttachment, stepsAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PillowRZAudioProcessorEditor)
 };

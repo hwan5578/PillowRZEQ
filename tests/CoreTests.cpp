@@ -1,5 +1,5 @@
 // =============================================================================
-//  Pillow RZ EQ v0.2 — DSP 코어 단독 테스트 (JUCE 불필요)
+//  Pillow RZ EQ v0.3 — DSP 코어 단독 테스트 (JUCE 불필요)
 //
 //    빌드:  g++ -std=c++17 -O2 -I../Source CoreTests.cpp -o CoreTests
 //    실행:  ./CoreTests            (모든 테스트)
@@ -7,6 +7,7 @@
 // =============================================================================
 #include "dsp/RZ062Core.h"
 
+#include <complex>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -214,7 +215,7 @@ static void testAnalyticMatchesProcessing()
     std::printf ("[3] GUI 해석 곡선 == 실제 처리 응답 (모듈별, 트랜스포머 셸프·Mix 포함)\n");
     std::mt19937 rng (42);
     std::uniform_real_distribution<float> u (0.0f, 1.0f);
-    const double rates[] = { 88200.0, 96000.0, 176400.0, 192000.0 };
+    const double rates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };   // ZERO LATENCY(세션 레이트) + HQ
     double worst = 0.0;
     for (double fs : rates)
         for (int t = 0; t < 8; ++t)
@@ -247,8 +248,10 @@ static void testAnalyticMatchesProcessing()
 //------------------------------------------------------------------------------
 static void testSpecPoints()
 {
-    std::printf ("[4] 원본 사양 지점 (빈티지 Q, 48 kHz 세션의 처리 레이트)\n");
-    const double fs = processingRateFor (48000.0);
+    std::printf ("[4] 원본 사양 지점 (빈티지 Q, 48 kHz 세션: ZERO LATENCY 48k / HQ 192k)\n");
+    for (const double fs : { 48000.0, processingRateFor (48000.0) })
+    {
+    std::printf ("  처리 레이트 %.0f Hz\n", fs);
     auto at = [&] (const Params& p, double f) { return ResponseModel (p, 0, fs).magnitudeDb (f); };
 
     Params p;
@@ -291,6 +294,7 @@ static void testSpecPoints()
     const double sh = at (p, 20000.0);
     std::printf ("    트랜스포머 HIGH 100%% : 20 kHz %.2f dB\n", sh);
     CHECK (sh < -1.0 && sh > -1.6, "transformer HF softening %.2f", sh);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -352,24 +356,27 @@ static void testSampleRateConsistency()
     std::printf ("[6] 세션 샘플레이트 간 일관성 (20 Hz ~ 20 kHz)\n");
     std::mt19937 rng (7);
     std::uniform_real_distribution<float> u (0.0f, 1.0f);
-    double worst = 0.0;
-    for (int t = 0; t < 40; ++t)
+    double worstHq = 0.0, worstZero = 0.0;
+    for (int t = 0; t < 60; ++t)
     {
         Params p;
         p.mod[0] = randomModule (rng);
         p.xfHigh = u (rng);
         const ResponseModel ref (p, 0, 768000.0);
-        const ResponseModel a (p, 0, processingRateFor (44100.0)), b (p, 0, processingRateFor (48000.0)),
-                            c (p, 0, processingRateFor (96000.0)), d (p, 0, processingRateFor (192000.0));
-        for (double f : logFreqs (20.0, 20000.0, 100))
+        for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
         {
-            const double r = ref.magnitudeDb (f);
-            worst = std::max ({ worst, std::abs (a.magnitudeDb (f) - r), std::abs (b.magnitudeDb (f) - r),
-                                std::abs (c.magnitudeDb (f) - r), std::abs (d.magnitudeDb (f) - r) });
+            const ResponseModel hq (p, 0, processingRateFor (sr)), zero (p, 0, sr);
+            for (double f : logFreqs (20.0, 20000.0, 100))
+            {
+                const double r = ref.magnitudeDb (f);
+                worstHq   = std::max (worstHq,   std::abs (hq.magnitudeDb (f) - r));
+                worstZero = std::max (worstZero, std::abs (zero.magnitudeDb (f) - r));
+            }
         }
     }
-    std::printf ("    44.1k/48k/96k/192k 세션 vs 아날로그 기준 최대 차이 %.3f dB\n", worst);
-    CHECK (worst < 0.15, "sample-rate deviation %.3f dB", worst);
+    std::printf ("    44.1k/48k/96k/192k 세션 vs 아날로그 기준 최대 차이: HQ %.3f dB / ZERO LATENCY %.3f dB\n", worstHq, worstZero);
+    CHECK (worstHq < 0.15, "sample-rate deviation (HQ) %.3f dB", worstHq);
+    CHECK (worstZero < 0.45, "sample-rate deviation (zero latency) %.3f dB", worstZero);
 }
 
 //------------------------------------------------------------------------------
@@ -762,6 +769,317 @@ static void testRoutingAndLink()
 }
 
 //------------------------------------------------------------------------------
+// 간단한 radix-2 FFT (에일리어싱 측정용)
+static void fft (std::vector<std::complex<double>>& a)
+{
+    const size_t n = a.size();
+    for (size_t i = 1, j = 0; i < n; ++i)
+    {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap (a[i], a[j]);
+    }
+    for (size_t len = 2; len <= n; len <<= 1)
+    {
+        const double ang = -2.0 * kPi / (double) len;
+        const std::complex<double> wl (std::cos (ang), std::sin (ang));
+        for (size_t i = 0; i < n; i += len)
+        {
+            std::complex<double> w (1.0, 0.0);
+            for (size_t j = 0; j < len / 2; ++j)
+            {
+                const auto u = a[i + j], v = a[i + j + len / 2] * w;
+                a[i + j] = u + v;
+                a[i + j + len / 2] = u - v;
+                w *= wl;
+            }
+        }
+    }
+}
+
+// 신호에서 "배음이 아닌 성분"(= 에일리어싱)의 에너지를 기본파 대비 dB로
+static double aliasingDb (const std::vector<float>& y, double fs, double f0)
+{
+    const size_t n = 65536;
+    std::vector<std::complex<double>> a (n);
+    const size_t start = y.size() - n;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = (double) i / (double) (n - 1);   // Blackman-Harris 창
+        const double w = 0.35875 - 0.48829 * std::cos (2 * kPi * t) + 0.14128 * std::cos (4 * kPi * t) - 0.01168 * std::cos (6 * kPi * t);
+        a[i] = (double) y[start + i] * w;
+    }
+    fft (a);
+    const double binHz = fs / (double) n;
+    std::vector<bool> harmonic (n / 2, false);
+    for (int k = 0; k * f0 < fs / 2.0; ++k)   // k = 0 은 DC
+    {
+        const long c = std::lround (k * f0 / binHz);
+        for (long b = c - 10; b <= c + 10; ++b)
+            if (b >= 0 && b < (long) (n / 2)) harmonic[(size_t) b] = true;
+    }
+    double fund = 0.0, alias = 0.0;
+    const long cf = std::lround (f0 / binHz);
+    for (long b = cf - 10; b <= cf + 10; ++b) fund += std::norm (a[(size_t) b]);
+    for (size_t b = 0; b < n / 2; ++b)
+        if (! harmonic[b]) alias += std::norm (a[b]);
+    return 10.0 * std::log10 (alias / fund + 1e-300);
+}
+
+static void testZeroLatencyAntiAliasing()
+{
+    std::printf ("[14] ZERO LATENCY (세션 레이트) 안티에일리어싱 — ADAA\n");
+    const auto& c = ef804sCurve();
+
+    // psi 테이블 = dev의 적분 (회로를 직접 풀어 촘촘히 적분한 값과 비교)
+    double worstPsi = 0.0;
+    for (double v : { -40.0, -8.0, -1.0, -0.05, 0.02, 0.3, 2.0, 9.0, 60.0 })
+    {
+        const int steps = 4000;
+        double acc = 0.0;
+        for (int k = 0; k < steps; ++k)
+        {
+            const double a0 = v * k / steps, a1 = v * (k + 1) / steps, am = 0.5 * (a0 + a1);
+            acc += (a1 - a0) / 6.0 * (c.solveDev (a0) + 4.0 * c.solveDev (am) + c.solveDev (a1));
+        }
+        worstPsi = std::max (worstPsi, std::abs (c.psi (v) - acc) / std::max (std::abs (acc), 1e-30));
+    }
+    std::printf ("    역도함수 테이블 상대 오차 최대 %.2e\n", worstPsi);
+    CHECK (worstPsi < 1e-5, "psi table error %.2e", worstPsi);
+
+    const double fs = 48000.0;
+    const int total = 1 << 17;
+
+    // 튜브: ADAA vs 그냥 곡선(같은 곡선, 안티에일리어싱 없음)
+    for (double driveDb : { 24.0, 36.0 })
+    {
+        const double f0 = 6127.0;
+        TubeStage t;
+        t.prepare (fs);
+        t.setTargets (true, driveDb, 0.0);
+        t.reset();
+        auto x = sine (fs, f0, 0.5, total);
+        std::vector<float> naive ((size_t) total);
+        for (int i = 0; i < total; ++i) naive[(size_t) i] = (float) t.transfer (x[(size_t) i]);
+        float* ptr = x.data();
+        t.process (ptr, total);
+        const double aN = aliasingDb (naive, fs, f0), aA = aliasingDb (x, fs, f0);
+        std::printf ("    EF804S Drive %2.0f dB, 6.1 kHz @48k: 에일리어싱 그냥 %.1f dBc -> ADAA %.1f dBc (%.1f dB 감소)\n",
+                     driveDb, aN, aA, aN - aA);
+        CHECK (aN - aA > 6.0, "ADAA must reduce tube aliasing (drive %.0f): %.1f -> %.1f", driveDb, aN, aA);
+    }
+
+    // 트랜스포머 HIGH: 7 kHz — 같은 곡선을 그냥 샘플마다 적용한 것과 비교
+    {
+        const double f0 = 7031.0, amp = 0.7;
+        TransformerStage t;
+        t.prepare (fs);
+        t.setAmounts (0, 0, 1);
+        t.reset();
+        auto x = sine (fs, f0, amp, total);
+        std::vector<float> naive ((size_t) total);
+        for (int i = 0; i < total; ++i)   // 7 kHz는 거의 전부 HIGH 구간 -> 곡선을 원신호에 직접
+            naive[(size_t) i] = (float) (x[(size_t) i] + TransformerStage::hHigh (x[(size_t) i]));
+        float* ptr = x.data();
+        t.process (ptr, total);
+        const double aN = aliasingDb (naive, fs, f0), aA = aliasingDb (x, fs, f0);
+        std::printf ("    트랜스포머 HIGH 100%%, 7 kHz @48k: 에일리어싱 그냥 %.1f dBc -> ADAA %.1f dBc (%.1f dB 감소)\n", aN, aA, aN - aA);
+        CHECK (aN - aA > 10.0, "transformer aliasing %.1f -> %.1f", aN, aA);
+    }
+
+    // 소신호 투명도 (세션 레이트)
+    {
+        TubeStage t;
+        t.prepare (fs);
+        t.setTargets (true, 0.0, 0.0);
+        t.reset();
+        auto x = sine (fs, 1000.0, 0.01, (int) fs);
+        float* ptr = x.data();
+        t.process (ptr, (int) x.size());
+        double h[3], dc;
+        harmonics (x, fs, 1000.0, (int) fs / 2, (int) fs / 2, h, 3, &dc);
+        const double g = 20.0 * std::log10 (h[0] / 0.01);
+        std::printf ("    Drive 0 dB, -40 dBFS @48k 게인 %+.3f dB\n", g);
+        CHECK (std::abs (g) < 0.05, "small-signal gain @48k %+.3f", g);
+    }
+
+    // 무거운 드라이브: 고역 기본파 레벨/위상이 정확한 곡선(오버샘플링과 같은 결과)과 같아야 함
+    //  (보정 없는 ADAA는 압축 성분이 반 샘플 늦어서 고역이 수~10 dB 뜸)
+    auto toneAt = [&] (TubeStage& t, const std::vector<float>& x, double f0, bool naive) {
+        std::vector<float> y (x.size());
+        if (naive) for (size_t i = 0; i < x.size(); ++i) y[i] = (float) t.transfer (x[i]);
+        else { y = x; float* ptr = y.data(); t.process (ptr, (int) y.size()); }
+        const size_t start = y.size() / 2, len = y.size() / 2;
+        double re = 0.0, im = 0.0;
+        for (size_t i = 0; i < len; ++i)
+        {
+            const double ph = 2.0 * kPi * f0 * (double) (start + i) / fs;
+            re += y[start + i] * std::sin (ph);
+            im += y[start + i] * std::cos (ph);
+        }
+        return std::complex<double> (re, im) * (2.0 / (double) len);
+    };
+    {
+        double worstDb = 0.0, worstDeg = 0.0;
+        for (double driveDb : { 30.0, 36.0, 42.0, 48.0 })
+            for (double amp : { 0.25, 0.5, 0.9 })
+                for (double f0 : { 1000.0, 5000.0, 10000.0, 15000.0 })
+                {
+                    TubeStage t;
+                    t.prepare (fs);
+                    t.setTargets (true, driveDb, 0.0);
+                    t.reset();
+                    const auto x = sine (fs, f0, amp, (int) fs);
+                    const auto ref = toneAt (t, x, f0, true);
+                    t.reset();
+                    const auto got = toneAt (t, x, f0, false);
+                    worstDb  = std::max (worstDb,  std::abs (20.0 * std::log10 (std::abs (got) / std::abs (ref))));
+                    worstDeg = std::max (worstDeg, std::abs (std::arg (got / ref)) * 180.0 / kPi);
+                }
+        std::printf ("    사인 1개 (Drive 30~48, -12~-1 dBFS, 1~15 kHz) 기본파: 정확한 곡선 대비 최대 %.3f dB / %.2f도\n", worstDb, worstDeg);
+        CHECK (worstDb < 0.05 && worstDeg < 0.5, "single-tone fundamental error %.3f dB %.2f deg", worstDb, worstDeg);
+    }
+    {
+        // 큰 저음(100 Hz) 위의 작은 고역 (-34 dBFS): 저음이 동작점을 흔드는 만큼 고역이 눌려야 함
+        double worstDb = 0.0, plainWorst = 0.0;
+        for (double driveDb : { 36.0, 42.0, 48.0 })
+            for (double lo : { 0.25, 0.5, 0.9 })
+                for (double fh : { 10000.0, 15000.0 })
+                {
+                    std::vector<float> x ((size_t) fs);
+                    for (size_t i = 0; i < x.size(); ++i)
+                        x[i] = (float) (lo * std::sin (2.0 * kPi * 100.0 * (double) i / fs) + 0.02 * std::sin (2.0 * kPi * fh * (double) i / fs));
+                    TubeStage t;
+                    t.prepare (fs);
+                    t.setTargets (true, driveDb, 0.0);
+                    t.reset();
+                    const double ref = std::abs (toneAt (t, x, fh, true));
+                    t.reset();
+                    const double got = std::abs (toneAt (t, x, fh, false));
+                    worstDb = std::max (worstDb, std::abs (20.0 * std::log10 (got / ref)));
+                    plainWorst = std::max (plainWorst, 20.0 * std::log10 (ref / 0.02));
+                }
+        std::printf ("    큰 저음 + 작은 고역: 고역 레벨 정확한 곡선 대비 최대 %.2f dB\n", worstDb);
+        CHECK (worstDb < 0.5, "HF-on-bass error %.2f dB", worstDb);
+    }
+    {
+        // Focus 끝값에서도 (짝수 성분 2배 / 0)
+        double worstDb = 0.0;
+        for (double focus : { -1.0, 1.0 })
+            for (double f0 : { 5000.0, 12000.0 })
+            {
+                TubeStage t;
+                t.prepare (fs);
+                t.setTargets (true, 42.0, focus);
+                t.reset();
+                const auto x = sine (fs, f0, 0.5, (int) fs);
+                const auto ref = toneAt (t, x, f0, true);
+                t.reset();
+                const auto got = toneAt (t, x, f0, false);
+                worstDb = std::max (worstDb, std::abs (20.0 * std::log10 (std::abs (got) / std::abs (ref))));
+            }
+        std::printf ("    Focus -100/+100, Drive 42: 기본파 오차 최대 %.3f dB\n", worstDb);
+        CHECK (worstDb < 0.05, "focus extremes fundamental error %.3f dB", worstDb);
+    }
+    {
+        // 트랜스포머: 큰 신호에서 기본파는 "눌리기만" 해야 함 (크로스오버 근처에서 확장 X), 위상도 거의 그대로
+        double worstUp = -99.0, worstDeg = 0.0, lowComp = 0.0;
+        for (int band = 0; band < 3; ++band)
+            for (double f0 : { 30.0, 60.0, 120.0, 200.0, 350.0, 1000.0, 2500.0, 4000.0, 6000.0, 10000.0, 16000.0 })
+            {
+                TransformerStage t;
+                t.prepare (fs);
+                t.setAmounts (band == 0 ? 1 : 0, band == 1 ? 1 : 0, band == 2 ? 1 : 0);
+                t.reset();
+                const double amp = 0.9;
+                auto x = sine (fs, f0, amp, (int) fs);
+                float* ptr = x.data();
+                t.process (ptr, (int) x.size());
+                double re = 0.0, im = 0.0;
+                const size_t start = x.size() / 2, len = x.size() / 2;
+                for (size_t i = 0; i < len; ++i)
+                {
+                    const double ph = 2.0 * kPi * f0 * (double) (start + i) / fs;
+                    re += x[start + i] * std::sin (ph);
+                    im += x[start + i] * std::cos (ph);
+                }
+                const auto shelf = svfResponse (makeHighShelfMatched (TransformerStage::kShelfHz, TransformerStage::kShelfQ,
+                                                               band == 2 ? -TransformerStage::kShelfMaxCutDb : 0.0, fs), f0, fs);
+                const auto rel = std::complex<double> (re, im) * (2.0 / (double) len) / (amp * shelf);
+                const double db = 20.0 * std::log10 (std::abs (rel));
+                worstUp  = std::max (worstUp, db);
+                worstDeg = std::max (worstDeg, std::abs (std::arg (rel)) * 180.0 / kPi);
+                if (band == 0 && f0 < 50.0) lowComp = db;
+            }
+        std::printf ("    트랜스포머 100%%, -1 dBFS 기본파: 최대 %+.2f dB (확장 없어야 함), 위상 최대 %.1f도, LOW 30 Hz 압축 %+.2f dB\n",
+                     worstUp, worstDeg, lowComp);
+        CHECK (worstUp < 0.05, "transformer must not expand: %+.2f dB", worstUp);
+        CHECK (worstDeg < 8.0, "transformer fundamental phase %.1f deg", worstDeg);
+        CHECK (lowComp < -1.0, "LOW band should compress big bass: %+.2f dB", lowComp);
+    }
+}
+
+//------------------------------------------------------------------------------
+static void testSessionRateCurves()
+{
+    std::printf ("[15] 세션 레이트 곡선 = 아날로그 곡선 (매칭 설계, 크램핑 없음)\n");
+    auto bellA = [] (double W, double Q, double A) {
+        const double re = 1.0 - W * W, nu = A * W / Q, de = W / (Q * A);
+        return 10.0 * std::log10 ((re * re + nu * nu) / (re * re + de * de));
+    };
+    auto shelfA = [] (double W, double Q, double A) {
+        const double r = std::sqrt (A) * W / Q;
+        return 10.0 * std::log10 (A * A * ((1 - A * W * W) * (1 - A * W * W) + r * r) / ((A - W * W) * (A - W * W) + r * r));
+    };
+    auto tiltA = [] (double f, double tiltDb) {   // 1차: outGain * (1 + (G - 1) * wp / (s + wp))
+        const double G = std::pow (10.0, -2.0 * tiltDb / 20.0), fp = kTiltPivotHz / std::sqrt (G);
+        const std::complex<double> s (0.0, f / fp);
+        return 20.0 * std::log10 (std::abs (std::pow (10.0, tiltDb / 20.0) * (1.0 + (G - 1.0) / (s + 1.0))));
+    };
+    for (double fs : { 44100.0, 48000.0 })
+    {
+        double wBell = 0.0, wShelf = 0.0, wBil = 0.0, wTilt = 0.0;
+        for (double f = 20.0; f <= 20000.0; f *= 1.02)
+        {
+            for (double fc : { 1400.0, 2000.0, 2800.0, 4000.0 })
+                for (double q : { 0.3, 1.0, 6.0 })
+                    for (double g : { 1.0, 3.0, 6.0 })
+                    {
+                        const double a = bellA (f / fc, q, std::pow (10.0, g / 40.0));
+                        wBell = std::max (wBell, std::abs (20.0 * std::log10 (std::abs (svfResponse (makeBellMatched (fc, q, g, fs), f, fs))) - a));
+                        wBil  = std::max (wBil,  std::abs (20.0 * std::log10 (std::abs (svfResponse (makeBell (fc, q, g, fs), f, fs))) - a));
+                    }
+            for (double q : { 0.3, 0.5, 1.0, 2.0 })
+                for (double g : { -18.0, -6.0, 4.0, 12.0 })
+                {
+                    const double a = shelfA (f / kTrebleShelfHz, q, std::pow (10.0, g / 40.0));
+                    wShelf = std::max (wShelf, std::abs (20.0 * std::log10 (std::abs (svfResponse (makeHighShelfMatched (kTrebleShelfHz, q, g, fs), f, fs))) - a));
+                }
+            for (double g : { -1.5, -0.5 })
+            {
+                const double a = shelfA (f / TransformerStage::kShelfHz, TransformerStage::kShelfQ, std::pow (10.0, g / 40.0));
+                wShelf = std::max (wShelf, std::abs (20.0 * std::log10 (std::abs (svfResponse (
+                             makeHighShelfMatched (TransformerStage::kShelfHz, TransformerStage::kShelfQ, g, fs), f, fs))) - a));
+            }
+            for (double t : { -4.0, -1.0, 2.0, 4.0 })
+                wTilt = std::max (wTilt, std::abs (20.0 * std::log10 (std::abs (tiltResponse (makeTilt (kTiltPivotHz, t, fs), f, fs))) - tiltA (f, t)));
+        }
+        std::printf ("    %.1f kHz: Presence 벨 최대 %.2f dB (쌍선형이면 %.2f) / 셸프 최대 %.2f dB / Pivot 최대 %.2f dB\n",
+                     fs / 1000.0, wBell, wBil, wShelf, wTilt);
+        CHECK (wBell < 0.45, "matched bell error %.2f dB @ %.0f", wBell, fs);
+        CHECK (wShelf < 0.35, "matched shelf error %.2f dB @ %.0f", wShelf, fs);
+        CHECK (wTilt < 0.1, "tilt error %.2f dB @ %.0f", wTilt, fs);
+    }
+
+    // 0 dB = 정확히 통과 (EQ off 비트 동일 조건)
+    const auto b0 = makeBellMatched (2800.0, 1.0, 0.0, 48000.0);
+    const auto s0 = makeHighShelfMatched (kTrebleShelfHz, 0.5, 0.0, 48000.0);
+    CHECK (sameValue (b0.m0, 1.0) && sameValue (b0.m1, 0.0) && sameValue (b0.m2, 0.0), "bell 0 dB must be identity");
+    CHECK (sameValue (s0.m0, 1.0) && sameValue (s0.m1, 0.0) && sameValue (s0.m2, 0.0), "shelf 0 dB must be identity");
+}
+
+//------------------------------------------------------------------------------
 static void dumpCsv (const std::string& dir)
 {
     const double fs = processingRateFor (48000.0);
@@ -869,6 +1187,8 @@ int main (int argc, char** argv)
     testTube();
     testTransformer();
     testRoutingAndLink();
+    testZeroLatencyAntiAliasing();
+    testSessionRateCurves();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

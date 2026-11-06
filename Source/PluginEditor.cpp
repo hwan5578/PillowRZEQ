@@ -672,6 +672,14 @@ PillowRZAudioProcessorEditor::PillowRZAudioProcessorEditor (PillowRZAudioProcess
     addAndMakeVisible (module2);
     addAndMakeVisible (global);
 
+    // ZERO LATENCY(기본) / HQ(오버샘플링, 수 샘플 지연)
+    qualitySwitch.getProperties().set ("rzStyle", "segmented");
+    qualitySwitch.getProperties().set ("rzLeft",  "ZERO LATENCY");
+    qualitySwitch.getProperties().set ("rzRight", "HQ");
+    qualitySwitch.setButtonText ("Quality");
+    addAndMakeVisible (qualitySwitch);
+    qualityAttachment = std::make_unique<pillow::ui::ButtonAttachment> (processorRef.apvts, pillow::ids::quality, qualitySwitch);
+
     routingSwitch.getProperties().set ("rzStyle", "segmented");
     routingSwitch.getProperties().set ("rzLeft",  "STEREO  L / R");
     routingSwitch.getProperties().set ("rzRight", "MID / SIDE");
@@ -735,6 +743,7 @@ void PillowRZAudioProcessorEditor::resized()
     stepsSwitch.setBounds   (kWidth - 16 - 150, 14, 150, 28);
     linkSwitch.setBounds    (kWidth - 16 - 150 - 10 - 88, 14, 88, 28);
     routingSwitch.setBounds (kWidth - 16 - 150 - 10 - 88 - 10 - 236, 14, 236, 28);
+    qualitySwitch.setBounds (kWidth - 16 - 150 - 10 - 88 - 10 - 236 - 14 - 206, 14, 206, 28);
 
     module1.setBounds  (16,  60, 296, 628);
     module2.setBounds  (324, 60, 296, 628);
@@ -756,5 +765,5 @@ void PillowRZAudioProcessorEditor::paint (juce::Graphics& g)
     g.drawText ("RZ EQ", 20, 23, 110, 30, juce::Justification::centredLeft, false);
     g.setColour (palette::dim);
     g.setFont (uiFont (11.5f));
-    g.drawText ("RZ062-style curves  /  variable Q  /  EF804S", 106, 32, 330, 16, juce::Justification::centredLeft, false);
+    g.drawText ("RZ062-style  /  EF804S", 106, 32, 230, 16, juce::Justification::centredLeft, false);
 }
