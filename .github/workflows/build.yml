@@ -1,0 +1,59 @@
+# Windows VST3 (+ Standalone)를 GitHub의 Windows 서버에서 MSVC로 빌드합니다.
+# 결과: Actions -> 최신 "Build" 실행 -> Artifacts
+#       main 브랜치에 push 한 경우 zip이 `builds` 브랜치에도 올라가서 git으로 바로 받을 수 있음
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (downloads JUCE)
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target PillowRZ_VST3 PillowRZ_Standalone PillowRZCoreTests
+
+      - name: DSP tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: PillowRZ-EQ-Windows-VST3
+          path: build/PillowRZ_artefacts/Release/VST3/*.vst3
+          if-no-files-found: error
+
+      - name: Upload Standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: PillowRZ-EQ-Windows-Standalone
+          path: build/PillowRZ_artefacts/Release/Standalone/
+          if-no-files-found: error
+
+      - name: Publish zips to the 'builds' branch
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "publish"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Compress-Archive -Path "build/PillowRZ_artefacts/Release/VST3/*.vst3" -DestinationPath "$out/PillowRZ-EQ-Windows-VST3.zip" -Force
+          Compress-Archive -Path "build/PillowRZ_artefacts/Release/Standalone/*" -DestinationPath "$out/PillowRZ-EQ-Windows-Standalone.zip" -Force
+          Set-Location $out
+          git init -q -b builds
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Windows build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" builds
