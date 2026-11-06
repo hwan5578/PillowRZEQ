@@ -27,7 +27,10 @@ namespace pillow::ids
     inline constexpr const char* bass     = "bass";
     inline constexpr const char* bassQ    = "bassQ";
     inline constexpr const char* tilt     = "tilt";
-    inline constexpr const char* presFreq = "presFreq";
+    inline constexpr const char* trebleHz = "trebleHz";   // v0.4: 기준 주파수 (연속)
+    inline constexpr const char* bassHz   = "bassHz";     // v0.4
+    inline constexpr const char* presHz   = "presHz";     // v0.4: 연속 (v0.3 이하의 4단계 presFreq를 대체)
+    inline constexpr const char* presFreqLegacy = "presFreq";   // v0.3 이하 세션 변환용 (파라미터로는 없음)
     inline constexpr const char* presGain = "presGain";
     inline constexpr const char* presQ    = "presQ";
     inline constexpr const char* drive    = "drive";
@@ -51,6 +54,25 @@ namespace pillow
     }
 
     inline juce::String formatQ (float q)  { return "Q " + juce::String (q, 2); }
+
+    inline juce::String formatHz (float hz)
+    {
+        if (hz >= 9995.0f) return juce::String (hz / 1000.0f, 1) + " kHz";
+        if (hz >= 999.5f)  return juce::String (hz / 1000.0f, 2) + " kHz";
+        if (hz >= 99.95f)  return juce::String (juce::roundToInt (hz)) + " Hz";
+        const float r = std::round (hz * 10.0f) / 10.0f;
+        return (std::abs (r - std::round (r)) < 0.05f ? juce::String (juce::roundToInt (r)) : juce::String (r, 1)) + " Hz";
+    }
+
+    // "2.8k", "2800", "2.8 kHz" 모두 받음. 단위 없이 범위보다 작은 수를 치면 kHz로 봄 (예: Presence에 "2.5")
+    inline float parseHz (const juce::String& text, float minHz)
+    {
+        const auto t = text.trim().toLowerCase();
+        float v = t.retainCharacters ("0123456789.").getFloatValue();
+        if (t.containsChar ('k') || (v < minHz && v * 1000.0f >= minHz))
+            v *= 1000.0f;
+        return v;
+    }
 }
 
 //==============================================================================
@@ -123,7 +145,9 @@ private:
         std::atomic<float>* bass = nullptr;
         std::atomic<float>* bassQ = nullptr;
         std::atomic<float>* tilt = nullptr;
-        std::atomic<float>* presFreq = nullptr;
+        std::atomic<float>* trebleHz = nullptr;
+        std::atomic<float>* bassHz = nullptr;
+        std::atomic<float>* presHz = nullptr;
         std::atomic<float>* presGain = nullptr;
         std::atomic<float>* presQ = nullptr;
         std::atomic<float>* drive = nullptr;

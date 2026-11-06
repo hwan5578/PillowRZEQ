@@ -63,6 +63,48 @@ RZKnob::RZKnob()
     setMouseDragSensitivity (220);
 }
 
+double RZKnob::snapValue (double attemptedValue, juce::Slider::DragMode dragMode)
+{
+    // 주파수 노브: 보통 드래그일 때만 단계 근처에서 붙음. Shift(미세 조정)·직접 입력·스텝 모드에서는 그대로
+    if (dragMode == notDragging || magnetOctaves <= 0.0 || detents.empty() || attemptedValue <= 0.0
+        || juce::ModifierKeys::currentModifiers.isShiftDown() || (isStepped && isStepped()))
+        return attemptedValue;
+
+    for (double d : detents)
+        if (std::abs (std::log2 (attemptedValue / d)) < magnetOctaves)
+            return d;
+
+    return attemptedValue;
+}
+
+void RZKnob::mouseDown (const juce::MouseEvent& e)
+{
+    lastDragPos = virtualDragPos = e.position;
+    juce::Slider::mouseDown (e);
+}
+
+void RZKnob::mouseDrag (const juce::MouseEvent& e)
+{
+    // Shift: 10배 미세 조정. 움직인 양을 누적한 "가상 위치"로 넘기므로 드래그 도중 Shift를 눌러도 값이 튀지 않음
+    const float k = e.mods.isShiftDown() ? 0.1f : 1.0f;
+    virtualDragPos += (e.position - lastDragPos) * k;
+    lastDragPos = e.position;
+    juce::Slider::mouseDrag (e.withNewPosition (virtualDragPos));
+}
+
+void RZKnob::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
+{
+    if (! e.mods.isShiftDown())
+    {
+        juce::Slider::mouseWheelMove (e, wheel);
+        return;
+    }
+    auto fine = wheel;
+    fine.deltaX *= 0.1f;
+    fine.deltaY *= 0.1f;
+    juce::Slider::mouseWheelMove (e, fine);
+}
+
 //==============================================================================
 //  LookAndFeel
 //==============================================================================
@@ -114,7 +156,7 @@ void RZLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int width
     };
 
     g.setColour (palette::scale.withMultipliedAlpha (0.75f * alpha));
-    if (stepped && ! knob->detents.empty())
+    if ((stepped || (knob != nullptr && knob->alwaysShowDetents)) && ! knob->detents.empty())
     {
         for (double d : knob->detents)
             tick ((float) slider.valueToProportionOfLength (d), large ? 7.0f : 5.0f, 1.6f);
@@ -216,12 +258,14 @@ ModulePanel::ModulePanel (PillowRZAudioProcessor& p, int moduleIndex)
     : proc (p), index (moduleIndex)
 {
     setupKnob (treble,   pillow::ids::treble,   true);
+    setupKnob (trebleHz, pillow::ids::trebleHz, false);
     setupKnob (trebleQ,  pillow::ids::trebleQ,  false);
     setupKnob (bass,     pillow::ids::bass,     true);
+    setupKnob (bassHz,   pillow::ids::bassHz,   false);
     setupKnob (bassQ,    pillow::ids::bassQ,    false);
     setupKnob (tilt,     pillow::ids::tilt,     true);
     setupKnob (presGain, pillow::ids::presGain, true);
-    setupKnob (presFreq, pillow::ids::presFreq, false);
+    setupKnob (presHz,   pillow::ids::presHz,   false);
     setupKnob (presQ,    pillow::ids::presQ,    false);
     setupKnob (drive,    pillow::ids::drive,    false);
     setupKnob (level,    pillow::ids::output,   false);
@@ -245,9 +289,33 @@ ModulePanel::ModulePanel (PillowRZAudioProcessor& p, int moduleIndex)
     presGain.quantize  = [] (double v) { return (double) rz::quantizePresence ((float) v); };
     presGain.detents   = rz::presenceDetents();
 
-    presFreq.isStepped = [] { return true; };
-    presFreq.quantize  = [] (double v) { return std::round (v); };
-    presFreq.detents   = { 0.0, 1.0, 2.0, 3.0 };
+    // 주파수 노브: 단계 눈금 항상 표시, 드래그 시 단계에서 살짝 붙음, VINTAGE STEPS면 단계로
+    auto setupFreq = [&stepped] (RZKnob& k, auto steps, std::function<double (double)> snap)
+    {
+        k.isStepped = stepped;
+        k.quantize  = std::move (snap);
+        k.detents.assign (steps.begin(), steps.end());
+        k.alwaysShowDetents = true;
+        k.magnetOctaves = 1.0 / 24.0;     // 4분의 1 반음
+        k.setMouseDragSensitivity (300);
+    };
+    setupFreq (trebleHz, rz::kTrebleSteps,   [] (double v) { return rz::nearestStep (rz::kTrebleSteps, v); });
+    setupFreq (bassHz,   rz::kBassSteps,     [] (double v) { return rz::nearestStep (rz::kBassSteps, v); });
+    setupFreq (presHz,   rz::kPresenceSteps, [] (double v) { return rz::nearestStep (rz::kPresenceSteps, v); });
+
+    for (auto* k : { &trebleHz, &bassHz, &presHz })
+    {
+        k->textFromValueFunction = [this, k] (double v)
+        {
+            const double shown = (proc.isSteppedMode() && k->quantize) ? k->quantize (v) : v;
+            return pillow::formatHz ((float) shown);
+        };
+        k->updateText();
+    }
+
+    // Q: 노브 한 바퀴를 더 길게 (더 촘촘하게)
+    for (auto* k : { &trebleQ, &bassQ, &presQ })
+        k->setMouseDragSensitivity (360);
 
     // 텍스트 박스에는 "실제로 적용되는 값"(스텝 반영)을 표시
     for (auto* k : { &treble, &bass, &tilt, &presGain })
@@ -270,10 +338,15 @@ ModulePanel::ModulePanel (PillowRZAudioProcessor& p, int moduleIndex)
 
 void ModulePanel::setupKnob (RZKnob& knob, const char* baseId, bool large)
 {
+    const auto id = pillow::ids::forModule (baseId, index);
     knob.large = large;
     knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, large ? 86 : 74, 18);
     addAndMakeVisible (knob);
-    attachments.push_back (std::make_unique<SliderAttachment> (proc.apvts, pillow::ids::forModule (baseId, index), knob));
+    attachments.push_back (std::make_unique<SliderAttachment> (proc.apvts, id, knob));
+
+    // 더블클릭 = 기본값
+    if (auto* prm = proc.apvts.getParameter (id))
+        knob.setDoubleClickReturnValue (true, (double) prm->convertFrom0to1 (prm->getDefaultValue()));
 }
 
 juce::String ModulePanel::title() const
@@ -298,17 +371,17 @@ void ModulePanel::setState (const State& s)
 
     tilt.setVisible (! state.modeB);
     presGain.setVisible (state.modeB);
-    presFreq.setVisible (state.modeB);
+    presHz.setVisible (state.modeB);
     presQ.setVisible (state.modeB);
 
-    for (auto* k : { &treble, &trebleQ, &bass, &bassQ, &tilt, &presGain, &presFreq, &presQ })
+    for (auto* k : { &treble, &trebleHz, &trebleQ, &bass, &bassHz, &bassQ, &tilt, &presGain, &presHz, &presQ })
         k->dimmed = ! state.eqOn;
     drive.dimmed = ! state.driveOn;
 
     setEnabled (! isFollower());
 
     if (steppedChanged)
-        for (auto* k : { &treble, &bass, &tilt, &presGain })
+        for (auto* k : { &treble, &bass, &tilt, &presGain, &trebleHz, &bassHz, &presHz })
             k->updateText();
 
     repaint();
@@ -330,10 +403,15 @@ void ModulePanel::resized()
     presGain.setBounds (bigKnob (rowMid));
     bass.setBounds     (bigKnob (rowBass));
 
-    trebleQ.setBounds  (rowTreble.getX() + 172, rowTreble.getY() + 46, 82, 94);
-    bassQ.setBounds    (rowBass.getX()   + 172, rowBass.getY()   + 46, 82, 94);
-    presFreq.setBounds (rowMid.getX() + 140, rowMid.getY() + 46, 74, 94);
-    presQ.setBounds    (rowMid.getX() + 214, rowMid.getY() + 46, 74, 94);
+    // 각 줄: 큰 게인 노브 + FREQ + Q
+    auto freqKnob = [] (juce::Rectangle<int> row) { return juce::Rectangle<int> (row.getX() + 140, row.getY() + 46, 74, 94); };
+    auto qKnob    = [] (juce::Rectangle<int> row) { return juce::Rectangle<int> (row.getX() + 214, row.getY() + 46, 74, 94); };
+    trebleHz.setBounds (freqKnob (rowTreble));
+    trebleQ.setBounds  (qKnob (rowTreble));
+    presHz.setBounds   (freqKnob (rowMid));
+    presQ.setBounds    (qKnob (rowMid));
+    bassHz.setBounds   (freqKnob (rowBass));
+    bassQ.setBounds    (qKnob (rowBass));
 
     drive.setBounds (rowTube.getX() + 34,  rowTube.getY() + 40, 96, 100);
     level.setBounds (rowTube.getX() + 166, rowTube.getY() + 40, 96, 100);
@@ -351,13 +429,14 @@ void ModulePanel::paint (juce::Graphics& g)
     for (auto row : { rowTreble, rowMid, rowBass, rowTube })
         g.drawHorizontalLine (row.getY() - 1, 20.0f, (float) getWidth() - 20.0f);
 
-    drawRowTitle (g, rowTreble, "TREBLE", "shelf  /  10 kHz ref");
+    drawRowTitle (g, rowTreble, "TREBLE", "high shelf  /  freq = full-boost point");
+    drawSmallLabel (g, trebleHz, "FREQ");
     drawSmallLabel (g, trebleQ, "Q");
 
     if (state.modeB)
     {
-        drawRowTitle (g, rowMid, "PRESENCE", "module B  /  boost");
-        drawSmallLabel (g, presFreq, "FREQ");
+        drawRowTitle (g, rowMid, "PRESENCE", "module B  /  bell boost");
+        drawSmallLabel (g, presHz, "FREQ");
         drawSmallLabel (g, presQ, "Q");
     }
     else
@@ -369,7 +448,9 @@ void ModulePanel::paint (juce::Graphics& g)
                           rowMid.getX() + 148, rowMid.getY() + 56, 136, 60, juce::Justification::centredLeft, 3);
     }
 
-    drawRowTitle (g, rowBass, "BASS", "shelf  /  40 Hz ref");
+    drawRowTitle (g, rowBass, "BASS", "low shelf  /  freq = full-boost point");
+    drawSmallLabel (g, bassHz, "FREQ");
+    drawSmallLabel (g, bassQ, "Q");
 
     drawRowTitle (g, rowTube, "TUBE  /  EF804S", {});
     drawSmallLabel (g, drive, "DRIVE");
@@ -421,6 +502,9 @@ void GlobalPanel::setupKnob (RZKnob& knob, const char* paramId)
     knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 92, 18);
     addAndMakeVisible (knob);
     attachments.push_back (std::make_unique<SliderAttachment> (proc.apvts, paramId, knob));
+
+    if (auto* prm = proc.apvts.getParameter (paramId))
+        knob.setDoubleClickReturnValue (true, (double) prm->convertFrom0to1 (prm->getDefaultValue()));
 }
 
 void GlobalPanel::setDriveOn (bool on)
@@ -468,8 +552,11 @@ void GlobalPanel::paint (juce::Graphics& g)
     g.setFont (uiFont (11.0f));
     g.drawFittedText ("Drive per module (bottom row).\n"
                       "Focus: odd <-> even harmonics.\n"
-                      "Mix: blend the dry signal back\n(parallel EQ + tube).",
-                      258, 64, getWidth() - 274, 90, juce::Justification::topLeft, 5);
+                      "Mix: blend the dry signal back.\n"
+                      "Shift + drag: fine adjust\n"
+                      "Click a value: type it\n"
+                      "Double-click: reset",
+                      258, 58, getWidth() - 274, 104, juce::Justification::topLeft, 6);
 
     g.setColour (palette::panelEdge.withAlpha (0.7f));
     g.drawHorizontalLine (176, 20.0f, (float) getWidth() - 20.0f);
@@ -575,7 +662,7 @@ void ResponseView::rebuildPaths()
         // B 모드: 프레즌스 중심, A 모드: Pivot 회전축 표시
         const auto& mp = params.effective (m);
         const bool isB = mp.mode == rz::Mode::B_Presence;
-        const double mf = isB ? rz::kPresenceHz[(size_t) juce::jlimit (0, 3, mp.presIndex)] : rz::kTiltPivotHz;
+        const double mf = isB ? rz::resolveModule (params, m).presHz : rz::kTiltPivotHz;
         markers[(size_t) m] = { xForFreq (mf, plot), yForDb (model.magnitudeDb (mf), plot) };
     }
 }

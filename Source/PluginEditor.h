@@ -25,6 +25,9 @@ namespace pillow::ui
 
     //==========================================================================
     // 원본처럼 디텐트(계단) 눈금을 표시하고, 스텝 모드에서 포인터가 계단에 붙는 노브
+    //  - Shift + 드래그 / 휠: 10배 미세 조정 (드래그 도중에 눌러도 값이 튀지 않음)
+    //  - 값 글자를 클릭하면 직접 입력, 노브 더블클릭은 기본값
+    //  - 주파수 노브: 단계 눈금을 항상 표시하고, 드래그하면 단계 근처에서 살짝 붙음 (Shift면 안 붙음)
     class RZKnob : public juce::Slider
     {
     public:
@@ -35,6 +38,16 @@ namespace pillow::ui
         std::vector<double> detents;                // 눈금 위치(값)
         bool large  = false;
         bool dimmed = false;                        // 기능이 꺼져 있을 때 흐리게 (조작은 가능)
+        bool alwaysShowDetents = false;             // 스텝 모드가 아니어도 눈금 표시 (주파수 노브)
+        double magnetOctaves = 0.0;                 // > 0: 드래그할 때 눈금에서 이 거리(옥타브) 안이면 붙음
+
+        double snapValue (double attemptedValue, juce::Slider::DragMode) override;
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseDrag (const juce::MouseEvent&) override;
+        void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
+
+    private:
+        juce::Point<float> lastDragPos, virtualDragPos;
     };
 
     //==========================================================================
@@ -90,7 +103,7 @@ namespace pillow::ui
         State state;
         bool hasState = false;
 
-        RZKnob treble, trebleQ, bass, bassQ, tilt, presGain, presFreq, presQ, drive, level;
+        RZKnob treble, trebleHz, trebleQ, bass, bassHz, bassQ, tilt, presGain, presHz, presQ, drive, level;
         juce::ToggleButton typeSwitch;
 
         // 어태치먼트는 노브보다 뒤에 선언 -> 먼저 파괴됨

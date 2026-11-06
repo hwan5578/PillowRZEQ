@@ -65,6 +65,22 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
     Range presQRange (rz::kPresQMin, rz::kPresQMax, 0.001f);
     presQRange.setSkewForCentre (1.0f);       // 기본 1.0이 정중앙
 
+    // 주파수: 노브 위치 = 옥타브 (로그)
+    auto logRange = [] (double lo, double hi)
+    {
+        return Range ((float) lo, (float) hi,
+                      [] (float start, float end, float t) { return start * std::pow (end / start, t); },
+                      [] (float start, float end, float v) { return std::log (std::max (v, start) / start) / std::log (end / start); });
+    };
+
+    auto hzAttr = [] (float minHz)
+    {
+        return FloatAttr()
+            .withLabel ("Hz")
+            .withStringFromValueFunction ([] (float v, int) { return pillow::formatHz (v); })
+            .withValueFromStringFunction ([minHz] (const juce::String& s) { return pillow::parseHz (s, minHz); });
+    };
+
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
     // ── 전역 ────────────────────────────────────────────────────────────────
@@ -129,6 +145,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
             shelfQRange, rz::kVintageShelfQ, qAttr()));
 
         layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::trebleHz, m), 4 }, n + "Treble Freq",
+            logRange (rz::kTrebleSteps.front(), rz::kTrebleSteps.back()), (float) rz::kTrebleRefHz,
+            hzAttr ((float) rz::kTrebleSteps.front())));
+
+        layout.add (std::make_unique<FloatParam> (
             juce::ParameterID { forModule (pillow::ids::bass, m), v }, n + "Bass",
             Range (rz::kBassMinDb, rz::kBassMaxDb, 0.01f), 0.0f, dbAttr()));
 
@@ -137,12 +158,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
             shelfQRange, rz::kVintageShelfQ, qAttr()));
 
         layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::bassHz, m), 4 }, n + "Bass Freq",
+            logRange (rz::kBassSteps.front(), rz::kBassSteps.back()), (float) rz::kBassRefHz,
+            hzAttr ((float) rz::kBassSteps.front())));
+
+        layout.add (std::make_unique<FloatParam> (
             juce::ParameterID { forModule (pillow::ids::tilt, m), v }, n + "Pivot",
             Range (-rz::kTiltMaxDb, rz::kTiltMaxDb, 0.01f), 0.0f, dbAttr()));
 
-        layout.add (std::make_unique<juce::AudioParameterChoice> (
-            juce::ParameterID { forModule (pillow::ids::presFreq, m), v }, n + "Presence Freq",
-            juce::StringArray { "1.4 kHz", "2 kHz", "2.8 kHz", "4 kHz" }, 2));
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::presHz, m), 4 }, n + "Presence Freq",
+            logRange (rz::kPresenceSteps.front(), rz::kPresenceSteps.back()), (float) rz::kPresenceDefaultHz,
+            hzAttr ((float) rz::kPresenceSteps.front())));
 
         layout.add (std::make_unique<FloatParam> (
             juce::ParameterID { forModule (pillow::ids::presGain, m), v }, n + "Presence",
@@ -193,14 +220,17 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
         p.bass     = get (pillow::ids::bass);
         p.bassQ    = get (pillow::ids::bassQ);
         p.tilt     = get (pillow::ids::tilt);
-        p.presFreq = get (pillow::ids::presFreq);
+        p.trebleHz = get (pillow::ids::trebleHz);
+        p.bassHz   = get (pillow::ids::bassHz);
+        p.presHz   = get (pillow::ids::presHz);
         p.presGain = get (pillow::ids::presGain);
         p.presQ    = get (pillow::ids::presQ);
         p.drive    = get (pillow::ids::drive);
         p.output   = get (pillow::ids::output);
-        jassert (p.mode != nullptr && p.treble != nullptr && p.trebleQ != nullptr && p.bass != nullptr
-                 && p.bassQ != nullptr && p.tilt != nullptr && p.presFreq != nullptr && p.presGain != nullptr
-                 && p.presQ != nullptr && p.drive != nullptr && p.output != nullptr);
+        jassert (p.mode != nullptr && p.treble != nullptr && p.trebleQ != nullptr && p.trebleHz != nullptr
+                 && p.bass != nullptr && p.bassQ != nullptr && p.bassHz != nullptr && p.tilt != nullptr
+                 && p.presHz != nullptr && p.presGain != nullptr && p.presQ != nullptr
+                 && p.drive != nullptr && p.output != nullptr);
     }
 
     jassert (paramQuality != nullptr && paramRouting != nullptr && paramLink != nullptr && paramSteps != nullptr
@@ -241,7 +271,9 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
         mp.bassDb    = ptr.bass->load();
         mp.bassQ     = ptr.bassQ->load();
         mp.tiltDb    = ptr.tilt->load();
-        mp.presIndex = juce::jlimit (0, 3, (int) std::lround (ptr.presFreq->load()));
+        mp.trebleHz  = ptr.trebleHz->load();
+        mp.bassHz    = ptr.bassHz->load();
+        mp.presHz    = ptr.presHz->load();
         mp.presDb    = ptr.presGain->load();
         mp.presQ     = ptr.presQ->load();
         mp.driveDb   = ptr.drive->load();
@@ -497,9 +529,31 @@ void PillowRZAudioProcessor::setStateInformation (const void* data, int sizeInBy
         {
             auto tree = juce::ValueTree::fromXml (*xml);
 
-            // v0.2 이하 세션에는 quality 항목이 없음 -> 지금 상태와 상관없이 항상 ZERO LATENCY로 열리게
-            if (! tree.getChildWithProperty ("id", pillow::ids::quality).isValid())
-                tree.appendChild (juce::ValueTree ("PARAM", { { "id", pillow::ids::quality }, { "value", 0.0f } }), nullptr);
+            // 예전 버전 세션에 없는 항목은 "그 버전과 같은 소리"가 나는 값으로 채움
+            // (빠진 항목은 지금 인스턴스 값이 남기 때문에, 항상 같은 결과가 되도록 명시)
+            auto ensure = [&tree] (const juce::String& id, float value)
+            {
+                if (! tree.getChildWithProperty ("id", id).isValid())
+                    tree.appendChild (juce::ValueTree ("PARAM", { { "id", id }, { "value", value } }), nullptr);
+            };
+
+            ensure (pillow::ids::quality, 0.0f);   // v0.2 이하 -> ZERO LATENCY
+
+            for (int m = 0; m < 2; ++m)
+            {
+                // v0.3 이하: Presence 주파수는 4단계 선택(0..3) -> Hz로 옮기고 옛 항목은 지움
+                float presHz = (float) rz::kPresenceDefaultHz;
+                const auto legacy = tree.getChildWithProperty ("id", pillow::ids::forModule (pillow::ids::presFreqLegacy, m));
+                if (legacy.isValid())
+                {
+                    const int idx = juce::jlimit (0, 3, (int) std::lround ((double) legacy.getProperty ("value", 2)));
+                    presHz = (float) rz::kPresenceHz[(size_t) idx];
+                    tree.removeChild (legacy, nullptr);
+                }
+                ensure (pillow::ids::forModule (pillow::ids::presHz, m), presHz);
+                ensure (pillow::ids::forModule (pillow::ids::trebleHz, m), (float) rz::kTrebleRefHz);
+                ensure (pillow::ids::forModule (pillow::ids::bassHz, m), (float) rz::kBassRefHz);
+            }
 
             apvts.replaceState (tree);
         }

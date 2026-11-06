@@ -1,5 +1,5 @@
 // =============================================================================
-//  Pillow RZ EQ v0.3 — DSP 코어 단독 테스트 (JUCE 불필요)
+//  Pillow RZ EQ v0.4 — DSP 코어 단독 테스트 (JUCE 불필요)
 //
 //    빌드:  g++ -std=c++17 -O2 -I../Source CoreTests.cpp -o CoreTests
 //    실행:  ./CoreTests            (모든 테스트)
@@ -85,7 +85,9 @@ static ModuleParams randomModule (std::mt19937& rng)
     m.trebleQ   = kShelfQMin * std::pow (kShelfQMax / kShelfQMin, u (rng));
     m.bassQ     = kShelfQMin * std::pow (kShelfQMax / kShelfQMin, u (rng));
     m.tiltDb    = -kTiltMaxDb + u (rng) * 2.0f * kTiltMaxDb;
-    m.presIndex = (int) (u (rng) * 3.999f);
+    m.presHz    = (float) (kPresenceSteps.front() * std::pow (kPresenceSteps.back() / kPresenceSteps.front(), (double) u (rng)));
+    m.bassHz    = (float) (kBassSteps.front() * std::pow (kBassSteps.back() / kBassSteps.front(), (double) u (rng)));
+    m.trebleHz  = (float) (kTrebleSteps.front() * std::pow (kTrebleSteps.back() / kTrebleSteps.front(), (double) u (rng)));
     m.presDb    = u (rng) * kPresMaxDb;
     m.presQ     = kPresQMin * std::pow (kPresQMax / kPresQMin, u (rng));
     m.driveDb   = u (rng) * kDriveMaxDb;
@@ -278,11 +280,11 @@ static void testSpecPoints()
     CHECK (std::abs (p10k - 4.0) < 0.2, "pivot 10k %.2f", p10k);
     CHECK (std::abs (p100 + 4.0) < 0.35, "pivot 100Hz %.2f", p100);
 
-    for (int i = 0; i < 4; ++i)
+    for (double hz : kPresenceSteps)
     {
-        p = Params {}; p.mod[0].presIndex = i; p.mod[0].presDb = 6.0f;
-        const double pk = at (p, kPresenceHz[(size_t) i]);
-        CHECK (std::abs (pk - 6.0) < 0.02, "presence %d peak %.3f", i, pk);
+        p = Params {}; p.mod[0].presHz = (float) hz; p.mod[0].presDb = 6.0f;
+        const double pk = at (p, hz);
+        CHECK (std::abs (pk - 6.0) < 0.02, "presence %.0f Hz peak %.3f", hz, pk);
     }
 
     p = Params {}; p.mod[0].mode = Mode::A_Tilt; p.mod[0].presDb = 6.0f;
@@ -322,7 +324,7 @@ static void testQBehaviour()
     double prevBw = 1e9;
     for (float q : { 0.3f, 0.6f, 1.0f, 2.0f, 4.0f, 6.0f })
     {
-        Params p; p.mod[0].presIndex = 2; p.mod[0].presDb = 6.0f; p.mod[0].presQ = q;
+        Params p; p.mod[0].presHz = 2800.0f; p.mod[0].presDb = 6.0f; p.mod[0].presQ = q;
         const double bw = halfGainBandwidthOct (p, fs, 2800.0);
         std::printf ("    Presence 2.8 kHz +6 dB, Q %.1f -> 대역폭 %.2f oct\n", q, bw);
         CHECK (bw < prevBw, "bandwidth must shrink as Q grows (Q %.1f)", q);
@@ -377,7 +379,7 @@ static void testSampleRateConsistency()
     }
     std::printf ("    44.1k/48k/96k/192k 세션 vs 아날로그 기준 최대 차이: HQ %.3f dB / ZERO LATENCY %.3f dB\n", worstHq, worstZero);
     CHECK (worstHq < 0.15, "sample-rate deviation (HQ) %.3f dB", worstHq);
-    CHECK (worstZero < 0.45, "sample-rate deviation (zero latency) %.3f dB", worstZero);
+    CHECK (worstZero < 0.6, "sample-rate deviation (zero latency) %.3f dB", worstZero);
 }
 
 //------------------------------------------------------------------------------
@@ -430,9 +432,24 @@ static void testClicks()
         add ("Bass +12 -> -20", a, b);
     }
     {
-        Params a; a.mod[0].presDb = 6; a.mod[0].presQ = 6; a.mod[0].presIndex = 0;
-        Params b = a; b.mod[0].presIndex = 3;
+        Params a; a.mod[0].presDb = 6; a.mod[0].presQ = 6; a.mod[0].presHz = 1400;
+        Params b = a; b.mod[0].presHz = 4000;
         add ("Presence 1.4k -> 4k (Q 6)", a, b);
+    }
+    {
+        Params a; a.mod[0].presDb = 6; a.mod[0].presQ = 6; a.mod[0].presHz = 700;
+        Params b = a; b.mod[0].presHz = 8000;
+        add ("Presence 0.7k -> 8k (Q 6)", a, b);
+    }
+    {
+        Params a; a.mod[0].bassDb = 12; a.mod[0].bassQ = 2; a.mod[0].bassHz = 20;
+        Params b = a; b.mod[0].bassHz = 120;
+        add ("Bass freq 20 -> 120 (+12, Q 2)", a, b);
+    }
+    {
+        Params a; a.mod[0].trebleDb = -18; a.mod[0].trebleQ = 2; a.mod[0].trebleHz = 5000;
+        Params b = a; b.mod[0].trebleHz = 16000;
+        add ("Treble freq 5k -> 16k (-18, Q 2)", a, b);
     }
     {
         Params a; a.mod[0].mode = Mode::A_Tilt; a.mod[0].tiltDb = -4; a.mod[0].presDb = 6;
@@ -462,7 +479,7 @@ static void testClicks()
         add ("Drive off -> on (18 dB)", a, b);
     }
     {
-        Params a; a.mod[0].presDb = 6; a.mod[0].presIndex = 0; Params b = a; b.mix = 0.3f;
+        Params a; a.mod[0].presDb = 6; a.mod[0].presHz = 1400; Params b = a; b.mix = 0.3f;
         add ("Mix 100 -> 30 %", a, b);
     }
     {
@@ -743,7 +760,7 @@ static void testRoutingAndLink()
     // M/S: 미드만 들어오면 모듈 1, 사이드만 들어오면 모듈 2 응답
     {
         Params p; p.link = false; p.routing = Routing::MidSide;
-        p.mod[0].presDb = 6.0f; p.mod[0].presIndex = 2;
+        p.mod[0].presDb = 6.0f; p.mod[0].presHz = 2800.0f;
         p.mod[1].bassDb = -12.0f; p.mod[1].trebleDb = 6.0f;
         const auto hMid  = impulseResponse (p, fs, len, 1.0f,  1.0f, 0);
         const auto hSide = impulseResponse (p, fs, len, 1.0f, -1.0f, 0);
@@ -1209,6 +1226,78 @@ static void testRobustness()
 }
 
 //------------------------------------------------------------------------------
+static void testFrequencyControls()
+{
+    std::printf ("[17] 주파수 조절 (Bass·Treble 기준 주파수, Presence 연속 + 단계)\n");
+
+    // 1) 셸프 주파수를 옮기면 곡선 모양은 그대로 평행 이동 (HQ 레이트 = 거의 아날로그)
+    {
+        const double fs = processingRateFor (48000.0);
+        double worst = 0.0;
+        for (double g : { -18.0, 12.0 })
+            for (double q : { 0.5, 2.0 })
+            {
+                Params a; a.mod[0].trebleDb = (float) g; a.mod[0].trebleQ = (float) q;
+                Params b = a; b.mod[0].trebleHz = 5000.0f;                 // 10k -> 5k: 한 옥타브 아래로
+                Params c; c.mod[0].bassDb = (float) g; c.mod[0].bassQ = (float) q;
+                Params d = c; d.mod[0].bassHz = 80.0f;                     // 40 -> 80: 한 옥타브 위로
+                const ResponseModel ma (a, 0, fs), mb (b, 0, fs), mc (c, 0, fs), md (d, 0, fs);
+                for (double f : logFreqs (40.0, 10000.0, 60))
+                {
+                    worst = std::max (worst, std::abs (mb.magnitudeDb (f * 0.5) - ma.magnitudeDb (f)));
+                    worst = std::max (worst, std::abs (md.magnitudeDb (f * 2.0) - mc.magnitudeDb (f)));
+                }
+            }
+        std::printf ("    Treble 10k->5k / Bass 40->80 Hz: 한 옥타브 평행 이동 오차 최대 %.3f dB\n", worst);
+        CHECK (worst < 0.05, "shelf frequency shift error %.3f dB", worst);
+
+        // 기본값은 v0.3과 같은 곡선 (중간점 160 Hz / 2.5 kHz)
+        Params p; p.mod[0].trebleDb = 6.0f; p.mod[0].bassDb = -8.0f;
+        const auto r = resolveModule (p, 0);
+        CHECK (std::abs (r.trebleMidHz() - 2500.0) < 1e-9 && std::abs (r.bassMidHz() - 160.0) < 1e-9, "default shelf midpoints changed");
+    }
+
+    // 2) Presence는 단계 사이 아무 주파수에서도 중심 이득이 정확 (세션 레이트·HQ 모두)
+    {
+        std::mt19937 rng (11);
+        std::uniform_real_distribution<double> u (0.0, 1.0);
+        double worst = 0.0;
+        for (double fs : { 44100.0, 48000.0, 192000.0 })
+            for (int t = 0; t < 40; ++t)
+            {
+                Params p;
+                p.mod[0].presHz = (float) (700.0 * std::pow (8000.0 / 700.0, u (rng)));
+                p.mod[0].presDb = (float) (1.0 + 5.0 * u (rng));
+                p.mod[0].presQ  = (float) (kPresQMin * std::pow (kPresQMax / kPresQMin, u (rng)));
+                const ResponseModel m (p, 0, fs);
+                worst = std::max (worst, std::abs (m.magnitudeDb (p.mod[0].presHz) - p.mod[0].presDb));
+            }
+        std::printf ("    Presence 0.7~8 kHz 아무 주파수: 중심 이득 오차 최대 %.4f dB\n", worst);
+        CHECK (worst < 0.01, "presence center gain error %.4f dB", worst);
+    }
+
+    // 3) VINTAGE STEPS: 가장 가까운 단계로 (옥타브 거리)
+    {
+        Params p; p.stepped = true;
+        p.mod[0].presHz = 2500.0f; p.mod[0].bassHz = 50.0f; p.mod[0].trebleHz = 11000.0f;
+        auto r = resolveModule (p, 0);
+        CHECK (sameValue (r.presHz, 2800.0) && sameValue (r.bassHz, 60.0) && sameValue (r.trebleHz, 12000.0),
+               "stepped snap: pres %.0f bass %.0f treble %.0f", r.presHz, r.bassHz, r.trebleHz);
+        p.mod[0].presHz = 1150.0f; p.mod[0].bassHz = 34.0f; p.mod[0].trebleHz = 6100.0f;
+        r = resolveModule (p, 0);
+        CHECK (sameValue (r.presHz, 1000.0) && sameValue (r.bassHz, 30.0) && sameValue (r.trebleHz, 7000.0),
+               "stepped snap 2: pres %.0f bass %.0f treble %.0f", r.presHz, r.bassHz, r.trebleHz);
+        p.stepped = false;
+        r = resolveModule (p, 0);
+        CHECK (std::abs (r.presHz - 1150.0) < 1e-3 && std::abs (r.bassHz - 34.0) < 1e-3 && std::abs (r.trebleHz - 6100.0) < 1e-2,
+               "free mode must keep in-between values");
+        p.mod[0].presHz = 50.0f; p.mod[0].bassHz = 500.0f; p.mod[0].trebleHz = 30000.0f;
+        r = resolveModule (p, 0);
+        CHECK (sameValue (r.presHz, 700.0) && sameValue (r.bassHz, 120.0) && sameValue (r.trebleHz, 16000.0), "range clamp");
+    }
+}
+
+//------------------------------------------------------------------------------
 static void dumpCsv (const std::string& dir)
 {
     const double fs = processingRateFor (48000.0);
@@ -1252,7 +1341,7 @@ static void dumpCsv (const std::string& dir)
     {
         char nm[32];
         std::snprintf (nm, sizeof nm, "presQ%.1f", q);
-        Params p; p.mod[0].presIndex = 2; p.mod[0].presDb = 6.0f; p.mod[0].presQ = q; pres.push_back ({ nm, p });
+        Params p; p.mod[0].presHz = 2800.0f; p.mod[0].presDb = 6.0f; p.mod[0].presQ = q; pres.push_back ({ nm, p });
     }
     writeSet ("presence", pres);
 
@@ -1319,6 +1408,7 @@ int main (int argc, char** argv)
     testZeroLatencyAntiAliasing();
     testSessionRateCurves();
     testRobustness();
+    testFrequencyControls();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

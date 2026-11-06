@@ -1,8 +1,8 @@
-# Pillow RZ EQ (v0.3)
+# Pillow RZ EQ (v0.4)
 
 Klangfilm(Siemens) **RZ062a/b** 진공관 EQ 커브를 기반으로 **밴드별 Q 조절**을 더하고,
 Plugin Alliance(NEOLD) RZ062를 참고해 **스테레오/M·S 모듈 조합 · Telefunken EF804S 튜브 · 구간별 출력 트랜스포머**를 넣은 EQ 플러그인입니다.
-v0.3부터 기본 모드가 **ZERO LATENCY (레이턴시 0 샘플)** 입니다.
+v0.3부터 기본 모드가 **ZERO LATENCY (레이턴시 0 샘플)** 이고, v0.4부터 **Bass·Treble 주파수 선택, Presence 0.7~8 kHz 자유 조절, 노브 미세 조정**이 들어갔습니다.
 JUCE 8 / CMake 프로젝트이고 VST3 · AU · Standalone으로 빌드됩니다. (Cubase에서는 VST3 사용)
 
 ![UI](docs_ui.png)
@@ -51,7 +51,7 @@ Mac이면 터미널에서 `bash build_mac.sh` (VST3 + AU).
 - **선형 성분 정렬**: 그냥 ADAA를 쓰면 왜곡 성분이 반 샘플 늦어져서, 세게 걸면 고역의 압축이 덜 빠지고 고역이 수~10 dB 뜹니다.
   ADAA 출력에서 압축(입력과 같은 위상 성분)을 떼어내 지연 없이 다시 거는 보정을 넣어서, 기본파 레벨·위상이 **오버샘플링한 것과 0.01 dB 이내**로 같습니다 (Drive 30~48 dB, 1~15 kHz, 큰 저음 위의 고역도 0.3 dB 이내).
 - **매칭 EQ 설계**: 일반적인 쌍선형 변환은 44.1/48k에서 고역 곡선이 찌그러집니다 (넓은 Presence는 20 kHz 근처 1.9 dB).
-  극점은 아날로그 그대로 옮기고 크기 응답을 DC·기준 주파수·나이퀴스트에서 맞추는 설계(Vicanek 2016)로 바꿔서, 20 Hz~20 kHz 전체에서 아날로그 곡선과 **0.3 dB 이내** (무작위 설정 60개 기준 최대 0.28 dB, HQ는 0.03 dB).
+  극점은 아날로그 그대로 옮기고 크기 응답을 DC·기준 주파수·나이퀴스트에서 맞추는 설계(Vicanek 2016)로 바꿔서, 20 Hz~20 kHz 전체에서 아날로그 곡선과 **보통 0.3 dB 이내** (가장 넓은 Q로 5 kHz 위를 크게 올릴 때 최대 0.5 dB, HQ는 0.05 dB 이내).
 
 ---
 
@@ -64,19 +64,32 @@ Mac이면 터미널에서 `bash build_mac.sh` (VST3 + AU).
 | ZERO LATENCY · HQ | 처리 모드 (위 표) |
 | STEREO L/R · MID/SIDE | 모듈 1 = 왼쪽(또는 Mid), 모듈 2 = 오른쪽(또는 Side). 전환할 때 5 ms 페이드로 클릭 없음 |
 | LINK | 켜면 모듈 2가 모듈 1 설정을 그대로 따름 (기본값, 일반 스테레오 EQ). 끄면 따로 조절 |
-| VINTAGE STEPS | 게인을 원본처럼 계단식으로 (셸프 2 dB, Pivot·Presence 1 dB). Q는 항상 연속 |
+| VINTAGE STEPS | 게인을 원본처럼 계단식으로 (셸프 2 dB, Pivot·Presence 1 dB), 주파수는 눈금 단계에 고정. Q는 항상 연속 |
 
 **모듈 (×2, 원본 RZ062 한 대씩)**
 
 | 컨트롤 | 범위 | 비고 |
 |---|---|---|
 | A PIVOT / B PRESENCE | 모듈 종류 | NEOLD처럼 A+B, B+A 등 조합 가능 |
-| TREBLE + Q | −18 ~ +12 dB, Q 0.3 ~ 2.0 (기본 0.5) | 10 kHz 기준 하이 셸프 |
+| TREBLE + FREQ + Q | −18 ~ +12 dB, 5 ~ 16 kHz (눈금 5 / 7 / **10** / 12 / 16 kHz), Q 0.3 ~ 2.0 (기본 0.5) | 하이 셸프 |
 | PIVOT (A) | ±4 dB | 650 Hz 축 틸트, 오른쪽 = 밝게 |
-| PRESENCE (B) + FREQ + Q | 0 ~ +6 dB, 1.4 / 2 / 2.8 / 4 kHz, Q 0.3 ~ 6.0 (기본 1.0) | NEOLD 기준 1 dB × 6 |
-| BASS + Q | −20 ~ +12 dB, Q 0.3 ~ 2.0 (기본 0.5) | 40 Hz 기준 로우 셸프 |
+| PRESENCE (B) + FREQ + Q | 0 ~ +6 dB, 0.7 ~ 8 kHz (눈금 0.7 / 1 / 1.4 / 2 / **2.8** / 4 / 5.6 / 8 kHz), Q 0.3 ~ 6.0 (기본 1.0) | 벨 부스트. 게인은 NEOLD 기준 1 dB × 6 |
+| BASS + FREQ + Q | −20 ~ +12 dB, 20 ~ 120 Hz (눈금 20 / 30 / **40** / 60 / 80 / 120 Hz), Q 0.3 ~ 2.0 (기본 0.5) | 로우 셸프 |
 | DRIVE | 0 ~ 48 dB | EF804S 단에 들어가는 신호 크기 (상단 DRIVE 스위치가 켜져 있을 때) |
 | LEVEL | ±18 dB | 모듈 출력 (M/S에서는 Mid/Side 레벨 = 스테레오 폭 조절) |
+
+- 굵은 글씨가 원본 RZ062 값(기본값)입니다. 기본값 그대로면 v0.3과 소리가 같습니다.
+- **셸프 FREQ = 셸프가 거의 다 올라오는 지점** (원본 표기 방식: Bass 40 Hz, Treble 10 kHz). 셸프의 중간점은 Bass는 그 4배(40 → 160 Hz), Treble은 1/4(10 k → 2.5 kHz)이고, FREQ를 돌리면 곡선 모양 그대로 옆으로 움직입니다.
+- 주파수는 눈금 사이 어디든 쓸 수 있고, 보통으로 돌리면 눈금 근처에서 살짝 붙어서 원래 단계를 맞추기 쉽습니다.
+
+**노브 조작 (모든 노브)**
+
+| 조작 | 동작 |
+|---|---|
+| 드래그 | 위·오른쪽 = 올림. Q 노브는 이동 거리를 길게 해서 더 촘촘함 |
+| **Shift + 드래그 / Shift + 휠** | 10배 미세 조정 (드래그 도중에 눌러도 값이 튀지 않음). 주파수 노브는 눈금에 붙지 않음 |
+| 값 글자 클릭 | 직접 입력 (예: Q `1.35`, Presence `2.5` 또는 `2.5k` → 2.5 kHz, Bass `55`) |
+| 더블클릭 | 기본값 |
 
 **TUBE (공통)**
 
@@ -129,9 +142,9 @@ DSP 테스트 (JUCE 없이도 됨): `g++ -std=c++17 -O2 -ISource tests/CoreTests
 
 ```
 Source/dsp/RZ062Core.h     DSP 전부 (JUCE 비의존): EQ(매칭 설계), EF804S, 트랜스포머, ADAA, 모듈·라우팅, 응답 곡선
-Source/PluginProcessor.*   파라미터 33개, ZERO LATENCY / HQ 경로, 레이턴시 보고, 바이패스
+Source/PluginProcessor.*   파라미터 37개, ZERO LATENCY / HQ 경로, 레이턴시 보고, 바이패스, 예전 세션 변환
 Source/PluginEditor.*      UI: 모듈 패널 2개, 튜브/트랜스포머 패널, 응답 곡선
-tests/CoreTests.cpp        161개 체크
+tests/CoreTests.cpp        179개 체크
 build_windows.bat          Windows 원클릭 빌드 + VST3 설치
 build_mac.sh               macOS 빌드 + VST3/AU 설치
 .github/workflows/         GitHub Actions 자동 빌드 (Windows VST3 + Standalone)
@@ -145,7 +158,7 @@ build_mac.sh               macOS 빌드 + VST3/AU 설치
 
 - **필터**: Cytomic(Andrew Simper) 선형 사다리꼴 SVF + 샘플 단위 계수 보간 → 큰 노브 변화에도 클릭 없음. 트레블·프레즌스·트랜스포머 셸프는 매칭 설계 계수를 SVF로 변환해서 사용.
 - **트랜스포머·튜브**는 "왜곡 성분"만 만들어 원신호에 더하는 방식이라, 0이면 비트 단위로 완전히 투명합니다.
-- 모듈 1의 파라미터 ID는 v0.1과 같아서 v0.1/v0.2로 저장한 세션도 열립니다.
+- 예전 세션도 그대로 열립니다: 모듈 1의 파라미터 ID는 v0.1과 같고, v0.3 이하의 Presence 4단계 선택은 같은 주파수(1.4 / 2 / 2.8 / 4 kHz)로 옮겨지며, 새 항목(Bass·Treble 주파수)은 원본 값으로 채워집니다.
 
 ---
 
@@ -153,7 +166,7 @@ build_mac.sh               macOS 빌드 + VST3/AU 설치
 
 **자료로 확인한 값** (Audified·NEOLD 매뉴얼, Plugin Alliance 제품 페이지, GroupDIY 실물 측정, 리뷰 기사)
 - 베이스 40 Hz 기준 +12 / −20 dB, 트레블 10 kHz 기준 +12 / −18 dB, 원본 2 dB 스텝
-- A 모듈 Pivot: 650 Hz 중심 ±4 dB / B 모듈 Presence: 1.4 / 2 / 2.8 / 4 kHz
+- A 모듈 Pivot: 650 Hz 중심 ±4 dB / B 모듈 Presence: 1.4 / 2 / 2.8 / 4 kHz (v0.4의 0.7~8 kHz 확장과 Bass·Treble 주파수 선택은 원본에 없는 기능)
 - Presence 최대치: NEOLD는 1 dB × 6 = 6 dB, 실물 측정 자료는 0.8 dB × 6 = 4.8 dB → v0.2부터 NEOLD 기준
 - EF804S: μ 38, 3극관 RC 증폭 이득 31 (데이터시트) / RZ062 안의 결선·전류는 GroupDIY 추정
 
@@ -167,7 +180,8 @@ build_mac.sh               macOS 빌드 + VST3/AU 설치
 
 | 하고 싶은 것 | 고칠 곳 (`RZ062Core.h`) |
 |---|---|
-| 셸프 위치/성격 | `kBassShelfHz`, `kTrebleShelfHz`, `kVintageShelfQ` |
+| 셸프 기본 주파수·성격 | `kBassRefHz`, `kTrebleRefHz`, `kShelfRefToMid`(기준 ↔ 중간점 비율), `kVintageShelfQ` |
+| 주파수 눈금(단계)·범위 | `kBassSteps`, `kTrebleSteps`, `kPresenceSteps` (첫 값 ~ 끝 값이 노브 범위) |
 | 프레즌스 최대치·스텝 | `kPresMaxDb`, `kMidStepDb` |
 | 튜브가 걸리기 시작하는 지점 | `TubeStage::kGridVoltsPerFullScale` |
 | EF804S 회로 (전압·부하·전류) | `Ef804sCurve::kBplus`, `kRl`, `kIdleA` |
@@ -176,7 +190,7 @@ build_mac.sh               macOS 빌드 + VST3/AU 설치
 | ZERO LATENCY 보정이 따라가는 속도 | `AdaaAligned::kAvgSeconds`, `kSlowSeconds` |
 
 ## 검증 상태
-- DSP 코어: GCC·Clang·MSVC(GitHub)에서 테스트 161개 통과 — 응답 곡선 vs 실제 처리(44.1k~192k), 두 모드의 아날로그 곡선 일치, 클릭(라우팅·링크 전환 포함), 블록 크기 독립성, EF804S 데이터시트 대조, 튜브 레벨 보상·Focus, 트랜스포머 구간 분리·압축 방향, M/S·링크·Mix, ADAA 에일리어싱 감소와 기본파 정렬, 극단적인 입력(표 끝·온셋·DC·NaN). AddressSanitizer·UBSan에서도 오류 없음.
-- 플러그인 코드: JUCE 8.0.17에 대고 GCC·Clang 컴파일 (엄격한 경고 옵션에서 에러·경고 0), 실제 프로세서로 레이턴시 측정 (ZERO LATENCY: 보고 0 / 임펄스 0, HQ 48k: 보고 6 / 임펄스 6, 바이패스도 같은 위치), 재생 중 모드 전환(블록 128~2048 모두 약 10 ms), NaN 입력 뒤 자동 복구, 예전 세션 복원, 실제 에디터를 오프스크린 렌더링해서 레이아웃 확인.
+- DSP 코어: GCC·Clang·MSVC(GitHub)에서 테스트 179개 통과 — 응답 곡선 vs 실제 처리(44.1k~192k), 두 모드의 아날로그 곡선 일치, 클릭(라우팅·링크 전환 포함), 블록 크기 독립성, EF804S 데이터시트 대조, 튜브 레벨 보상·Focus, 트랜스포머 구간 분리·압축 방향, M/S·링크·Mix, ADAA 에일리어싱 감소와 기본파 정렬, 극단적인 입력(표 끝·온셋·DC·NaN), 주파수 조절(셸프 평행 이동, Presence 아무 주파수에서 중심 이득 정확, 단계 고정, 주파수 자동화 클릭 없음). AddressSanitizer·UBSan에서도 오류 없음.
+- 플러그인 코드: JUCE 8.0.17에 대고 GCC·Clang 컴파일 (엄격한 경고 옵션에서 에러·경고 0), 실제 프로세서로 레이턴시 측정 (ZERO LATENCY: 보고 0 / 임펄스 0, HQ 48k: 보고 6 / 임펄스 6, 바이패스도 같은 위치), 재생 중 모드 전환(블록 128~2048 모두 약 10 ms), NaN 입력 뒤 자동 복구, 예전 세션 복원(v0.3 Presence 단계 → Hz 변환 포함), 노브 Shift 미세 조정·눈금 붙음·직접 입력을 실제 마우스 이벤트로 확인, 실제 에디터를 오프스크린 렌더링해서 레이아웃 확인.
 
 배포할 계획이면: 제품명과 UI에는 "Klangfilm" 상표를 넣지 않고 "RZ062-style"이라고만 표기해 두었습니다.

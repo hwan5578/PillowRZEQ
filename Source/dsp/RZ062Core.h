@@ -30,12 +30,21 @@ inline constexpr double kPi = 3.14159265358979323846;
 //==============================================================================
 //  EQ 상수 (Audified·NEOLD 매뉴얼, GroupDIY 실측; 추정치는 README에 표시)
 //==============================================================================
+// Bass / Treble 주파수 = "기준 주파수"(셸프가 거의 다 올라오는 곳). 셸프 중간점은 기준에서 2옥타브 안쪽
+//  원본: Bass 40 Hz 기준 -> 중간점 160 Hz, Treble 10 kHz 기준 -> 중간점 2.5 kHz (650 Hz 축 대칭, 추정)
 inline constexpr double kBassRefHz     = 40.0;
 inline constexpr double kTrebleRefHz   = 10000.0;
-inline constexpr double kBassShelfHz   = 160.0;    // 셸프 중간점 (추정)
-inline constexpr double kTrebleShelfHz = 2500.0;   // 650 Hz 축 대칭: 160 x 2500 = 40 x 10000
+inline constexpr double kShelfRefToMid = 4.0;      // 중간점 = Bass 기준 x 4, Treble 기준 / 4
+inline constexpr double kBassShelfHz   = kBassRefHz * kShelfRefToMid;     // 160 Hz (기본값일 때)
+inline constexpr double kTrebleShelfHz = kTrebleRefHz / kShelfRefToMid;   // 2.5 kHz (기본값일 때)
 inline constexpr double kTiltPivotHz   = 650.0;
-inline constexpr std::array<double, 4> kPresenceHz { 1400.0, 2000.0, 2800.0, 4000.0 };
+
+// v0.4: 주파수 단계 (노브 눈금 · VINTAGE STEPS일 때 붙는 위치). 사이 값도 자유롭게 쓸 수 있음
+inline constexpr std::array<double, 6> kBassSteps     { 20.0, 30.0, 40.0, 60.0, 80.0, 120.0 };
+inline constexpr std::array<double, 5> kTrebleSteps   { 5000.0, 7000.0, 10000.0, 12000.0, 16000.0 };
+inline constexpr std::array<double, 8> kPresenceSteps { 700.0, 1000.0, 1400.0, 2000.0, 2800.0, 4000.0, 5600.0, 8000.0 };   // 반 옥타브
+inline constexpr std::array<double, 4> kPresenceHz    { 1400.0, 2000.0, 2800.0, 4000.0 };   // 원본 4단계 (v0.3 이하 세션 변환용)
+inline constexpr double kPresenceDefaultHz = 2800.0;
 
 inline constexpr float kBassMinDb   = -20.0f, kBassMaxDb   = 12.0f;
 inline constexpr float kTrebleMinDb = -18.0f, kTrebleMaxDb = 12.0f;
@@ -85,6 +94,25 @@ inline float quantizePresence (float db) noexcept
     return cleanZero (std::clamp (std::round (db / kMidStepDb) * kMidStepDb, 0.0f, kPresMaxDb));
 }
 
+// 로그(옥타브) 거리로 가장 가까운 단계
+template <size_t N>
+inline double nearestStep (const std::array<double, N>& steps, double hz) noexcept
+{
+    double best = steps[0], bestDist = 1.0e9;
+    for (double st : steps)
+    {
+        const double d = std::abs (std::log (std::max (hz, 1.0) / st));
+        if (d < bestDist) { bestDist = d; best = st; }
+    }
+    return best;
+}
+
+template <size_t N>
+inline double clampToSteps (const std::array<double, N>& steps, double hz) noexcept
+{
+    return std::clamp (hz, steps.front(), steps.back());
+}
+
 inline std::vector<double> trebleDetents()
 {
     std::vector<double> v;
@@ -124,21 +152,21 @@ enum class Routing { Stereo = 0, MidSide = 1 };
 struct ModuleParams
 {
     Mode  mode      = Mode::B_Presence;
-    float trebleDb  = 0.0f, trebleQ = kVintageShelfQ;
-    float bassDb    = 0.0f, bassQ   = kVintageShelfQ;
+    float trebleDb  = 0.0f, trebleQ = kVintageShelfQ, trebleHz = (float) kTrebleRefHz;   // 기준 5 ~ 16 kHz
+    float bassDb    = 0.0f, bassQ   = kVintageShelfQ, bassHz   = (float) kBassRefHz;     // 기준 20 ~ 120 Hz
     float tiltDb    = 0.0f;           // + = 밝게 (고역 업 / 저역 다운)
-    int   presIndex = 2;              // 0..3 -> 1.4 / 2 / 2.8 / 4 kHz
+    float presHz    = (float) kPresenceDefaultHz;   // 0.7 ~ 8 kHz (연속)
     float presDb    = 0.0f, presQ = kVintagePresQ;
     float driveDb   = 0.0f;           // EF804S 드라이브 0..48 dB
     float outputDb  = 0.0f;           // 모듈 출력 레벨
 
     bool operator== (const ModuleParams& o) const noexcept
     {
-        return mode == o.mode && presIndex == o.presIndex
-            && sameValue (trebleDb, o.trebleDb) && sameValue (trebleQ, o.trebleQ)
-            && sameValue (bassDb, o.bassDb)     && sameValue (bassQ, o.bassQ)
+        return mode == o.mode
+            && sameValue (trebleDb, o.trebleDb) && sameValue (trebleQ, o.trebleQ) && sameValue (trebleHz, o.trebleHz)
+            && sameValue (bassDb, o.bassDb)     && sameValue (bassQ, o.bassQ)     && sameValue (bassHz, o.bassHz)
             && sameValue (tiltDb, o.tiltDb)
-            && sameValue (presDb, o.presDb)     && sameValue (presQ, o.presQ)
+            && sameValue (presHz, o.presHz)     && sameValue (presDb, o.presDb)   && sameValue (presQ, o.presQ)
             && sameValue (driveDb, o.driveDb)   && sameValue (outputDb, o.outputDb);
     }
     bool operator!= (const ModuleParams& o) const noexcept { return ! (*this == o); }
@@ -148,7 +176,7 @@ struct Params
 {
     Routing routing = Routing::Stereo;
     bool  link    = true;     // 켜면 모듈 2가 모듈 1 설정을 그대로 따름
-    bool  stepped = false;    // 원본처럼 계단식 게인
+    bool  stepped = false;    // 원본처럼 계단식 게인 + 주파수는 단계에 붙음
     bool  eqOn    = true;
     bool  driveOn = false;
     float focus   = 0.0f;     // -1 = 홀수 배음(대칭)  0 = EF804S 그대로  +1 = 짝수 배음 2배
@@ -172,7 +200,10 @@ struct Params
 // 모듈에 실제로 들어가는 값 (링크 · 스텝 · 모드 · EQ on/off 반영)
 struct ResolvedModule
 {
-    double trebleDb, trebleQ, bassDb, bassQ, tiltDb, presHz, presDb, presQ, driveDb, outputDb;
+    double trebleDb, trebleQ, trebleHz, bassDb, bassQ, bassHz, tiltDb, presHz, presDb, presQ, driveDb, outputDb;
+
+    double trebleMidHz() const noexcept { return trebleHz / kShelfRefToMid; }   // 셸프 중간점
+    double bassMidHz()   const noexcept { return bassHz * kShelfRefToMid; }
 };
 
 inline ResolvedModule resolveModule (const Params& p, int module) noexcept
@@ -187,11 +218,13 @@ inline ResolvedModule resolveModule (const Params& p, int module) noexcept
     r.bassDb   = ! eq ? 0.0 : (st ? quantizeBass (m.bassDb)     : std::clamp (m.bassDb, kBassMinDb, kBassMaxDb));
     r.trebleQ  = std::clamp (m.trebleQ, kShelfQMin, kShelfQMax);
     r.bassQ    = std::clamp (m.bassQ,   kShelfQMin, kShelfQMax);
+    r.trebleHz = st ? nearestStep (kTrebleSteps, m.trebleHz) : clampToSteps (kTrebleSteps, m.trebleHz);
+    r.bassHz   = st ? nearestStep (kBassSteps,   m.bassHz)   : clampToSteps (kBassSteps,   m.bassHz);
 
     // 가운데 밴드: 모드에 따라 한쪽 게인을 0으로 (스무딩으로 자연스럽게 크로스페이드)
     r.tiltDb = (! eq || isB) ? 0.0 : (st ? quantizeTilt (m.tiltDb) : std::clamp (m.tiltDb, -kTiltMaxDb, kTiltMaxDb));
     r.presDb = (! eq || ! isB) ? 0.0 : (st ? quantizePresence (m.presDb) : std::clamp (m.presDb, 0.0f, kPresMaxDb));
-    r.presHz = kPresenceHz[(size_t) std::clamp (m.presIndex, 0, 3)];
+    r.presHz = st ? nearestStep (kPresenceSteps, m.presHz) : clampToSteps (kPresenceSteps, m.presHz);
     r.presQ  = std::clamp (m.presQ, kPresQMin, kPresQMax);
 
     r.driveDb  = std::clamp (m.driveDb, 0.0f, kDriveMaxDb);
@@ -460,8 +493,10 @@ public:
     {
         setTarget (sTrebleDb, r.trebleDb);
         setTarget (sTrebleQ,  std::log (r.trebleQ));
+        setTarget (sTrebleHz, std::log (r.trebleMidHz()));
         setTarget (sBassDb,   r.bassDb);
         setTarget (sBassQ,    std::log (r.bassQ));
+        setTarget (sBassHz,   std::log (r.bassMidHz()));
         setTarget (sTiltDb,   r.tiltDb);
         setTarget (sPresDb,   r.presDb);
         setTarget (sPresHz,   std::log (r.presHz));
@@ -562,9 +597,9 @@ private:
         return c;
     }
 
-    std::array<Smoother*, 8> smoothers() noexcept
+    std::array<Smoother*, 10> smoothers() noexcept
     {
-        return { &sTrebleDb, &sTrebleQ, &sBassDb, &sBassQ, &sTiltDb, &sPresDb, &sPresHz, &sPresQ };
+        return { &sTrebleDb, &sTrebleQ, &sTrebleHz, &sBassDb, &sBassQ, &sBassHz, &sTiltDb, &sPresDb, &sPresHz, &sPresQ };
     }
 
     void applySmoothing() noexcept
@@ -573,6 +608,7 @@ private:
         for (auto* s : smoothers()) s->setTimeConstant (smoothingSeconds, ctrlRate);
         sTrebleDb.eps = sBassDb.eps = sTiltDb.eps = sPresDb.eps = 1.0e-4;   // dB
         sTrebleQ.eps = sBassQ.eps = sPresHz.eps = sPresQ.eps = 1.0e-6;      // log 도메인
+        sTrebleHz.eps = sBassHz.eps = 1.0e-6;
     }
 
     void setTarget (Smoother& s, double v) noexcept
@@ -615,8 +651,8 @@ private:
     Bank computeBank() const noexcept
     {
         Bank b;
-        b.treble = makeHighShelfMatched (kTrebleShelfHz, std::exp (sTrebleQ.current), sTrebleDb.current, fs);
-        b.bass   = makeLowShelf  (kBassShelfHz,   std::exp (sBassQ.current),   sBassDb.current,   fs);
+        b.treble = makeHighShelfMatched (std::exp (sTrebleHz.current), std::exp (sTrebleQ.current), sTrebleDb.current, fs);
+        b.bass   = makeLowShelf  (std::exp (sBassHz.current),   std::exp (sBassQ.current),   sBassDb.current,   fs);
         b.pres   = makeBellMatched (std::exp (sPresHz.current), std::exp (sPresQ.current), sPresDb.current, fs);
         b.tilt   = makeTilt      (kTiltPivotHz, sTiltDb.current, fs);
         return b;
@@ -625,7 +661,7 @@ private:
     double fs = 48000.0, smoothingSeconds = 0.015;
     bool dirty = false, ramping = false;
     int samplesToNextUpdate = 0, rampPos = 0;
-    Smoother sTrebleDb, sTrebleQ, sBassDb, sBassQ, sTiltDb, sPresDb, sPresHz, sPresQ;
+    Smoother sTrebleDb, sTrebleQ, sTrebleHz, sBassDb, sBassQ, sBassHz, sTiltDb, sPresDb, sPresHz, sPresQ;
     Bank base, step, target;
     State st;
 };
@@ -1524,8 +1560,8 @@ public:
         : fs (sampleRate > 0.0 ? sampleRate : 48000.0)
     {
         const ResolvedModule r = resolveModule (p, module);
-        treble = makeHighShelfMatched (kTrebleShelfHz, r.trebleQ, r.trebleDb, fs);
-        bass   = makeLowShelf  (kBassShelfHz,   r.bassQ,   r.bassDb,   fs);
+        treble = makeHighShelfMatched (r.trebleMidHz(), r.trebleQ, r.trebleDb, fs);
+        bass   = makeLowShelf  (r.bassMidHz(),   r.bassQ,   r.bassDb,   fs);
         pres   = makeBellMatched (r.presHz, r.presQ, r.presDb, fs);
         tilt   = makeTilt      (kTiltPivotHz, r.tiltDb, fs);
         shelf  = makeHighShelfMatched (TransformerStage::kShelfHz, TransformerStage::kShelfQ,
