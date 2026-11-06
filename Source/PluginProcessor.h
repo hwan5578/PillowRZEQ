@@ -55,7 +55,7 @@ namespace pillow
 
 //==============================================================================
 class PillowRZAudioProcessor : public juce::AudioProcessor,
-                               private juce::AsyncUpdater
+                               private juce::Timer
 {
 public:
     PillowRZAudioProcessor();
@@ -100,19 +100,18 @@ public:
     // 응답 곡선 계산용 처리 레이트 (지금 소리를 내는 모드 기준). 아직 준비 전이면 48k 기준.
     double getProcessingRate() const noexcept { return processingRate.load(); }
 
-    // 지금 소리를 내는 모드 (전환 페이드가 끝난 뒤 바뀜)
-    bool isHqActive() const noexcept { return activeHq.load(); }
-
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     juce::AudioProcessorValueTreeState apvts;
 
 private:
-    // 모드 전환: 5 ms 페이드아웃 -> (블록 경계에서) 경로 교체·초기화 -> 5 ms 페이드인
+    // 모드 전환: 5 ms 페이드아웃 -> (소리가 0이 되는 그 샘플에서) 경로 교체·초기화 -> 5 ms 페이드인
     enum class Fade { None, Out, In };
 
-    void handleAsyncUpdate() override;            // 레이턴시 보고 (메시지 스레드)
+    void timerCallback() override;                // 레이턴시 보고 (메시지 스레드, 오디오 스레드는 플래그만)
     int latencyFor (bool hq) const noexcept;
+    bool wantsHq() const noexcept;                // 실제로 다른 경로가 되는 경우만 true (176.4k 이상은 늘 false)
     void switchPath (bool toHq) noexcept;         // 오디오 스레드
+    void resetActivePath() noexcept;
     void runActivePath (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
     void applyFade (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
 
@@ -158,8 +157,8 @@ private:
     Fade  fade = Fade::None;
     float fadeGain = 1.0f, fadeStep = 0.0f;
 
-    std::atomic<bool>   activeHq { false };
     std::atomic<int>    pendingLatency { 0 };
+    std::atomic<bool>   latencyDirty { false };
     std::atomic<int>    numChannelsInUse { 2 };
     std::atomic<double> processingRate { 48000.0 };
 

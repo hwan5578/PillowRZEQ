@@ -658,26 +658,26 @@ public:
     // 정규화 전달곡선 T(v): v = 그리드 신호 전압(V), T(0) = 0, T'(0) = 1, 위상 반전 보정됨
     double operator() (double v) const noexcept { return v + dev (v); }
 
-    // T(v) - v. 범위 밖은 포화(평탄)로 연장
+    // T(v) - v. 표의 보간 구간 밖(약 ±1484 V 바깥)은 포화(평탄)로 연장
+    //  (비교를 이렇게 써야 NaN이 표 조회로 들어가지 않음)
     double dev (double v) const noexcept
     {
-        if (v >  kVmax) return tEndPos - v;
-        if (v < -kVmax) return tEndNeg - v;
-        return lookup (devTable, v);
+        if (v >= -vEdge && v <= vEdge) return lookup (devTable, v);
+        return v > 0.0 ? tEdgePos - v : tEdgeNeg - v;
     }
 
-    // 적분 0..v (T(u) - u) du. 범위 밖은 평탄 곡선의 적분으로 연장
+    // 적분 0..v (T(u) - u) du. 표 밖은 평탄 곡선의 적분으로 연장 (경계에서 값이 이어짐)
     double psi (double v) const noexcept
     {
-        if (v >  kVmax) return psiEndPos + tEndPos * (v - kVmax) - 0.5 * (v * v - kVmax * kVmax);
-        if (v < -kVmax) return psiEndNeg + tEndNeg * (v + kVmax) - 0.5 * (v * v - kVmax * kVmax);
-        return lookup (psiTable, v);
+        if (v >= -vEdge && v <= vEdge) return lookup (psiTable, v);
+        return v > 0.0 ? psiEdgePos + tEdgePos * (v - vEdge) - 0.5 * (v * v - vEdge * vEdge)
+                       : psiEdgeNeg + tEdgeNeg * (v + vEdge) - 0.5 * (v * v - vEdge * vEdge);
     }
 
     // dev(v), dev(-v), psi(v), psi(-v)를 한 번에 (오디오 루프용: asinh 1번)
     void evalPair (double v, double& devPos, double& devNeg, double& psiPos, double& psiNeg) const noexcept
     {
-        if (std::abs (v) > kVmax)
+        if (! (std::abs (v) <= vEdge))   // 표 밖 (NaN 포함)
         {
             devPos = dev (v);  devNeg = dev (-v);
             psiPos = psi (v);  psiNeg = psi (-v);
@@ -794,15 +794,17 @@ private:
                 - dw / 6.0 * (integrand (wAt (k - 1), devTable[(size_t) k - 1]) + 4.0 * fm + integrand (wAt (k), devTable[(size_t) k]));
         }
 
-        tEndPos   =  kVmax + devTable[(size_t) kSize - 1];
-        tEndNeg   = -kVmax + devTable[0];
-        psiEndPos = psiTable[(size_t) kSize - 1];
-        psiEndNeg = psiTable[0];
+        // 4점 보간이 표 안에서만 이뤄지는 마지막 격자점 (양쪽 대칭: 2번, kSize-3번)
+        vEdge      = kV0 * std::sinh (wAt ((double) kSize - 3.0));
+        tEdgePos   =  vEdge + devTable[(size_t) kSize - 3];
+        tEdgeNeg   = -vEdge + devTable[2];
+        psiEdgePos = psiTable[(size_t) kSize - 3];
+        psiEdgeNeg = psiTable[2];
     }
 
     Table devTable {}, psiTable {};
     double wMax = 1.0, invDw = 1.0, rk = 0.0, vp0 = 0.0, gain = 1.0;
-    double tEndPos = 0.0, tEndNeg = 0.0, psiEndPos = 0.0, psiEndNeg = 0.0;
+    double vEdge = kVmax, tEdgePos = 0.0, tEdgeNeg = 0.0, psiEdgePos = 0.0, psiEdgeNeg = 0.0;
 };
 
 // 프로세스 전체에서 한 번만 계산 (prepare 때 먼저 불러서 오디오 스레드에서 생성되지 않게 함)
@@ -839,7 +841,7 @@ public:
     static constexpr double kTiny     = 1.0e-12;  // 아주 작은 신호에서는 보정 0으로
     static constexpr double kMaxSlope = 4.0;      // 안전 한계 (정상 동작에서는 닿지 않음)
     static constexpr double kAvgSeconds  = 0.010;   // N, G 회귀 평균
-    static constexpr double kSlowSeconds = 0.040;   // 원신호에 직접 거는 N은 한 번 더 평균 (저역 리플 -> DC 방지)
+    static constexpr double kSlowSeconds = 0.040;   // (트랜스포머) 상보 구간에 거는 N은 한 번 더 평균
 
     void prepare (double sampleRate) noexcept
     {
@@ -897,13 +899,33 @@ private:
     double nNum = 0.0, nDen = 0.0, gNum = 0.0, gDen = 0.0, nSlow = 0.0;
 };
 
+// 1차 ADAA만 (정렬 없음): 입력과 상관없는 성분(짝수 배음·DC)에 사용
+class Adaa1
+{
+public:
+    void reset() noexcept { xPrev = hPrev = HPrev = 0.0; }
+    void rebase (double hAtLast, double HAtLast) noexcept { hPrev = hAtLast; HPrev = HAtLast; }
+
+    double tick (double x, double h, double H) noexcept
+    {
+        const double dx = x - xPrev;
+        const double y  = std::abs (dx) > AdaaAligned::kEps ? (H - HPrev) / dx : 0.5 * (h + hPrev);
+        xPrev = x;  hPrev = h;  HPrev = H;
+        return y;
+    }
+
+private:
+    double xPrev = 0.0, hPrev = 0.0, HPrev = 0.0;
+};
+
 //==============================================================================
 //  튜브 스테이지 (채널 1개)
 //   - Drive: 그리드에 들어가는 신호 크기 (0 dB = 풀스케일이 그리드 0.5 Vpk, 거의 깨끗)
 //   - Focus: 전달곡선의 홀수 성분 + (1 + focus) x 짝수 성분
 //   - 보상: -12 dBFS 사인의 기본파 레벨이 드라이브와 상관없이 같도록 정규화
-//   - 1차 ADAA + 선형 성분 정렬(AdaaAligned): 오버샘플링 없이도 에일리어싱을 크게 줄임 -> 레이턴시 0
-//     원신호는 그대로 두고 "왜곡 성분(y - x)"에만 ADAA와 DC 블로커를 적용
+//   - 1차 ADAA: 오버샘플링 없이도 에일리어싱을 줄임 -> 레이턴시 0. 원신호는 그대로 두고 "왜곡 성분"에만 적용
+//     홀수 성분(압축 + 홀수 배음): ADAA + 선형 성분 정렬, DC 블로커를 거치지 않음 (저역 위상·온셋 그대로)
+//     짝수 성분(짝수 배음 + 비대칭 DC): ADAA -> DC 블로커 (5 Hz)
 //   - Drive off면 완전 바이패스 (비트 단위 동일)
 //==============================================================================
 class TubeStage
@@ -923,7 +945,7 @@ public:
         fs    = sampleRate > 0.0 ? sampleRate : 48000.0;
         dcR   = std::exp (-2.0 * kPi * 5.0 / fs);
         curve = &ef804sCurve();
-        adaa.prepare (fs);
+        oddPart.prepare (fs);
         applySmoothing();
         reset();
     }
@@ -945,7 +967,7 @@ public:
         updateDerived();
     }
 
-    void clearState() noexcept { dcX1 = dcY1 = 0.0; adaa.reset(); }
+    void clearState() noexcept { dcX1 = dcY1 = 0.0; oddPart.reset(); evenPart.reset(); }
 
     void process (float* x, int n) noexcept
     {
@@ -958,9 +980,10 @@ public:
                 {
                     wet.step(); drive.step(); foc.step();
                     updateDerived();
-                    double h, H;                   // 곡선이 바뀌었으니 직전 입력의 값도 새 곡선으로
-                    shapeAt (adaa.lastInput(), h, H);
-                    adaa.rebase (h, H);
+                    double ho, Ho, he, He;         // 곡선이 바뀌었으니 직전 입력의 값도 새 곡선으로
+                    shapeAt (oddPart.lastInput(), ho, Ho, he, He);
+                    oddPart.rebase (ho, Ho);
+                    evenPart.rebase (he, He);
                 }
                 samplesToNextUpdate = kChunk;
             }
@@ -972,18 +995,17 @@ public:
                 for (int k = 0; k < len; ++k)
                 {
                     const double in = p[k];
-                    double h, H;
-                    shapeAt (in, h, H);
-                    const auto sp = adaa.tickSplit (in, h, H);
+                    double ho, Ho, he, He;
+                    shapeAt (in, ho, Ho, he, He);
 
-                    // 순수 왜곡(배음 + 비대칭 DC)만 DC 블로커(5 Hz)로. 선형 성분(압축 + 레벨 보상)은 그대로
-                    // -> 무거운 드라이브에서도 저역 압축의 위상이 틀어지지 않음
-                    const double d  = norm * sp.distortion;
-                    const double hp = d - dcX1 + dcR * dcY1;
-                    dcX1 = d;
+                    const double odd  = oddPart.tick (in, ho, Ho);     // 압축 + 홀수 배음 (정렬됨)
+                    const double even = evenPart.tick (in, he, He);    // 짝수 배음 + DC
+                    const double hp   = even - dcX1 + dcR * dcY1;      // DC 블로커 (5 Hz)
+                    dcX1 = even;
                     dcY1 = hp;
-                    const double lin = norm * (1.0 + sp.slope) - 1.0;
-                    p[k] = (float) (in + wetNow * (hp + lin * in));
+
+                    // 정적 곡선이면 norm * (x + dev(x)) -> 원신호 기준 차이만 wet 만큼
+                    p[k] = (float) (in + wetNow * (norm * (in + odd + hp) - in));
                 }
             }
             else
@@ -1010,13 +1032,15 @@ private:
         return (0.5 * (ep - en) + evenMul * 0.5 * (ep + en)) * invScale;
     }
 
-    // h(x) = shape(x) - x 와 H(x) = 적분 0..x h(u) du 를 한 번에
-    void shapeAt (double x, double& h, double& H) const noexcept
+    // h(x) = shape(x) - x 의 홀수·짝수 성분과 각각의 역도함수 H(x) = 적분 0..x h(u) du 를 한 번에
+    void shapeAt (double x, double& hOdd, double& HOdd, double& hEven, double& HEven) const noexcept
     {
         double dp, dn, pp, pn;
         curve->evalPair (x * scale, dp, dn, pp, pn);
-        h = (0.5 * (dp - dn) + evenMul * 0.5 * (dp + dn)) * invScale;
-        H = (0.5 * (pp + pn) + evenMul * 0.5 * (pp - pn)) * invScale * invScale;
+        hOdd  = 0.5 * (dp - dn) * invScale;
+        hEven = evenMul * 0.5 * (dp + dn) * invScale;
+        HOdd  = 0.5 * (pp + pn) * invScale * invScale;
+        HEven = evenMul * 0.5 * (pp - pn) * invScale * invScale;
     }
 
     void applySmoothing() noexcept
@@ -1050,7 +1074,8 @@ private:
     double fs = 48000.0, dcR = 0.9999, smoothingSeconds = 0.02;
     double wetNow = 0.0, scale = kGridVoltsPerFullScale, invScale = 1.0 / kGridVoltsPerFullScale;
     double evenMul = 1.0, norm = 1.0, dcX1 = 0.0, dcY1 = 0.0;
-    AdaaAligned adaa;
+    AdaaAligned oddPart;
+    Adaa1 evenPart;
     Smoother wet, drive, foc;
     int samplesToNextUpdate = 0;
 };
@@ -1115,6 +1140,7 @@ public:
         splitLo = splitHi = 0.0;
         dcX1 = dcY1 = 0.0;
         for (auto& b : bands) b.reset();
+        midEven.reset();
     }
 
     void process (float* x, int n) noexcept
@@ -1151,17 +1177,23 @@ public:
                     const double c2   = onePoleLp (rest, gSplitHi, splitHi);
                     const double c3   = rest - c2;
 
-                    const auto sl = bands[0].tickSplit (lo,  hLow (lo),   HLow (lo));
-                    const auto sm = bands[1].tickSplit (mid, hMid (mid),  HMid (mid));
-                    const auto sh = bands[2].tickSplit (hi,  hHigh (hi),  HHigh (hi));
+                    // LOW·HIGH 곡선은 홀수 함수 -> DC가 생기지 않음
+                    const auto sl = bands[0].tickSplit (lo, hLow (lo),  HLow (lo));
+                    const auto sh = bands[2].tickSplit (hi, hHigh (hi), HHigh (hi));
 
-                    const double d  = curLow * sl.distortion + curMid * sm.distortion + curHigh * sh.distortion;
-                    const double hp = d - dcX1 + dcR * dcY1;     // DC 블로커는 순수 왜곡에만
-                    dcX1 = d;
+                    // MID는 비대칭 -> 홀수 성분(압축·홀수 배음)과 짝수 성분(짝수 배음·DC)으로 나눠서
+                    const double mp = hMid (mid), mn = hMid (-mid), Mp = HMid (mid), Mn = HMid (-mid);
+                    const auto   sm = bands[1].tickSplit (mid, 0.5 * (mp - mn), 0.5 * (Mp + Mn));
+                    const double me = midEven.tick (mid, 0.5 * (mp + mn), 0.5 * (Mp - Mn));
+                    const double hp = me - dcX1 + dcR * dcY1;     // DC 블로커는 짝수 성분에만
+                    dcX1 = me;
                     dcY1 = hp;
-                    const double lin = curLow * sl.slope * c1 + curMid * sm.slope * c2 + curHigh * sh.slope * c3;
 
-                    p[k] = (float) (svfTick (shelf, shelfState, in) + hp + lin);
+                    const double r = curLow  * (sl.distortion + sl.slope * c1)
+                                   + curMid  * (sm.distortion + sm.slope * c2 + hp)
+                                   + curHigh * (sh.distortion + sh.slope * c3);
+
+                    p[k] = (float) (svfTick (shelf, shelfState, in) + r);
                 }
             }
             else
@@ -1236,6 +1268,7 @@ private:
     SvfCoeffs lpLo, hpLo, lpHi, hpHi, shelf;
     std::array<SvfState, 8> xs {};
     std::array<AdaaAligned, 3> bands {};
+    Adaa1 midEven;
     SvfState shelfState;
     Smoother aLow, aMid, aHigh;
     int samplesToNextUpdate = 0;

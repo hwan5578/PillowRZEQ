@@ -43,6 +43,7 @@ Mac이면 터미널에서 `bash build_mac.sh` (VST3 + AU).
 - 재생 중에도 바꿀 수 있습니다 (약 10 ms 페이드). 레이턴시가 바뀌는 설정이라 **자동화는 막아 두었습니다.**
 - 바뀐 레이턴시는 호스트에 바로 알려서 Cubase의 지연 보상이 따라옵니다.
 - v0.2로 저장한 세션은 ZERO LATENCY로 열립니다. 예전과 똑같은 처리(오버샘플링)를 원하면 HQ를 누르세요.
+- Drive를 아주 세게(36 dB 이상) 걸고 고역이 많은 소리를 넣으면, ZERO LATENCY의 순간 피크가 HQ보다 1~2 dB 높게 나올 수 있습니다 (평균 레벨·음색은 같음). 이런 설정으로 마스터링할 때는 HQ를 권합니다.
 
 **ZERO LATENCY에서 오버샘플링 없이 품질을 지키는 방법**
 - **ADAA (역도함수 안티에일리어싱)**: 튜브·트랜스포머 곡선을 "샘플 사이를 직선으로 이은 구간의 평균"으로 계산해서 접혀 들어오는 배음(에일리어싱)을 줄입니다. 레이턴시가 없습니다.
@@ -130,7 +131,7 @@ DSP 테스트 (JUCE 없이도 됨): `g++ -std=c++17 -O2 -ISource tests/CoreTests
 Source/dsp/RZ062Core.h     DSP 전부 (JUCE 비의존): EQ(매칭 설계), EF804S, 트랜스포머, ADAA, 모듈·라우팅, 응답 곡선
 Source/PluginProcessor.*   파라미터 33개, ZERO LATENCY / HQ 경로, 레이턴시 보고, 바이패스
 Source/PluginEditor.*      UI: 모듈 패널 2개, 튜브/트랜스포머 패널, 응답 곡선
-tests/CoreTests.cpp        155개 체크
+tests/CoreTests.cpp        161개 체크
 build_windows.bat          Windows 원클릭 빌드 + VST3 설치
 build_mac.sh               macOS 빌드 + VST3/AU 설치
 .github/workflows/         GitHub Actions 자동 빌드 (Windows VST3 + Standalone)
@@ -175,7 +176,7 @@ build_mac.sh               macOS 빌드 + VST3/AU 설치
 | ZERO LATENCY 보정이 따라가는 속도 | `AdaaAligned::kAvgSeconds`, `kSlowSeconds` |
 
 ## 검증 상태
-- DSP 코어: GCC·Clang·MSVC(GitHub)에서 테스트 155개 통과 — 응답 곡선 vs 실제 처리(44.1k~192k), 두 모드의 아날로그 곡선 일치, 클릭(라우팅·링크 전환 포함), 블록 크기 독립성, EF804S 데이터시트 대조, 튜브 레벨 보상·Focus, 트랜스포머 구간 분리·압축 방향, M/S·링크·Mix, ADAA 에일리어싱 감소와 기본파 정렬.
-- 플러그인 코드: JUCE 8.0.17에 대고 GCC·Clang 컴파일 (엄격한 경고 옵션에서 에러·경고 0), 실제 프로세서로 레이턴시 측정 (ZERO LATENCY: 보고 0 / 임펄스 0, HQ 48k: 보고 6 / 임펄스 6, 바이패스도 같은 위치), 재생 중 모드 전환 확인, 실제 에디터를 오프스크린 렌더링해서 레이아웃 확인.
+- DSP 코어: GCC·Clang·MSVC(GitHub)에서 테스트 161개 통과 — 응답 곡선 vs 실제 처리(44.1k~192k), 두 모드의 아날로그 곡선 일치, 클릭(라우팅·링크 전환 포함), 블록 크기 독립성, EF804S 데이터시트 대조, 튜브 레벨 보상·Focus, 트랜스포머 구간 분리·압축 방향, M/S·링크·Mix, ADAA 에일리어싱 감소와 기본파 정렬, 극단적인 입력(표 끝·온셋·DC·NaN). AddressSanitizer·UBSan에서도 오류 없음.
+- 플러그인 코드: JUCE 8.0.17에 대고 GCC·Clang 컴파일 (엄격한 경고 옵션에서 에러·경고 0), 실제 프로세서로 레이턴시 측정 (ZERO LATENCY: 보고 0 / 임펄스 0, HQ 48k: 보고 6 / 임펄스 6, 바이패스도 같은 위치), 재생 중 모드 전환(블록 128~2048 모두 약 10 ms), NaN 입력 뒤 자동 복구, 예전 세션 복원, 실제 에디터를 오프스크린 렌더링해서 레이아웃 확인.
 
 배포할 계획이면: 제품명과 UI에는 "Klangfilm" 상표를 넣지 않고 "RZ062-style"이라고만 표기해 두었습니다.

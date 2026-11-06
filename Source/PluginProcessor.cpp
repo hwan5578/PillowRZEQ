@@ -206,11 +206,14 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
     jassert (paramQuality != nullptr && paramRouting != nullptr && paramLink != nullptr && paramSteps != nullptr
              && paramEqOn != nullptr && paramDriveOn != nullptr && paramFocus != nullptr && paramMix != nullptr
              && paramXfLow != nullptr && paramXfMid != nullptr && paramXfHigh != nullptr);
+
+    // 모드를 바꾸면 오디오 스레드는 플래그만 세우고, 호스트 알림(setLatencySamples)은 여기 타이머에서
+    startTimer (40);
 }
 
 PillowRZAudioProcessor::~PillowRZAudioProcessor()
 {
-    cancelPendingUpdate();
+    stopTimer();
 }
 
 //==============================================================================
@@ -283,15 +286,15 @@ void PillowRZAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
         e->reset();
     }
 
-    hq = paramQuality->load() >= 0.5f;
+    hq = wantsHq();
     fade = Fade::None;
     fadeGain = 1.0f;
     fadeStep = (float) (1.0 / (0.005 * baseRate));   // 5 ms
-    activeHq.store (hq);
     processingRate.store (hq ? baseRate * (double) (1 << hqOrder) : baseRate);
 
     const int latency = latencyFor (hq);
     pendingLatency.store (latency);
+    latencyDirty.store (false);
     setLatencySamples (latency);
     prepared = true;
 }
@@ -301,25 +304,34 @@ int PillowRZAudioProcessor::latencyFor (bool useHq) const noexcept
     return (useHq && oversampler != nullptr) ? (int) std::lround (oversampler->getLatencyInSamples()) : 0;
 }
 
-void PillowRZAudioProcessor::handleAsyncUpdate()
+bool PillowRZAudioProcessor::wantsHq() const noexcept
 {
-    setLatencySamples (pendingLatency.load());
+    return paramQuality->load() >= 0.5f && oversampler != nullptr;
 }
 
-// 경로 교체 (오디오 스레드, 소리가 0인 순간에만 호출)
+void PillowRZAudioProcessor::timerCallback()
+{
+    if (latencyDirty.exchange (false))
+        setLatencySamples (pendingLatency.load());
+}
+
+void PillowRZAudioProcessor::resetActivePath() noexcept
+{
+    (hq ? engineHq : engineZero).reset();    // 오래된 필터 상태가 튀어나오지 않게
+    if (hq && oversampler != nullptr)
+        oversampler->reset();
+}
+
+// 경로 교체 (오디오 스레드, 소리가 0인 순간에만 호출). 메모리 할당·락 없음
 void PillowRZAudioProcessor::switchPath (bool toHq) noexcept
 {
     hq = toHq;
-    auto& engine = hq ? engineHq : engineZero;
-    engine.setParams (readParams());
-    engine.reset();                          // 오래된 필터 상태가 튀어나오지 않게
-    if (hq && oversampler != nullptr)
-        oversampler->reset();
+    (hq ? engineHq : engineZero).setParams (readParams());
+    resetActivePath();
 
-    activeHq.store (hq);
     processingRate.store (hq ? baseRate * (double) (1 << hqOrder) : baseRate);
     pendingLatency.store (latencyFor (hq));
-    triggerAsyncUpdate();                    // 호스트에 새 레이턴시 알림은 메시지 스레드에서
+    latencyDirty.store (true);
 }
 
 bool PillowRZAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -384,35 +396,52 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     if (numCh <= 0)
         return;
 
-    // 모드 전환: 페이드아웃이 끝났으면(소리 0) 이 블록부터 새 경로
-    const bool wantHq = paramQuality->load() >= 0.5f;
-    if (fade == Fade::Out && fadeGain <= 0.0f)
-    {
-        if (wantHq != hq)
-            switchPath (wantHq);
-        fade = Fade::In;
-    }
-    else if (wantHq != hq)
-    {
+    // 모드 전환 요청
+    const bool wantHq = wantsHq();
+    if (wantHq != hq)
         fade = Fade::Out;                    // 페이드인 도중이면 지금 크기에서 다시 내려감
-    }
     else if (fade == Fade::Out)
-    {
         fade = Fade::In;                     // 페이드아웃 도중에 원래대로 돌려놓으면 바로 복귀
-    }
 
     (hq ? engineHq : engineZero).setParams (readParams());
 
     juce::dsp::AudioBlock<float> fullBlock (buffer.getArrayOfWritePointers(),
                                             (size_t) numCh, (size_t) numSamples);
 
-    // 호스트가 prepareToPlay 때보다 큰 블록을 보내도 안전하도록 잘라서 처리
-    for (int start = 0; start < numSamples; start += maxBlockSize)
+    // 호스트가 prepareToPlay 때보다 큰 블록을 보내도 안전하도록 잘라서 처리.
+    // 페이드아웃이 끝나는 샘플에서 잘라 바로 새 경로로 넘어감 (블록 크기와 상관없이 전환 공백 10 ms)
+    int pos = 0;
+    while (pos < numSamples)
     {
-        const int len = juce::jmin (maxBlockSize, numSamples - start);
-        auto block = fullBlock.getSubBlock ((size_t) start, (size_t) len);
+        int len = juce::jmin (maxBlockSize, numSamples - pos);
+        if (fade == Fade::Out)
+            len = juce::jmin (len, juce::jmax (1, (int) std::ceil (fadeGain / fadeStep)));
+
+        auto block = fullBlock.getSubBlock ((size_t) pos, (size_t) len);
         runActivePath (block, numCh);
         applyFade (block, numCh);
+        pos += len;
+
+        if (fade == Fade::Out && fadeGain <= 0.0f)
+        {
+            if (wantHq != hq)
+                switchPath (wantHq);
+            fade = Fade::In;
+        }
+    }
+
+    // NaN/Inf가 나오면(입력에 섞여 들어온 경우 등) 이 블록은 무음, 상태는 초기화 -> 다음 블록부터 정상
+    double energy = 0.0;
+    for (int c = 0; c < numCh; ++c)
+    {
+        const float* d = buffer.getReadPointer (c);
+        for (int i = 0; i < numSamples; ++i)
+            energy += (double) d[i] * (double) d[i];
+    }
+    if (! std::isfinite (energy))
+    {
+        buffer.clear();
+        resetActivePath();
     }
 }
 
@@ -428,7 +457,7 @@ void PillowRZAudioProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
         return;
 
     // 바이패스 중에 모드를 바꾸면 바로 적용 (레이턴시도 바로 맞춤)
-    const bool wantHq = paramQuality->load() >= 0.5f;
+    const bool wantHq = wantsHq();
     if (wantHq != hq)
         switchPath (wantHq);
     fade = Fade::None;
@@ -465,7 +494,15 @@ void PillowRZAudioProcessor::setStateInformation (const void* data, int sizeInBy
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (apvts.state.getType()))
-            apvts.replaceState (juce::ValueTree::fromXml (*xml));
+        {
+            auto tree = juce::ValueTree::fromXml (*xml);
+
+            // v0.2 이하 세션에는 quality 항목이 없음 -> 지금 상태와 상관없이 항상 ZERO LATENCY로 열리게
+            if (! tree.getChildWithProperty ("id", pillow::ids::quality).isValid())
+                tree.appendChild (juce::ValueTree ("PARAM", { { "id", pillow::ids::quality }, { "value", 0.0f } }), nullptr);
+
+            apvts.replaceState (tree);
+        }
 }
 
 juce::AudioProcessorEditor* PillowRZAudioProcessor::createEditor()

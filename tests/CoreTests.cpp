@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 
@@ -1080,6 +1081,134 @@ static void testSessionRateCurves()
 }
 
 //------------------------------------------------------------------------------
+static void testRobustness()
+{
+    std::printf ("[16] 견고성 (표 끝, 온셋, DC, NaN)\n");
+    const double fs = 48000.0;
+    const auto& c = ef804sCurve();
+
+    // 1) 표 끝(약 ±1500 V)을 넘나드는 아주 큰 그리드 전압: 출력이 정적 곡선 범위를 넘지 않아야 함
+    {
+        double worstRatio = 0.0;
+        for (double drive : { 42.0, 48.0 })
+            for (double amp : { 8.0, 11.9, 13.0, 20.0 })
+            {
+                TubeStage t;
+                t.prepare (fs);
+                t.setTargets (true, drive, 0.0);
+                t.reset();
+                auto x = sine (fs, 100.0, amp, (int) fs / 2);
+                double refPeak = 0.0;
+                for (float v : x) refPeak = std::max (refPeak, std::abs (t.transfer (v)));
+                float* ptr = x.data();
+                t.process (ptr, (int) x.size());
+                double peak = 0.0;
+                for (size_t i = x.size() / 2; i < x.size(); ++i) peak = std::max (peak, (double) std::abs (x[i]));
+                worstRatio = std::max (worstRatio, peak / refPeak);
+            }
+        // 엔진 전체: Bass +12 dB Q 2 + Drive 48, 100 Hz +5 dBFS
+        Engine e;
+        e.prepare (fs, 1, 512);
+        Params p;
+        p.driveOn = true;
+        p.mod[0].bassDb = 12.0f; p.mod[0].bassQ = 2.0f; p.mod[0].driveDb = 48.0f;
+        e.setParams (p);
+        e.reset();
+        auto x = sine (fs, 100.0, std::pow (10.0, 5.0 / 20.0), (int) fs);
+        double peak = 0.0;
+        for (size_t start = 0; start < x.size(); start += 512)
+        {
+            float* ch[1] = { x.data() + start };
+            e.process (ch, 1, (int) std::min<size_t> (512, x.size() - start));
+        }
+        for (size_t i = x.size() / 2; i < x.size(); ++i) peak = std::max (peak, (double) std::abs (x[i]));
+        std::printf ("    그리드 수백~2500 V: 피크 / 정적 곡선 피크 최대 %.2f배, 엔진(Bass +12 Q2, Drive 48, +5 dBFS) 피크 %.2f\n",
+                     worstRatio, peak);
+        CHECK (worstRatio < 1.25, "table-edge overshoot x%.2f", worstRatio);
+        CHECK (peak < 1.0, "engine peak at extreme drive %.2f", peak);
+    }
+
+    // 2) 온셋: 무음 뒤 60 Hz 버스트. 같은 DC 블로커를 거친 정적 곡선과 첫 주기 피크가 같아야 함 (튀는 것 없음)
+    {
+        double worst = 0.0;
+        for (double drive : { 36.0, 48.0 })
+        {
+            TubeStage t;
+            t.prepare (fs);
+            t.setTargets (true, drive, 0.0);
+            t.reset();
+            const int n = (int) (fs * 0.2), start = (int) (fs * 0.05);
+            std::vector<float> x ((size_t) n, 0.0f);
+            for (int i = start; i < n; ++i) x[(size_t) i] = (float) (0.9 * std::sin (2.0 * kPi * 60.0 * (i - start) / fs));
+            // 기준: norm * (x + 홀수(x) + DC블로커(짝수(x)))
+            const double scale = TubeStage::kGridVoltsPerFullScale * dbToGain (drive);
+            const double norm  = t.transfer (1.0e-3) / (1.0e-3 + c.dev (1.0e-3 * scale) / scale);
+            const double R = std::exp (-2.0 * kPi * 5.0 / fs);
+            double x1 = 0.0, y1 = 0.0, refPeak = 0.0;
+            for (int i = 0; i < start + (int) (fs / 60.0); ++i)
+            {
+                const double v = x[(size_t) i] * scale, dp = c.dev (v), dn = c.dev (-v);
+                const double even = 0.5 * (dp + dn) / scale, hp = even - x1 + R * y1;
+                x1 = even; y1 = hp;
+                refPeak = std::max (refPeak, std::abs (norm * (x[(size_t) i] + 0.5 * (dp - dn) / scale + hp)));
+            }
+            float* ptr = x.data();
+            t.process (ptr, n);
+            double peak = 0.0;
+            for (int i = start; i < start + (int) (fs / 60.0); ++i) peak = std::max (peak, (double) std::abs (x[(size_t) i]));
+            worst = std::max (worst, std::abs (20.0 * std::log10 (peak / refPeak)));
+        }
+        std::printf ("    무음 뒤 60 Hz 버스트 첫 주기 피크: 정적 곡선 대비 최대 %.2f dB\n", worst);
+        CHECK (worst < 0.3, "onset peak deviation %.2f dB", worst);
+    }
+
+    // 3) 저역 사인의 DC: 비대칭 곡선이라도 출력 DC가 남지 않아야 함
+    {
+        double worstDc = 0.0;
+        for (double drive : { 36.0, 48.0 })
+            for (double f0 : { 20.0, 50.0 })
+            {
+                TubeStage t;
+                t.prepare (fs);
+                t.setTargets (true, drive, 1.0);   // Focus +100: 짝수 성분 최대
+                t.reset();
+                auto x = sine (fs, f0, 0.5, (int) (fs * 4));
+                float* ptr = x.data();
+                t.process (ptr, (int) x.size());
+                double sum = 0.0;
+                const size_t len = (size_t) (fs * 2);
+                for (size_t i = x.size() - len; i < x.size(); ++i) sum += x[i];
+                worstDc = std::max (worstDc, std::abs (sum / (double) len));
+            }
+        std::printf ("    20/50 Hz, Drive 36/48, Focus +100: 출력 DC 최대 %.1e\n", worstDc);
+        CHECK (worstDc < 1.0e-5, "DC leak %.2e", worstDc);
+    }
+
+    // 4) NaN이 들어와도 표 조회가 정의되지 않은 동작을 하지 않고, reset 뒤에는 정상
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        double dp, dn, pp, pn;
+        c.evalPair (nan, dp, dn, pp, pn);
+        CHECK (std::isnan (c.dev (nan)) && std::isnan (c.psi (nan)) && std::isnan (dp) && std::isnan (pp), "NaN must stay NaN");
+        TubeStage t;
+        t.prepare (fs);
+        t.setTargets (true, 30.0, 0.0);
+        t.reset();
+        auto x = sine (fs, 440.0, 0.5, 4800);
+        x[100] = std::numeric_limits<float>::quiet_NaN();
+        float* ptr = x.data();
+        t.process (ptr, (int) x.size());
+        t.reset();
+        auto y = sine (fs, 440.0, 0.5, 4800);
+        ptr = y.data();
+        t.process (ptr, (int) y.size());
+        bool finite = true;
+        for (float v : y) finite = finite && std::isfinite (v);
+        CHECK (finite, "tube must recover after reset");
+    }
+}
+
+//------------------------------------------------------------------------------
 static void dumpCsv (const std::string& dir)
 {
     const double fs = processingRateFor (48000.0);
@@ -1189,6 +1318,7 @@ int main (int argc, char** argv)
     testRoutingAndLink();
     testZeroLatencyAntiAliasing();
     testSessionRateCurves();
+    testRobustness();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
