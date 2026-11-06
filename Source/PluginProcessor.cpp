@@ -9,12 +9,21 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
     using FloatParam = juce::AudioParameterFloat;
     using FloatAttr  = juce::AudioParameterFloatAttributes;
     using Range      = juce::NormalisableRange<float>;
+    using pillow::ids::forModule;
 
     auto dbAttr = []
     {
         return FloatAttr()
             .withLabel ("dB")
             .withStringFromValueFunction ([] (float v, int) { return pillow::formatDb (v); })
+            .withValueFromStringFunction ([] (const juce::String& s) { return s.getFloatValue(); });
+    };
+
+    auto driveAttr = []
+    {
+        return FloatAttr()
+            .withLabel ("dB")
+            .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 1) + " dB"; })
             .withValueFromStringFunction ([] (const juce::String& s) { return s.getFloatValue(); });
     };
 
@@ -26,6 +35,30 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
                                           { return s.retainCharacters ("0123456789.").getFloatValue(); });
     };
 
+    auto percentAttr = []
+    {
+        return FloatAttr()
+            .withLabel ("%")
+            .withStringFromValueFunction ([] (float v, int) { return juce::String (juce::roundToInt (v)) + " %"; })
+            .withValueFromStringFunction ([] (const juce::String& s) { return s.getFloatValue(); });
+    };
+
+    auto focusAttr = []
+    {
+        return FloatAttr()
+            .withStringFromValueFunction ([] (float v, int)
+            {
+                const int r = juce::roundToInt (v);
+                if (r == 0) return juce::String ("Neutral");
+                return (r < 0 ? juce::String ("Odd ") : juce::String ("Even ")) + juce::String (std::abs (r)) + " %";
+            })
+            .withValueFromStringFunction ([] (const juce::String& s)
+            {
+                const float n = s.retainCharacters ("0123456789.").getFloatValue();
+                return s.containsIgnoreCase ("odd") || s.trimStart().startsWithChar ('-') ? -n : n;
+            });
+    };
+
     Range shelfQRange (rz::kShelfQMin, rz::kShelfQMax, 0.001f);
     shelfQRange.setSkewForCentre (0.6f);      // 빈티지 0.5가 약 40% 위치
 
@@ -34,56 +67,93 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
 
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
+    // ── 전역 ────────────────────────────────────────────────────────────────
     layout.add (std::make_unique<juce::AudioParameterChoice> (
-        juce::ParameterID { pillow::ids::mode, 1 }, "Mode",
-        juce::StringArray { "A (Tilt)", "B (Presence)" }, 1));
+        juce::ParameterID { pillow::ids::routing, 2 }, "Routing",
+        juce::StringArray { "Stereo (L/R)", "Mid / Side" }, 0));
+
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { pillow::ids::link, 2 }, "Link", true));
 
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { pillow::ids::steps, 1 }, "Vintage Steps", false));
 
-    layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::treble, 1 }, "Treble",
-        Range (rz::kTrebleMinDb, rz::kTrebleMaxDb, 0.01f), 0.0f, dbAttr()));
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { pillow::ids::eqOn, 2 }, "EQ On", true));
+
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { pillow::ids::driveOn, 2 }, "Drive On", false));
 
     layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::trebleQ, 1 }, "Treble Q",
-        shelfQRange, rz::kVintageShelfQ, qAttr()));
+        juce::ParameterID { pillow::ids::focus, 2 }, "Focus",
+        Range (-100.0f, 100.0f, 0.1f), 0.0f, focusAttr()));
 
     layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::bass, 1 }, "Bass",
-        Range (rz::kBassMinDb, rz::kBassMaxDb, 0.01f), 0.0f, dbAttr()));
+        juce::ParameterID { pillow::ids::mix, 2 }, "Mix",
+        Range (0.0f, 100.0f, 0.1f), 100.0f, percentAttr()));
 
     layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::bassQ, 1 }, "Bass Q",
-        shelfQRange, rz::kVintageShelfQ, qAttr()));
+        juce::ParameterID { pillow::ids::xfLow, 2 }, "Transformer Low",
+        Range (0.0f, 100.0f, 0.1f), 0.0f, percentAttr()));
 
     layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::tilt, 1 }, "Tilt",
-        Range (-rz::kTiltMaxDb, rz::kTiltMaxDb, 0.01f), 0.0f, dbAttr()));
-
-    layout.add (std::make_unique<juce::AudioParameterChoice> (
-        juce::ParameterID { pillow::ids::presFreq, 1 }, "Presence Freq",
-        juce::StringArray { "1.4 kHz", "2 kHz", "2.8 kHz", "4 kHz" }, 2));
+        juce::ParameterID { pillow::ids::xfMid, 2 }, "Transformer Mid",
+        Range (0.0f, 100.0f, 0.1f), 0.0f, percentAttr()));
 
     layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::presGain, 1 }, "Presence",
-        Range (0.0f, rz::kPresMaxDb, 0.01f), 0.0f, dbAttr()));
+        juce::ParameterID { pillow::ids::xfHigh, 2 }, "Transformer High",
+        Range (0.0f, 100.0f, 0.1f), 0.0f, percentAttr()));
 
-    layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::presQ, 1 }, "Presence Q",
-        presQRange, rz::kVintagePresQ, qAttr()));
+    // ── 모듈 1, 2 ───────────────────────────────────────────────────────────
+    for (int m = 0; m < 2; ++m)
+    {
+        const int v = (m == 0) ? 1 : 2;   // 모듈 1의 기존 ID는 v0.1부터 있던 것
+        const juce::String n = juce::String (m + 1) + " ";
 
-    layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::tube, 1 }, "Tube",
-        Range (0.0f, 100.0f, 0.1f), 0.0f,
-        FloatAttr()
-            .withLabel ("%")
-            .withStringFromValueFunction ([] (float v, int) { return juce::String (juce::roundToInt (v)) + " %"; })
-            .withValueFromStringFunction ([] (const juce::String& s) { return s.getFloatValue(); })));
+        layout.add (std::make_unique<juce::AudioParameterChoice> (
+            juce::ParameterID { forModule (pillow::ids::mode, m), v }, n + "Type",
+            juce::StringArray { "A (Pivot)", "B (Presence)" }, 1));
 
-    layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::output, 1 }, "Output",
-        Range (-18.0f, 18.0f, 0.01f), 0.0f, dbAttr()));
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::treble, m), v }, n + "Treble",
+            Range (rz::kTrebleMinDb, rz::kTrebleMaxDb, 0.01f), 0.0f, dbAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::trebleQ, m), v }, n + "Treble Q",
+            shelfQRange, rz::kVintageShelfQ, qAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::bass, m), v }, n + "Bass",
+            Range (rz::kBassMinDb, rz::kBassMaxDb, 0.01f), 0.0f, dbAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::bassQ, m), v }, n + "Bass Q",
+            shelfQRange, rz::kVintageShelfQ, qAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::tilt, m), v }, n + "Pivot",
+            Range (-rz::kTiltMaxDb, rz::kTiltMaxDb, 0.01f), 0.0f, dbAttr()));
+
+        layout.add (std::make_unique<juce::AudioParameterChoice> (
+            juce::ParameterID { forModule (pillow::ids::presFreq, m), v }, n + "Presence Freq",
+            juce::StringArray { "1.4 kHz", "2 kHz", "2.8 kHz", "4 kHz" }, 2));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::presGain, m), v }, n + "Presence",
+            Range (0.0f, rz::kPresMaxDb, 0.01f), 0.0f, dbAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::presQ, m), v }, n + "Presence Q",
+            presQRange, rz::kVintagePresQ, qAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::drive, m), 2 }, n + "Drive",
+            Range (0.0f, rz::kDriveMaxDb, 0.01f), 0.0f, driveAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { forModule (pillow::ids::output, m), v }, n + "Level",
+            Range (-18.0f, 18.0f, 0.01f), 0.0f, dbAttr()));
+    }
 
     return layout;
 }
@@ -95,41 +165,73 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
-    paramMode     = apvts.getRawParameterValue (pillow::ids::mode);
-    paramSteps    = apvts.getRawParameterValue (pillow::ids::steps);
-    paramTreble   = apvts.getRawParameterValue (pillow::ids::treble);
-    paramTrebleQ  = apvts.getRawParameterValue (pillow::ids::trebleQ);
-    paramBass     = apvts.getRawParameterValue (pillow::ids::bass);
-    paramBassQ    = apvts.getRawParameterValue (pillow::ids::bassQ);
-    paramTilt     = apvts.getRawParameterValue (pillow::ids::tilt);
-    paramPresFreq = apvts.getRawParameterValue (pillow::ids::presFreq);
-    paramPresGain = apvts.getRawParameterValue (pillow::ids::presGain);
-    paramPresQ    = apvts.getRawParameterValue (pillow::ids::presQ);
-    paramTube     = apvts.getRawParameterValue (pillow::ids::tube);
-    paramOutput   = apvts.getRawParameterValue (pillow::ids::output);
+    paramRouting = apvts.getRawParameterValue (pillow::ids::routing);
+    paramLink    = apvts.getRawParameterValue (pillow::ids::link);
+    paramSteps   = apvts.getRawParameterValue (pillow::ids::steps);
+    paramEqOn    = apvts.getRawParameterValue (pillow::ids::eqOn);
+    paramDriveOn = apvts.getRawParameterValue (pillow::ids::driveOn);
+    paramFocus   = apvts.getRawParameterValue (pillow::ids::focus);
+    paramMix     = apvts.getRawParameterValue (pillow::ids::mix);
+    paramXfLow   = apvts.getRawParameterValue (pillow::ids::xfLow);
+    paramXfMid   = apvts.getRawParameterValue (pillow::ids::xfMid);
+    paramXfHigh  = apvts.getRawParameterValue (pillow::ids::xfHigh);
 
-    jassert (paramMode != nullptr && paramSteps != nullptr && paramTreble != nullptr
-             && paramTrebleQ != nullptr && paramBass != nullptr && paramBassQ != nullptr
-             && paramTilt != nullptr && paramPresFreq != nullptr && paramPresGain != nullptr
-             && paramPresQ != nullptr && paramTube != nullptr && paramOutput != nullptr);
+    for (int m = 0; m < 2; ++m)
+    {
+        auto get = [this, m] (const char* base) { return apvts.getRawParameterValue (pillow::ids::forModule (base, m)); };
+        auto& p    = modulePtrs[(size_t) m];
+        p.mode     = get (pillow::ids::mode);
+        p.treble   = get (pillow::ids::treble);
+        p.trebleQ  = get (pillow::ids::trebleQ);
+        p.bass     = get (pillow::ids::bass);
+        p.bassQ    = get (pillow::ids::bassQ);
+        p.tilt     = get (pillow::ids::tilt);
+        p.presFreq = get (pillow::ids::presFreq);
+        p.presGain = get (pillow::ids::presGain);
+        p.presQ    = get (pillow::ids::presQ);
+        p.drive    = get (pillow::ids::drive);
+        p.output   = get (pillow::ids::output);
+        jassert (p.mode != nullptr && p.treble != nullptr && p.trebleQ != nullptr && p.bass != nullptr
+                 && p.bassQ != nullptr && p.tilt != nullptr && p.presFreq != nullptr && p.presGain != nullptr
+                 && p.presQ != nullptr && p.drive != nullptr && p.output != nullptr);
+    }
+
+    jassert (paramRouting != nullptr && paramLink != nullptr && paramSteps != nullptr && paramEqOn != nullptr
+             && paramDriveOn != nullptr && paramFocus != nullptr && paramMix != nullptr
+             && paramXfLow != nullptr && paramXfMid != nullptr && paramXfHigh != nullptr);
 }
 
 //==============================================================================
 rz::Params PillowRZAudioProcessor::readParams() const noexcept
 {
     rz::Params p;
-    p.mode      = paramMode->load() >= 0.5f ? rz::Mode::B_Presence : rz::Mode::A_Tilt;
-    p.stepped   = paramSteps->load() >= 0.5f;
-    p.trebleDb  = paramTreble->load();
-    p.trebleQ   = paramTrebleQ->load();
-    p.bassDb    = paramBass->load();
-    p.bassQ     = paramBassQ->load();
-    p.tiltDb    = paramTilt->load();
-    p.presIndex = juce::jlimit (0, 3, (int) std::lround (paramPresFreq->load()));
-    p.presDb    = paramPresGain->load();
-    p.presQ     = paramPresQ->load();
-    p.tube      = paramTube->load() * 0.01f;
-    p.outputDb  = paramOutput->load();
+    p.routing = paramRouting->load() >= 0.5f ? rz::Routing::MidSide : rz::Routing::Stereo;
+    p.link    = paramLink->load() >= 0.5f;
+    p.stepped = paramSteps->load() >= 0.5f;
+    p.eqOn    = paramEqOn->load() >= 0.5f;
+    p.driveOn = paramDriveOn->load() >= 0.5f;
+    p.focus   = paramFocus->load() * 0.01f;
+    p.mix     = paramMix->load() * 0.01f;
+    p.xfLow   = paramXfLow->load() * 0.01f;
+    p.xfMid   = paramXfMid->load() * 0.01f;
+    p.xfHigh  = paramXfHigh->load() * 0.01f;
+
+    for (size_t m = 0; m < 2; ++m)
+    {
+        const auto& ptr = modulePtrs[m];
+        auto& mp = p.mod[m];
+        mp.mode      = ptr.mode->load() >= 0.5f ? rz::Mode::B_Presence : rz::Mode::A_Tilt;
+        mp.trebleDb  = ptr.treble->load();
+        mp.trebleQ   = ptr.trebleQ->load();
+        mp.bassDb    = ptr.bass->load();
+        mp.bassQ     = ptr.bassQ->load();
+        mp.tiltDb    = ptr.tilt->load();
+        mp.presIndex = juce::jlimit (0, 3, (int) std::lround (ptr.presFreq->load()));
+        mp.presDb    = ptr.presGain->load();
+        mp.presQ     = ptr.presQ->load();
+        mp.driveDb   = ptr.drive->load();
+        mp.outputDb  = ptr.output->load();
+    }
     return p;
 }
 
@@ -138,10 +240,11 @@ void PillowRZAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 {
     const int order = rz::oversamplingOrderFor (sampleRate);
 
-    numProcessChannels = juce::jmax (1, getTotalNumOutputChannels());
-    maxBlockSize       = juce::jmax (1, samplesPerBlock);
+    numProcessChannels = juce::jlimit (1, 2, getTotalNumOutputChannels());
+    numChannelsInUse.store (numProcessChannels);
+    maxBlockSize = juce::jmax (1, samplesPerBlock);
 
-    // EQ와 튜브를 모두 오버샘플된 레이트에서 처리 (IIR 하프밴드: 지연이 짧고 아날로그 같은 위상)
+    // EQ·튜브·트랜스포머를 모두 오버샘플된 레이트에서 처리 (IIR 하프밴드: 지연이 짧고 아날로그 같은 위상)
     oversampler = std::make_unique<juce::dsp::Oversampling<float>> (
         (size_t) numProcessChannels, (size_t) order,
         juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR,
@@ -152,7 +255,7 @@ void PillowRZAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     const double rate = sampleRate * (double) (1 << order);
     processingRate.store (rate);
 
-    engine.prepare (rate, numProcessChannels);
+    engine.prepare (rate, numProcessChannels, maxBlockSize << order);
     engine.setParams (readParams());
     engine.reset();
 
@@ -180,7 +283,7 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     engine.setParams (readParams());
 
-    const int numCh = juce::jmin (numProcessChannels, buffer.getNumChannels(), 8);
+    const int numCh = juce::jmin (numProcessChannels, buffer.getNumChannels());
     if (numCh <= 0)
         return;
 
@@ -195,7 +298,7 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
         auto osBlock = oversampler->processSamplesUp (block);
 
-        std::array<float*, 8> ptrs {};
+        std::array<float*, 2> ptrs {};
         for (int c = 0; c < numCh; ++c)
             ptrs[(size_t) c] = osBlock.getChannelPointer ((size_t) c);
 
@@ -216,7 +319,7 @@ void PillowRZAudioProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
     if (oversampler == nullptr || numSamples == 0)
         return;
 
-    const int numCh = juce::jmin (numProcessChannels, buffer.getNumChannels(), 8);
+    const int numCh = juce::jmin (numProcessChannels, buffer.getNumChannels());
     if (numCh <= 0)
         return;
 

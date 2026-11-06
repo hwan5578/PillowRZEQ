@@ -1,146 +1,151 @@
-# Pillow RZ EQ
+# Pillow RZ EQ (v0.2)
 
-Klangfilm(Siemens) **RZ062a/b** 진공관 EQ의 커브를 기반으로, 원본에는 없는 **밴드별 Q 조절**을 더한 EQ 플러그인입니다.
+Klangfilm(Siemens) **RZ062a/b** 진공관 EQ 커브를 기반으로 **밴드별 Q 조절**을 더하고,
+Plugin Alliance(NEOLD) RZ062를 참고해 **스테레오/M·S 모듈 조합 · Telefunken EF804S 튜브 · 구간별 출력 트랜스포머**를 넣은 EQ 플러그인입니다.
 JUCE 8 / CMake 프로젝트이고 VST3 · AU · Standalone으로 빌드됩니다. (Cubase에서는 VST3 사용)
 
-![응답 곡선](docs_response_curves.png)
+![UI](docs_ui.png)
 
-위 그래프는 그림용 계산이 아니라, 이 프로젝트의 DSP 코드에 임펄스를 넣어 측정한 값입니다.
+![EQ 응답 곡선](docs_response_curves.png)
+
+![튜브·트랜스포머 왜곡](docs_tube_transformer.png)
+
+위 그래프는 전부 이 프로젝트의 DSP 코드를 실제로 돌려서 측정한 값이고, UI 그림도 실제 플러그인 화면을 렌더링한 것입니다.
+
+---
+
+## VST3 파일 만들기
+
+### 방법 1 — GitHub에서 자동 빌드 (설치 불필요)
+`main` 브랜치에 push 하면 GitHub의 Windows 서버가 MSVC로 빌드하고 DSP 테스트까지 돌립니다 (10분 안팎).
+- 결과물: 저장소 → **Actions** → 최신 Build 실행 → 맨 아래 **Artifacts** → `PillowRZ-EQ-Windows-VST3`
+- 같은 zip이 `builds` 브랜치에도 올라갑니다 (`PillowRZ-EQ-Windows-VST3.zip`, `PillowRZ-EQ-Windows-Standalone.zip`).
+- 압축을 풀어 `Pillow RZ EQ.vst3` 폴더를 `C:\Program Files\Common Files\VST3` 에 넣고 Cubase에서 다시 스캔.
+
+### 방법 2 — Windows PC에서 더블클릭
+`build_windows.bat` 을 더블클릭하면 빌드 → VST3 폴더 설치까지 한 번에 합니다.
+처음 한 번만 Visual Studio Build Tools, CMake, Git이 필요하고, 없으면 스크립트가 `winget` 설치 명령을 알려줍니다.
+Mac이면 터미널에서 `bash build_mac.sh` (VST3 + AU).
 
 ---
 
 ## 컨트롤
 
-| 컨트롤 | 범위 | 원본 RZ062 | 비고 |
-|---|---|---|---|
-| **TREBLE** | −18 ~ +12 dB | 10 kHz 기준, 2 dB 스텝 | 하이 셸프 |
-| TREBLE **Q** | 0.3 ~ 2.0 (기본 0.5) | 없음 (고정 커브) | 0.5 = 원본에 가까운 완만한 셸프 |
-| **BASS** | −20 ~ +12 dB | 40 Hz 기준, 2 dB 스텝 (컷 쪽 첫 칸은 −4 dB) | 로우 셸프 |
-| BASS **Q** | 0.3 ~ 2.0 (기본 0.5) | 없음 | |
-| **MODE** | A / B | A·B 모듈이 별개 제품 | A = 틸트, B = 프레즌스 |
-| TILT (A) | ±4 dB | 650 Hz 축 회전, 0.8 dB 스텝 | 오른쪽 = 밝게(고역↑ 저역↓) |
-| PRESENCE (B) | 0 ~ +4.8 dB | 0.8 dB × 6칸 | 부스트 전용 |
-| PRESENCE FREQ | 1.4 / 2 / 2.8 / 4 kHz | 같음 | |
-| PRESENCE **Q** | 0.3 ~ 6.0 (기본 1.0) | 없음 | |
-| VINTAGE STEPS | on / off | 원본은 계단식 | on이면 게인이 원본 스텝에 붙음 (Q는 항상 연속) |
-| TUBE | 0 ~ 100 % | 진공관 증폭단 색채 | 0 %면 완전 바이패스 |
-| OUTPUT | ±18 dB | | |
+**상단**
 
-### Q가 하는 일
-- **셸프 Q** — 0.5는 원본처럼 넓고 완만한 경사, 0.707은 일반적인 2차 셸프, 1 이상은 경사가 가팔라지면서 셸프 앞뒤로 범프와 딥이 생깁니다(Pultec식 "부스트하면서 바로 위를 살짝 파는" 느낌). Q 2.0에서 +12 dB면 최대 약 +16.6 dB 범프 / −4.6 dB 딥.
-- **프레즌스 Q** — +4.8 dB 기준 절반 게인 대역폭: Q 0.3 ≈ 3.7옥타브, 1.0 ≈ 1.4옥타브, 2.0 ≈ 0.7옥타브, 6.0 ≈ 0.24옥타브.
+| 컨트롤 | 설명 |
+|---|---|
+| STEREO L/R · MID/SIDE | 모듈 1 = 왼쪽(또는 Mid), 모듈 2 = 오른쪽(또는 Side). 전환할 때 5 ms 페이드로 클릭 없음 |
+| LINK | 켜면 모듈 2가 모듈 1 설정을 그대로 따름 (기본값, 일반 스테레오 EQ). 끄면 따로 조절 |
+| VINTAGE STEPS | 게인을 원본처럼 계단식으로 (셸프 2 dB, Pivot·Presence 1 dB). Q는 항상 연속 |
+
+**모듈 (×2, 원본 RZ062 한 대씩)**
+
+| 컨트롤 | 범위 | 비고 |
+|---|---|---|
+| A PIVOT / B PRESENCE | 모듈 종류 | NEOLD처럼 A+B, B+A 등 조합 가능 |
+| TREBLE + Q | −18 ~ +12 dB, Q 0.3 ~ 2.0 (기본 0.5) | 10 kHz 기준 하이 셸프 |
+| PIVOT (A) | ±4 dB | 650 Hz 축 틸트, 오른쪽 = 밝게 |
+| PRESENCE (B) + FREQ + Q | 0 ~ +6 dB, 1.4 / 2 / 2.8 / 4 kHz, Q 0.3 ~ 6.0 (기본 1.0) | NEOLD 기준 1 dB × 6 |
+| BASS + Q | −20 ~ +12 dB, Q 0.3 ~ 2.0 (기본 0.5) | 40 Hz 기준 로우 셸프 |
+| DRIVE | 0 ~ 48 dB | EF804S 단에 들어가는 신호 크기 (상단 DRIVE 스위치가 켜져 있을 때) |
+| LEVEL | ±18 dB | 모듈 출력 (M/S에서는 Mid/Side 레벨 = 스테레오 폭 조절) |
+
+**TUBE (공통)**
+
+| 컨트롤 | 설명 |
+|---|---|
+| EQ / DRIVE 스위치 | EQ와 튜브를 각각 켜고 끔 (NEOLD의 레버와 같은 역할) |
+| FOCUS | 홀수 ↔ 짝수 배음. 0 = EF804S 단 그대로, −100 = 짝수 제거(대칭), +100 = 짝수 2배 |
+| MIX | 원음 블렌드 (EQ + 튜브 + 트랜스포머를 병렬로) |
+
+**OUTPUT TRANSFORMER (공통, 구간별)**
+
+| 컨트롤 | 대역 | 하는 일 |
+|---|---|---|
+| LOW | 200 Hz 아래 | 코어 포화 — 큰 저음일수록 진해지는 3차 배음 위주 두께감 |
+| MID | 200 Hz ~ 4 kHz | 은은한 밀도 — 약한 비대칭, 2차+3차 |
+| HIGH | 4 kHz 위 | 고역 포화 + 12 kHz 위를 최대 −1.5 dB 부드럽게 (응답 곡선에 표시됨) |
 
 ---
 
-## VST3 파일 만들기 (가장 쉬운 방법)
+## EF804S 튜브 모델
 
-### 방법 1 — Windows PC에서 더블클릭
-`build_windows.bat` 을 더블클릭하면 빌드 → `C:\Program Files\Common Files\VST3` 설치까지 한 번에 합니다.
-처음 한 번만 아래 3개가 필요하고, 없으면 스크립트가 설치 명령을 알려줍니다.
+RZ062 안의 EF804S 증폭단을 **Koren 3극관 모델**로 풀어서 얻은 실제 전달곡선을 씁니다 (tanh 같은 일반 곡선이 아님).
 
-```bat
-winget install Kitware.CMake
-winget install Git.Git
-winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-```
-
-- 첫 빌드는 JUCE 다운로드 때문에 5~10분, 이후는 1~2분.
-- 마지막 복사 단계에서 권한 오류가 나면 Cubase를 닫고 `build_windows.bat` 우클릭 → **관리자 권한으로 실행**.
-- Cubase: 스튜디오 → VST 플러그인 관리자 → 다시 스캔 → "Pillow Audio / Pillow RZ EQ".
-
-Mac이면 터미널에서 `bash build_mac.sh` (VST3 + AU 설치까지).
-
-### 방법 2 — GitHub에서 자동 빌드 (설치 불필요)
-`main` 브랜치에 push 하면 GitHub의 Windows 서버가 MSVC로 빌드하고 DSP 테스트까지 돌립니다 (10~15분).
-- 결과물: 저장소 → **Actions** → 최신 Build 실행 → 맨 아래 **Artifacts** → `PillowRZ-EQ-Windows-VST3`
-- 같은 zip이 `builds` 브랜치에도 올라갑니다 (`PillowRZ-EQ-Windows-VST3.zip`, `PillowRZ-EQ-Windows-Standalone.zip`).
-- 압축을 풀어 `Pillow RZ EQ.vst3` 폴더를 `C:\Program Files\Common Files\VST3` 에 넣고 Cubase에서 다시 스캔.
-- Standalone(.exe)은 DAW 없이 소리를 바로 확인할 때 씁니다.
+- **관 파라미터**: μ = 38 (EF804S 데이터시트의 3극관 결선 값). Ex·Kvb는 같은 계열 EF86의 Koren 모델을 따랐고, Kg1·Kp는 데이터시트의 "3극관 결선 RC 증폭 이득 31 (250 V, 100 kΩ)"이 정확히 나오도록 보정했습니다 (모델 결과 31.0, ra ≈ 23 kΩ, gm ≈ 1.7 mA/V @ 1 mA).
+- **회로**: B+ 290 V, 플레이트 부하 220 kΩ, 바이패스 안 된 캐소드 저항(유휴 0.5 mA가 되도록 계산된 8.4 kΩ), 그리드 전류 소프트 클램프 — GroupDIY에 올라온 RZ062 실물 추정값 기반. 단 이득은 약 14배.
+- **결과**: 약하게 걸면 2차 배음 위주, 그리드 전압이 커지면 컷오프와 그리드 전류 때문에 3차 배음이 주도 (그래프 왼쪽).
+- **Drive 0 dB**는 풀스케일이 그리드 0.5 Vpk라 거의 깨끗하고, 30 dB 근처에서 본격적으로 걸립니다.
+- **레벨 보상**: −12 dBFS 사인의 기본파 레벨이 Drive와 상관없이 같도록 자동 보정 (테스트상 0.00 dB 오차).
+- 4,097점 asinh 워핑 테이블 + 3차 보간이라, 회로를 직접 푼 값과 작은 신호에서 상대오차 1e-7 이하.
 
 ---
 
 ## 빌드 (직접 명령으로)
 
-처음 configure 할 때 JUCE 8.0.17을 GitHub에서 자동으로 받아옵니다 (몇 분 걸림, 한 번만).
-이미 JUCE가 있으면 이 폴더 안에 `JUCE/`로 넣어두면 그걸 씁니다.
-
-### Windows (Cubase)
-필요: Visual Studio 2022 ("C++를 사용한 데스크톱 개발"), CMake 3.22+, Git
+처음 configure 할 때 JUCE 8.0.17을 GitHub에서 자동으로 받아옵니다. 이미 JUCE가 있으면 이 폴더 안에 `JUCE/`로 넣어두면 그걸 씁니다.
 
 ```bat
-cmake -B build -G "Visual Studio 17 2022"
-cmake --build build --config Release
+cmake -B build -A x64
+cmake --build build --config Release --target PillowRZ_VST3
 ```
-
 결과물: `build\PillowRZ_artefacts\Release\VST3\Pillow RZ EQ.vst3`
-→ `C:\Program Files\Common Files\VST3\` 에 복사 → Cubase **플러그인 관리자**에서 다시 스캔.
-제조사는 "Pillow Audio"로 표시됩니다.
 
-### macOS
-```bash
-cmake -B build -G Xcode
-cmake --build build --config Release
-```
-결과물: `build/PillowRZ_artefacts/Release/VST3/`, `.../AU/`
-→ `~/Library/Audio/Plug-Ins/VST3/`, `~/Library/Audio/Plug-Ins/Components/`
-
-### DSP 테스트 (JUCE 없이도 됨)
-```bash
-cmake --build build --config Release --target PillowRZCoreTests
-ctest --test-dir build -C Release --output-on-failure
-```
-또는 `g++ -std=c++17 -O2 -ISource tests/CoreTests.cpp -o CoreTests && ./CoreTests`
+DSP 테스트 (JUCE 없이도 됨): `g++ -std=c++17 -O2 -ISource tests/CoreTests.cpp -o CoreTests && ./CoreTests`
 
 ---
 
 ## 구조
 
 ```
+Source/dsp/RZ062Core.h     DSP 전부 (JUCE 비의존): EQ, EF804S, 트랜스포머, 모듈·라우팅, 응답 곡선
+Source/PluginProcessor.*   파라미터 32개, 오버샘플링, 레이턴시, 바이패스
+Source/PluginEditor.*      UI: 모듈 패널 2개, 튜브/트랜스포머 패널, 응답 곡선
+tests/CoreTests.cpp        119개 체크
 build_windows.bat          Windows 원클릭 빌드 + VST3 설치
 build_mac.sh               macOS 빌드 + VST3/AU 설치
 .github/workflows/         GitHub Actions 자동 빌드 (Windows VST3 + Standalone)
-Source/dsp/RZ062Core.h     DSP 전부 (JUCE 비의존): 필터, 스무딩, 튜브, 응답 곡선 계산
-Source/PluginProcessor.*   파라미터, 오버샘플링, 레이턴시
-Source/PluginEditor.*      UI: 노브, A/B 스위치, 실시간 응답 곡선
-tests/CoreTests.cpp        81개 체크 (응답·Q·클릭·안정성·튜브 THD)
 ```
 
-- **필터**: Cytomic(Andrew Simper) 선형 사다리꼴 SVF. Q·주파수를 자동화해도 안정적입니다.
-- **오버샘플링**: EQ와 튜브를 둘 다 44.1/48k에서 4배, 88.2/96k에서 2배로 처리합니다. 덕분에 고역 커브가 세션 샘플레이트와 상관없이 아날로그 기준 ±0.05 dB 안에 들어옵니다 (오버샘플링 없이 44.1k면 최대 0.77 dB 어긋남). 대신 IIR 하프밴드 필터 지연이 몇 샘플 생기고, 호스트에 레이턴시로 보고됩니다.
-- **파라미터 변화**: 15 ms 스무딩 + 샘플 단위 계수 보간. 베이스 +12 → −20 dB 같은 큰 점프도 클릭 없이 넘어갑니다.
-- **응답 곡선 UI**: 실제 처리에 쓰는 계수로 계산해서, 화면 곡선과 실제 소리가 0.00001 dB 이내로 같습니다.
-- **바이패스**: Cubase 인서트 바이패스 때도 오버샘플링 필터를 그대로 통과시켜, 켜고 끌 때 지연이 어긋나 생기는 클릭·콤필터가 없습니다.
+신호 흐름 (모듈마다, 오버샘플된 레이트 — 44.1/48k에서 4배, 88.2/96k에서 2배):
 
-### 검증 상태
-- DSP 코어: GCC·Clang에서 테스트 81개 통과.
-- 플러그인 코드: JUCE 8.0.17 소스에 대고 GCC·Clang으로 컴파일 확인 (JUCE 권장 경고 옵션에서 에러·경고 0).
-- 아직 못 해본 것: MSVC 빌드, 실제 DAW에서 로드. Windows에서 빌드 에러가 나면 로그를 그대로 보내 주세요.
+```
+[L/R 또는 M/S] -> EQ -> EF804S -> 출력 트랜스포머 -> MIX(원음) -> LEVEL -> [디코드]
+```
+
+- **필터**: Cytomic(Andrew Simper) 선형 사다리꼴 SVF + 샘플 단위 계수 보간 → 큰 노브 변화에도 클릭 없음.
+- **트랜스포머·튜브**는 "왜곡 성분"만 만들어 원신호에 더하는 방식이라, 0이면 비트 단위로 완전히 투명합니다.
+- 모듈 1의 파라미터 ID는 v0.1과 같아서 v0.1로 저장한 세션도 열립니다 (v0.1의 Tube 설정만 빠짐).
 
 ---
 
 ## 원본 커브: 확인된 것과 추정한 것
 
-**자료로 확인한 값** (Audified·NEOLD 매뉴얼, GroupDIY 실물 측정, 리뷰 기사)
+**자료로 확인한 값** (Audified·NEOLD 매뉴얼, Plugin Alliance 제품 페이지, GroupDIY 실물 측정, 리뷰 기사)
 - 베이스 40 Hz 기준 +12 / −20 dB, 트레블 10 kHz 기준 +12 / −18 dB, 원본 2 dB 스텝
-- A 모듈 틸트: 650 Hz 중심 ±4 dB (100 Hz +4 / 10 kHz −4 쪽으로 기울어짐)
-- B 모듈 프레즌스: 1.4 / 2 / 2.8 / 4 kHz, 0.8 dB × 6칸 = 최대 4.8 dB
-  - NEOLD는 1 dB × 6 = 6 dB로 구현했습니다. 6 dB가 좋으면 `kPresMaxDb`와 `kMidStepDb`만 바꾸면 됩니다.
+- A 모듈 Pivot: 650 Hz 중심 ±4 dB / B 모듈 Presence: 1.4 / 2 / 2.8 / 4 kHz
+- Presence 최대치: NEOLD는 1 dB × 6 = 6 dB, 실물 측정 자료는 0.8 dB × 6 = 4.8 dB → v0.2부터 NEOLD 기준
+- EF804S: μ 38, 3극관 RC 증폭 이득 31 (데이터시트) / RZ062 안의 결선·전류는 GroupDIY 추정
 
-**공개 자료가 없어 추정한 값** (전부 `Source/dsp/RZ062Core.h` 상단 상수)
-- 셸프 중간점 `kBassShelfHz = 160`, `kTrebleShelfHz = 2500` — 40 Hz와 10 kHz가 약 632 Hz를 기준으로 대칭이라는 점(틸트 축 650 Hz와 거의 같음)에 맞춰 두 셸프를 거울 대칭으로 설계했습니다. 베이스 +12면 40 Hz에서 +11.3 dB, 1 kHz에서 +0.3 dB.
-- 빈티지 셸프 Q 0.5, 프레즌스 기본 Q 1.0 — 원본 회로의 부품값이 공개되지 않아 문서상 동작에 맞춘 값입니다. 실기나 다른 에뮬레이션과 비교해서 귀로 맞추는 걸 권합니다.
-- 튜브: 회로 모델이 아니라 비대칭 tanh 셰이퍼입니다. −6 dBFS 1 kHz 사인 기준 THD: 10 % → 0.3 %, 25 % → 0.8 %, 50 % → 1.8 %, 75 % → 4.2 %, 100 % → 9.4 %. 낮은 설정에서는 2차 배음 위주.
+**공개 자료가 없어 추정한 값** (전부 `Source/dsp/RZ062Core.h` 상수)
+- 셸프 중간점 160 Hz / 2.5 kHz (650 Hz 축 대칭), 빈티지 셸프 Q 0.5, 프레즌스 기본 Q 1.0
+- 트랜스포머 크로스오버 200 Hz / 4 kHz와 구간별 포화량 (100 %에서 −6 dBFS 기준 LOW 3.4 % · MID 1.4 % · HIGH 2.3 %)
 
 ---
 
 ## 바꾸고 싶을 때
 
-| 하고 싶은 것 | 고칠 곳 |
+| 하고 싶은 것 | 고칠 곳 (`RZ062Core.h`) |
 |---|---|
 | 셸프 위치/성격 | `kBassShelfHz`, `kTrebleShelfHz`, `kVintageShelfQ` |
 | 프레즌스 최대치·스텝 | `kPresMaxDb`, `kMidStepDb` |
-| Q 범위 | `kShelfQMin/Max`, `kPresQMin/Max` (+ `PluginProcessor.cpp`의 skew 중심) |
-| 튜브 성격 | `TubeStage`의 `kBias`(짝수 배음), `kMinDrive`, `kRangeDb` |
-| 다른 Pillow 플러그인과 제조사 코드 통일 | `CMakeLists.txt`의 `PLUGIN_MANUFACTURER_CODE` |
+| 튜브가 걸리기 시작하는 지점 | `TubeStage::kGridVoltsPerFullScale` |
+| EF804S 회로 (전압·부하·전류) | `Ef804sCurve::kBplus`, `kRl`, `kIdleA` |
+| 트랜스포머 구간 경계·강도 | `TransformerStage::kXoverLowHz/HighHz`, `kLowDrive`, `kMidDrive`, `kHighDrive`, `kShelfMaxCutDb` |
 
-배포할 계획이면: 제품명과 UI에는 "Klangfilm" 상표를 넣지 않고 "RZ062-style"이라고만 표기해 두었습니다. 마케팅 문구에서도 상표 사용은 조심하는 게 좋습니다.
+## 검증 상태
+- DSP 코어: GCC·Clang·MSVC(GitHub)에서 테스트 119개 통과 — 응답 곡선 vs 실제 처리, 샘플레이트 일관성, 클릭(라우팅·링크 전환 포함), 블록 크기 독립성, EF804S 데이터시트 대조, 튜브 레벨 보상·Focus, 트랜스포머 구간 분리, M/S·링크·Mix.
+- 플러그인 코드: JUCE 8.0.17에 대고 GCC·Clang 컴파일 (JUCE 권장 경고 옵션에서 에러·경고 0), 실제 에디터를 오프스크린 렌더링해서 레이아웃 확인.
+
+배포할 계획이면: 제품명과 UI에는 "Klangfilm" 상표를 넣지 않고 "RZ062-style"이라고만 표기해 두었습니다.

@@ -1,15 +1,18 @@
 // =============================================================================
-//  Pillow RZ EQ — DSP 코어 (JUCE 비의존, C++17 헤더 온리)
+//  Pillow RZ EQ — DSP 코어 v0.2 (JUCE 비의존, C++17 헤더 온리)
 //
-//  Klangfilm(Siemens) RZ062a/b 진공관 EQ의 커브를 기반으로 하고,
-//  원본에는 없는 "밴드별 Q 조절"을 추가한 구현.
+//  Klangfilm(Siemens) RZ062a/b 진공관 EQ 커브 + 밴드별 Q,
+//  Plugin Alliance(NEOLD) RZ062를 참고한 확장:
+//   - 모듈 2개 (L/R 또는 Mid/Side, 링크), 모듈마다 A(Pivot) / B(Presence)
+//   - 튜브: Telefunken EF804S(3극관 결선) Koren 모델로 계산한 실제 전달곡선
+//           Drive(0~48 dB, 기준 레벨 보상), Focus(홀수 <-> 짝수 배음), Mix
+//   - 출력 트랜스포머 색채: 저역 / 중역 / 고역 따로 조절
 //
-//  필터 구조: Andrew Simper(Cytomic)의 선형 사다리꼴(TPT) SVF
-//   - 파라미터를 계속 바꿔도(자동화, Q 스윕) 안정적이고 지퍼 노이즈가 적음
-//   - 사다리꼴 적분 = 쌍선형 변환이므로, GUI 응답 곡선을 "실제 처리와 똑같이"
-//     해석적으로 계산할 수 있음 (ResponseModel)
+//  처리 순서 (모듈마다, 오버샘플된 레이트):
+//    [L/R 또는 M/S 인코드] -> EQ -> EF804S -> 트랜스포머 -> Mix(원음) -> Level -> [디코드]
 //
-//  JUCE 없이 컴파일되므로 tests/CoreTests.cpp 로 단독 검증 가능.
+//  필터는 Cytomic(Andrew Simper) 선형 사다리꼴 SVF. 사다리꼴 적분 = 쌍선형 변환이라
+//  GUI 응답 곡선을 실제 처리와 같은 계수로 정확히 계산할 수 있음 (ResponseModel).
 // =============================================================================
 #pragma once
 
@@ -21,51 +24,49 @@
 
 namespace pillow::rz
 {
-//==============================================================================
-//  하드웨어 기반 상수
-//  - 게인 범위 / 기준 주파수 / 스텝: Audified·NEOLD 매뉴얼, GroupDIY 실측 (README 참고)
-//  - 셸프 중간점과 프레즌스 기본 Q는 원본 부품값이 공개돼 있지 않아서,
-//    문서상 동작(베이스 40 Hz~1 kHz, 트레블 1~10 kHz에 걸친 완만한 셸프)에 맞춘 추정치.
-//    소리 취향에 맞게 이 값들만 바꿔도 전체 캐릭터가 바뀜.
-//==============================================================================
 inline constexpr double kPi = 3.14159265358979323846;
 
-inline constexpr double kBassRefHz     = 40.0;     // 베이스 게인 표기 기준 주파수
-inline constexpr double kTrebleRefHz   = 10000.0;  // 트레블 게인 표기 기준 주파수
-inline constexpr double kBassShelfHz   = 160.0;    // 베이스 셸프 중간점(게인이 절반인 지점, 추정)
+//==============================================================================
+//  EQ 상수 (Audified·NEOLD 매뉴얼, GroupDIY 실측; 추정치는 README에 표시)
+//==============================================================================
+inline constexpr double kBassRefHz     = 40.0;
+inline constexpr double kTrebleRefHz   = 10000.0;
+inline constexpr double kBassShelfHz   = 160.0;    // 셸프 중간점 (추정)
 inline constexpr double kTrebleShelfHz = 2500.0;   // 650 Hz 축 대칭: 160 x 2500 = 40 x 10000
-inline constexpr double kTiltPivotHz   = 650.0;    // A 모듈 틸트 회전 중심
+inline constexpr double kTiltPivotHz   = 650.0;
 inline constexpr std::array<double, 4> kPresenceHz { 1400.0, 2000.0, 2800.0, 4000.0 };
 
 inline constexpr float kBassMinDb   = -20.0f, kBassMaxDb   = 12.0f;
 inline constexpr float kTrebleMinDb = -18.0f, kTrebleMaxDb = 12.0f;
-inline constexpr float kTiltMaxDb   = 4.0f;    // +-4 dB
-inline constexpr float kPresMaxDb   = 4.8f;    // 0.8 dB x 6칸 (원본 눈금 0~6)
-inline constexpr float kShelfStepDb = 2.0f;    // 베이스/트레블 원본 스텝
-inline constexpr float kMidStepDb   = 0.8f;    // 틸트/프레즌스 원본 스텝
+inline constexpr float kTiltMaxDb   = 4.0f;    // A 모듈 Pivot +-4 dB
+inline constexpr float kPresMaxDb   = 6.0f;    // B 모듈 Presence: NEOLD 기준 1 dB x 6 (실물 측정 자료는 0.8 dB x 6)
+inline constexpr float kShelfStepDb = 2.0f;    // 원본 2 dB 스텝
+inline constexpr float kMidStepDb   = 1.0f;    // Pivot / Presence 스텝
 
-// Q 범위와 "빈티지" 기본값
-//  - 셸프 Q 0.5 = 1차 셸프에 가까운 완만한 원본 느낌, 0.707 = 일반적인 2차 셸프,
-//    1 이상 = 셸프 앞뒤로 범프/딥이 생기는 공진형(Pultec 같은 느낌)
 inline constexpr float kShelfQMin = 0.3f, kShelfQMax = 2.0f, kVintageShelfQ = 0.5f;
 inline constexpr float kPresQMin  = 0.3f, kPresQMax  = 6.0f, kVintagePresQ  = 1.0f;
 
+inline constexpr float kDriveMaxDb = 48.0f;    // NEOLD: 최대 48 dB 보상 드라이브
+
+//==============================================================================
+//  작은 헬퍼
+//==============================================================================
 // 부동소수 "정확히 같음" 비교 (-Wfloat-equal 경고 없이). 변경 감지용.
 inline bool sameValue (double a, double b) noexcept { return ! (a < b) && ! (b < a); }
+inline float cleanZero (float v) noexcept { return std::abs (v) < 1.0e-4f ? 0.0f : v; }
+inline double dbToGain (double db) noexcept { return std::pow (10.0, db / 20.0); }
+inline double clamp01 (double v) noexcept { return std::clamp (v, 0.0, 1.0); }
 
 //==============================================================================
 //  원본 스텝(디텐트) 양자화
 //==============================================================================
-inline float cleanZero (float v) noexcept { return std::abs (v) < 1.0e-4f ? 0.0f : v; }
-
 inline float quantizeTreble (float db) noexcept
 {
     const float q = std::round (db / kShelfStepDb) * kShelfStepDb;
     return cleanZero (std::clamp (q, kTrebleMinDb, kTrebleMaxDb));
 }
 
-// 원본 베이스 노브는 컷 방향 첫 칸이 -4 dB, 그 뒤로 2 dB 간격
-// (+12 ... +2, 0, -4, -6 ... -20)
+// 원본 베이스 노브는 컷 방향 첫 칸이 -4 dB, 그 뒤로 2 dB 간격 (+12 ... +2, 0, -4 ... -20)
 inline float quantizeBass (float db) noexcept
 {
     float q = std::round (db / kShelfStepDb) * kShelfStepDb;
@@ -83,7 +84,6 @@ inline float quantizePresence (float db) noexcept
     return cleanZero (std::clamp (std::round (db / kMidStepDb) * kMidStepDb, 0.0f, kPresMaxDb));
 }
 
-// UI 눈금용 디텐트 목록
 inline std::vector<double> trebleDetents()
 {
     std::vector<double> v;
@@ -102,80 +102,104 @@ inline std::vector<double> bassDetents()
 inline std::vector<double> tiltDetents()
 {
     std::vector<double> v;
-    for (int i = -5; i <= 5; ++i) v.push_back (0.8 * i);
+    for (int i = -4; i <= 4; ++i) v.push_back ((double) i * kMidStepDb);
     return v;
 }
 
 inline std::vector<double> presenceDetents()
 {
     std::vector<double> v;
-    for (int i = 0; i <= 6; ++i) v.push_back (0.8 * i);
+    for (int i = 0; i <= 6; ++i) v.push_back ((double) i * kMidStepDb);
     return v;
 }
 
 //==============================================================================
 //  파라미터
 //==============================================================================
-enum class Mode { A_Tilt = 0, B_Presence = 1 };
+enum class Mode    { A_Tilt = 0, B_Presence = 1 };   // A = Pivot(틸트), B = Presence
+enum class Routing { Stereo = 0, MidSide = 1 };
 
-struct Params
+// 모듈 하나(= 원본 RZ062 한 대)의 설정
+struct ModuleParams
 {
     Mode  mode      = Mode::B_Presence;
-    bool  stepped   = false;          // true = 원본처럼 계단식 게인
     float trebleDb  = 0.0f, trebleQ = kVintageShelfQ;
     float bassDb    = 0.0f, bassQ   = kVintageShelfQ;
-    float tiltDb    = 0.0f;           // A 모드: + = 밝게(고역 업/저역 다운)
-    int   presIndex = 2;              // B 모드: 0..3 -> 1.4 / 2 / 2.8 / 4 kHz
+    float tiltDb    = 0.0f;           // + = 밝게 (고역 업 / 저역 다운)
+    int   presIndex = 2;              // 0..3 -> 1.4 / 2 / 2.8 / 4 kHz
     float presDb    = 0.0f, presQ = kVintagePresQ;
-    float tube      = 0.0f;           // 0..1
-    float outputDb  = 0.0f;
+    float driveDb   = 0.0f;           // EF804S 드라이브 0..48 dB
+    float outputDb  = 0.0f;           // 모듈 출력 레벨
 
-    bool operator== (const Params& o) const noexcept
+    bool operator== (const ModuleParams& o) const noexcept
     {
-        return mode == o.mode && stepped == o.stepped && presIndex == o.presIndex
+        return mode == o.mode && presIndex == o.presIndex
             && sameValue (trebleDb, o.trebleDb) && sameValue (trebleQ, o.trebleQ)
             && sameValue (bassDb, o.bassDb)     && sameValue (bassQ, o.bassQ)
             && sameValue (tiltDb, o.tiltDb)
             && sameValue (presDb, o.presDb)     && sameValue (presQ, o.presQ)
-            && sameValue (tube, o.tube)         && sameValue (outputDb, o.outputDb);
+            && sameValue (driveDb, o.driveDb)   && sameValue (outputDb, o.outputDb);
+    }
+    bool operator!= (const ModuleParams& o) const noexcept { return ! (*this == o); }
+};
+
+struct Params
+{
+    Routing routing = Routing::Stereo;
+    bool  link    = true;     // 켜면 모듈 2가 모듈 1 설정을 그대로 따름
+    bool  stepped = false;    // 원본처럼 계단식 게인
+    bool  eqOn    = true;
+    bool  driveOn = false;
+    float focus   = 0.0f;     // -1 = 홀수 배음(대칭)  0 = EF804S 그대로  +1 = 짝수 배음 2배
+    float mix     = 1.0f;     // 0..1 (원음 블렌드)
+    float xfLow = 0.0f, xfMid = 0.0f, xfHigh = 0.0f;   // 트랜스포머 색채 0..1 (구간별)
+    std::array<ModuleParams, 2> mod {};
+
+    const ModuleParams& effective (int m) const noexcept { return (link || m <= 0) ? mod[0] : mod[1]; }
+
+    bool operator== (const Params& o) const noexcept
+    {
+        return routing == o.routing && link == o.link && stepped == o.stepped
+            && eqOn == o.eqOn && driveOn == o.driveOn
+            && sameValue (focus, o.focus) && sameValue (mix, o.mix)
+            && sameValue (xfLow, o.xfLow) && sameValue (xfMid, o.xfMid) && sameValue (xfHigh, o.xfHigh)
+            && mod[0] == o.mod[0] && mod[1] == o.mod[1];
     }
     bool operator!= (const Params& o) const noexcept { return ! (*this == o); }
 };
 
-// 실제 DSP에 들어가는 값 (스텝 양자화 + 모드 반영 + 범위 제한)
-struct Resolved
+// 모듈에 실제로 들어가는 값 (링크 · 스텝 · 모드 · EQ on/off 반영)
+struct ResolvedModule
 {
-    double trebleDb, trebleQ, bassDb, bassQ, tiltDb, presHz, presDb, presQ, tube, outputDb;
+    double trebleDb, trebleQ, bassDb, bassQ, tiltDb, presHz, presDb, presQ, driveDb, outputDb;
 };
 
-inline Resolved resolve (const Params& p) noexcept
+inline ResolvedModule resolveModule (const Params& p, int module) noexcept
 {
-    const bool st   = p.stepped;
-    const bool isB  = (p.mode == Mode::B_Presence);
-    const int  pidx = std::clamp (p.presIndex, 0, 3);
+    const ModuleParams& m = p.effective (module);
+    const bool st  = p.stepped;
+    const bool isB = (m.mode == Mode::B_Presence);
+    const bool eq  = p.eqOn;
 
-    Resolved r {};
-    r.trebleDb = st ? quantizeTreble (p.trebleDb) : std::clamp (p.trebleDb, kTrebleMinDb, kTrebleMaxDb);
-    r.bassDb   = st ? quantizeBass (p.bassDb)     : std::clamp (p.bassDb, kBassMinDb, kBassMaxDb);
-    r.trebleQ  = std::clamp (p.trebleQ, kShelfQMin, kShelfQMax);
-    r.bassQ    = std::clamp (p.bassQ,   kShelfQMin, kShelfQMax);
+    ResolvedModule r {};
+    r.trebleDb = ! eq ? 0.0 : (st ? quantizeTreble (m.trebleDb) : std::clamp (m.trebleDb, kTrebleMinDb, kTrebleMaxDb));
+    r.bassDb   = ! eq ? 0.0 : (st ? quantizeBass (m.bassDb)     : std::clamp (m.bassDb, kBassMinDb, kBassMaxDb));
+    r.trebleQ  = std::clamp (m.trebleQ, kShelfQMin, kShelfQMax);
+    r.bassQ    = std::clamp (m.bassQ,   kShelfQMin, kShelfQMax);
 
-    // 가운데 밴드: 모드에 따라 한쪽 게인을 0으로 (전환 시 스무딩으로 자연스럽게 크로스페이드)
-    r.tiltDb = isB ? 0.0 : (st ? quantizeTilt (p.tiltDb) : std::clamp (p.tiltDb, -kTiltMaxDb, kTiltMaxDb));
-    r.presDb = isB ? (st ? quantizePresence (p.presDb) : std::clamp (p.presDb, 0.0f, kPresMaxDb)) : 0.0;
-    r.presHz = kPresenceHz[(size_t) pidx];
-    r.presQ  = std::clamp (p.presQ, kPresQMin, kPresQMax);
+    // 가운데 밴드: 모드에 따라 한쪽 게인을 0으로 (스무딩으로 자연스럽게 크로스페이드)
+    r.tiltDb = (! eq || isB) ? 0.0 : (st ? quantizeTilt (m.tiltDb) : std::clamp (m.tiltDb, -kTiltMaxDb, kTiltMaxDb));
+    r.presDb = (! eq || ! isB) ? 0.0 : (st ? quantizePresence (m.presDb) : std::clamp (m.presDb, 0.0f, kPresMaxDb));
+    r.presHz = kPresenceHz[(size_t) std::clamp (m.presIndex, 0, 3)];
+    r.presQ  = std::clamp (m.presQ, kPresQMin, kPresQMax);
 
-    r.tube     = std::clamp (p.tube, 0.0f, 1.0f);
-    r.outputDb = std::clamp (p.outputDb, -24.0f, 24.0f);
+    r.driveDb  = std::clamp (m.driveDb, 0.0f, kDriveMaxDb);
+    r.outputDb = std::clamp (m.outputDb, -24.0f, 24.0f);
     return r;
 }
 
-inline double dbToGain (double db) noexcept { return std::pow (10.0, db / 20.0); }
-
 //==============================================================================
-//  Simper SVF (선형 사다리꼴)
-//   출력 = m0*v0 + m1*v1(band) + m2*v2(low)
+//  Simper SVF (선형 사다리꼴):  출력 = m0*v0 + m1*v1(band) + m2*v2(low)
 //==============================================================================
 struct SvfCoeffs
 {
@@ -195,7 +219,6 @@ inline SvfCoeffs finishSvf (SvfCoeffs c) noexcept
     return c;
 }
 
-// 피크(벨): 중심 게인 = gainDb, Q는 RBJ 정의와 동일
 inline SvfCoeffs makeBell (double fc, double q, double gainDb, double fs) noexcept
 {
     const double A = std::pow (10.0, gainDb / 40.0);
@@ -208,7 +231,6 @@ inline SvfCoeffs makeBell (double fc, double q, double gainDb, double fs) noexce
     return finishSvf (c);
 }
 
-// 2차 로우 셸프: fc = 게인이 절반(dB)인 중간점, Q가 경사/공진을 결정
 inline SvfCoeffs makeLowShelf (double fc, double q, double gainDb, double fs) noexcept
 {
     const double A = std::pow (10.0, gainDb / 40.0);
@@ -221,7 +243,6 @@ inline SvfCoeffs makeLowShelf (double fc, double q, double gainDb, double fs) no
     return finishSvf (c);
 }
 
-// 2차 하이 셸프
 inline SvfCoeffs makeHighShelf (double fc, double q, double gainDb, double fs) noexcept
 {
     const double A = std::pow (10.0, gainDb / 40.0);
@@ -231,6 +252,24 @@ inline SvfCoeffs makeHighShelf (double fc, double q, double gainDb, double fs) n
     c.m0 = A * A;
     c.m1 = c.k * (1.0 - A) * A;
     c.m2 = 1.0 - A * A;
+    return finishSvf (c);
+}
+
+inline SvfCoeffs makeLowpass (double fc, double q, double fs) noexcept
+{
+    SvfCoeffs c;
+    c.g  = std::tan (kPi * clampFreq (fc, fs) / fs);
+    c.k  = 1.0 / q;
+    c.m0 = 0.0; c.m1 = 0.0; c.m2 = 1.0;
+    return finishSvf (c);
+}
+
+inline SvfCoeffs makeHighpass (double fc, double q, double fs) noexcept
+{
+    SvfCoeffs c;
+    c.g  = std::tan (kPi * clampFreq (fc, fs) / fs);
+    c.k  = 1.0 / q;
+    c.m0 = 1.0; c.m1 = -c.k; c.m2 = -1.0;
     return finishSvf (c);
 }
 
@@ -254,8 +293,7 @@ inline std::complex<double> svfResponse (const SvfCoeffs& c, double f, double fs
 }
 
 //==============================================================================
-//  A 모듈 틸트: 1차 셸프를 650 Hz 중심으로 회전 (원본처럼 중심부 경사가 가장 가파름)
-//   +T dB -> 고역 +T, 저역 -T, 650 Hz는 0 dB
+//  A 모듈 Pivot(틸트): 1차 셸프를 650 Hz 중심으로 회전
 //==============================================================================
 struct TiltCoeffs { double g = 0.0, G1 = 0.0, lfMinus1 = 0.0, outGain = 1.0; };
 struct OnePoleState { double s = 0.0; };
@@ -263,7 +301,7 @@ struct OnePoleState { double s = 0.0; };
 inline TiltCoeffs makeTilt (double pivotHz, double tiltDb, double fs) noexcept
 {
     const double G  = std::pow (10.0, -2.0 * tiltDb / 20.0);   // 고역 대비 저역 게인
-    const double fp = pivotHz / std::sqrt (G);                 // 극점 (중간점 = pivot)
+    const double fp = pivotHz / std::sqrt (G);
     TiltCoeffs c;
     c.g        = std::tan (kPi * clampFreq (fp, fs) / fs);
     c.G1       = c.g / (1.0 + c.g);
@@ -288,7 +326,7 @@ inline std::complex<double> tiltResponse (const TiltCoeffs& c, double f, double 
 }
 
 //==============================================================================
-//  1폴 스무더 (파라미터 변화 시 클릭 방지)
+//  1폴 스무더
 //==============================================================================
 struct Smoother
 {
@@ -310,158 +348,25 @@ struct Smoother
 };
 
 //==============================================================================
-//  튜브 스테이지 (오버샘플링된 레이트에서 호출)
-//   - 비대칭 tanh -> 짝수 배음 위주 (3극관 느낌)
-//   - 소신호 게인을 1로 정규화 -> 드라이브를 올려도 작은 신호 레벨은 그대로
-//   - "왜곡 성분(y - x)"에만 DC 블로커를 걸어 원신호 저역은 건드리지 않음
-//   - amount = 0 이면 완전히 바이패스(비트 단위 동일)
+//  EQ 섹션 (채널 1개)
+//   16샘플마다 스무딩된 목표 계수를 다시 계산하고, 그 사이는 샘플 단위로 선형 보간
 //==============================================================================
-class TubeStage
+class EqSection
 {
 public:
-    void prepare (double sampleRate, int numChannels)
+    EqSection() { setTargets (resolveModule (Params {}, 0)); reset(); }
+
+    void prepare (double sampleRate)
     {
         fs = sampleRate > 0.0 ? sampleRate : 48000.0;
-        dc.assign ((size_t) std::max (1, numChannels), DcState {});
-        dcR = std::exp (-2.0 * kPi * 5.0 / fs);
-        amount.setTimeConstant (0.02, fs / kChunk);
-        amount.eps = 1.0e-5;
+        applySmoothing();
         reset();
     }
 
-    void reset() noexcept
+    void setSmoothingSeconds (double s) { smoothingSeconds = std::max (0.0, s); applySmoothing(); }
+
+    void setTargets (const ResolvedModule& r) noexcept
     {
-        amount.snap();
-        for (auto& d : dc) d = DcState {};
-        samplesToNextUpdate = 0;
-        updateDerived();
-    }
-
-    void setAmount (double a) noexcept { amount.target = std::clamp (a, 0.0, 1.0); }
-
-    void process (float* const* ch, int numCh, int numSamples) noexcept
-    {
-        numCh = std::min (numCh, (int) dc.size());
-        int i = 0;
-        while (i < numSamples)
-        {
-            if (samplesToNextUpdate <= 0)
-            {
-                if (! amount.isSettled())
-                {
-                    amount.step();
-                    updateDerived();
-                }
-                samplesToNextUpdate = kChunk;
-            }
-            const int len = std::min (samplesToNextUpdate, numSamples - i);
-
-            if (wet > 0.0)
-            {
-                for (int c = 0; c < numCh; ++c)
-                {
-                    auto& d  = dc[(size_t) c];
-                    float* x = ch[c] + i;
-                    for (int k = 0; k < len; ++k)
-                    {
-                        const double in = x[k];
-                        const double y  = (std::tanh (in * drive + kBias) - tanhBias) * norm;
-                        const double r  = y - in;                    // 왜곡 성분
-                        const double hp = r - d.x1 + dcR * d.y1;     // DC 블로커 (5 Hz)
-                        d.x1 = r;
-                        d.y1 = hp;
-                        x[k] = (float) (in + wet * hp);
-                    }
-                }
-            }
-            else
-            {
-                for (auto& d : dc) d = DcState {};
-            }
-
-            samplesToNextUpdate -= len;
-            i += len;
-        }
-    }
-
-    // 캘리브레이션 상수 (tests 의 THD 측정으로 맞춤, -6 dBFS 사인 기준
-    //  amount 0.1 ≈ 0.3 %, 0.25 ≈ 1 %, 0.5 ≈ 2~3 %, 1.0 ≈ 10 % 내외)
-    static constexpr double kBias      = 0.22;   // 비대칭 정도 (짝수 배음)
-    static constexpr double kMinDrive  = 0.06;   // amount 0 근처의 드라이브 (거의 선형)
-    static constexpr double kRangeDb   = 30.0;   // amount 0 -> 1 사이 드라이브 증가량
-    static constexpr double kFadeIn    = 0.15;   // 처음 15% 구간에서 왜곡을 서서히 섞음
-
-private:
-    void updateDerived() noexcept
-    {
-        const double a = amount.current;
-        wet      = std::min (1.0, a / kFadeIn);
-        drive    = kMinDrive * std::pow (10.0, (a * kRangeDb) / 20.0);
-        tanhBias = std::tanh (kBias);
-        norm     = 1.0 / (drive * (1.0 - tanhBias * tanhBias));
-    }
-
-    struct DcState { double x1 = 0.0, y1 = 0.0; };
-    static constexpr int kChunk = 32;
-
-    double fs = 48000.0, dcR = 0.9999;
-    double wet = 0.0, drive = 1.0, tanhBias = 0.0, norm = 1.0;
-    Smoother amount;
-    std::vector<DcState> dc;
-    int samplesToNextUpdate = 0;
-};
-
-//==============================================================================
-//  오버샘플링 배율 (플러그인과 테스트가 같은 규칙을 쓰도록 여기에 둠)
-//   EQ와 튜브를 모두 오버샘플된 레이트에서 돌려서
-//   - 쌍선형 변환의 고역 찌그러짐(cramping) 없이 44.1 kHz에서도 아날로그와 같은 커브
-//   - 튜브 왜곡의 에일리어싱 억제
-//   0 = 1배, 1 = 2배, 2 = 4배
-//==============================================================================
-inline int oversamplingOrderFor (double sampleRate) noexcept
-{
-    if (sampleRate <= 50000.0)  return 2;
-    if (sampleRate <= 100000.0) return 1;
-    return 0;
-}
-
-inline double processingRateFor (double sampleRate) noexcept
-{
-    return sampleRate * (double) (1 << oversamplingOrderFor (sampleRate));
-}
-
-//==============================================================================
-//  엔진: EQ -> 튜브 -> 출력 게인 (모두 같은 "처리 레이트", 보통 오버샘플된 레이트)
-//
-//  파라미터 변화는 스무딩 후 16샘플마다 목표 계수를 다시 계산하고,
-//  그 사이는 샘플 단위로 계수를 선형 보간 -> 계수 계단에서 생기는 지퍼 노이즈 제거
-//==============================================================================
-class Engine
-{
-public:
-    Engine() { setParams (Params {}); }
-
-    void prepare (double processingRate, int numChannels)
-    {
-        fs = processingRate > 0.0 ? processingRate : 48000.0;
-        channels.assign ((size_t) std::max (1, numChannels), ChannelState {});
-        applySmoothingTimes();
-        tube.prepare (fs, numChannels);
-        reset();
-    }
-
-    double getProcessingRate() const noexcept { return fs; }
-
-    // 0 이면 스무딩 없음 (테스트용)
-    void setSmoothingMs (double ms)
-    {
-        smoothingSeconds = std::max (0.0, ms) * 0.001;
-        applySmoothingTimes();
-    }
-
-    void setParams (const Params& p) noexcept
-    {
-        const Resolved r = resolve (p);
         setTarget (sTrebleDb, r.trebleDb);
         setTarget (sTrebleQ,  std::log (r.trebleQ));
         setTarget (sBassDb,   r.bassDb);
@@ -470,76 +375,56 @@ public:
         setTarget (sPresDb,   r.presDb);
         setTarget (sPresHz,   std::log (r.presHz));
         setTarget (sPresQ,    std::log (r.presQ));
-        outGain.target = dbToGain (r.outputDb);
-        tube.setAmount (r.tube);
     }
 
     void reset() noexcept
     {
         for (auto* s : smoothers()) s->snap();
-        outGain.snap();
         target  = computeBank();
         base    = target;
         ramping = false;
         dirty   = false;
         samplesToNextUpdate = 0;
         rampPos = 0;
-        for (auto& c : channels) c = ChannelState {};
-        tube.reset();
+        clearState();
     }
 
-    // 한 번에 전부 (플러그인은 이걸 오버샘플된 블록에 호출)
-    void process (float* const* ch, int numCh, int numSamples) noexcept
-    {
-        processEQ (ch, numCh, numSamples);
-        processTube (ch, numCh, numSamples);
-        processOutput (ch, numCh, numSamples);
-    }
+    void clearState() noexcept { st = State {}; }
 
-    void processEQ (float* const* ch, int numCh, int numSamples) noexcept
+    void process (float* x, int n) noexcept
     {
-        numCh = std::min (numCh, (int) channels.size());
         int i = 0;
-        while (i < numSamples)
+        while (i < n)
         {
             if (samplesToNextUpdate <= 0)
                 beginSubBlock();
 
-            const int len = std::min (samplesToNextUpdate, numSamples - i);
+            const int len = std::min (samplesToNextUpdate, n - i);
+            float* p = x + i;
 
-            for (int c = 0; c < numCh; ++c)
+            if (ramping)
             {
-                auto& st = channels[(size_t) c];
-                float* x = ch[c] + i;
-
-                if (ramping)
+                for (int k = 0; k < len; ++k)
                 {
-                    for (int k = 0; k < len; ++k)
-                    {
-                        const double t = (double) (rampPos + k + 1);
-                        const SvfCoeffs cb = lerpSvf (base.bass,   step.bass,   t);
-                        const SvfCoeffs ct = lerpSvf (base.treble, step.treble, t);
-                        const SvfCoeffs cp = lerpSvf (base.pres,   step.pres,   t);
-                        const TiltCoeffs cl = lerpTilt (base.tilt, step.tilt, t);
-                        double v = x[k];
-                        v = svfTick (cb, st.bass, v);
-                        v = svfTick (ct, st.treble, v);
-                        v = svfTick (cp, st.pres, v);
-                        v = tiltTick (cl, st.tilt, v);
-                        x[k] = (float) v;
-                    }
+                    const double t = (double) (rampPos + k + 1);
+                    double v = p[k];
+                    v = svfTick (lerpSvf (base.bass,   step.bass,   t), st.bass,   v);
+                    v = svfTick (lerpSvf (base.treble, step.treble, t), st.treble, v);
+                    v = svfTick (lerpSvf (base.pres,   step.pres,   t), st.pres,   v);
+                    v = tiltTick (lerpTilt (base.tilt, step.tilt,   t), st.tilt,   v);
+                    p[k] = (float) v;
                 }
-                else
+            }
+            else
+            {
+                for (int k = 0; k < len; ++k)
                 {
-                    for (int k = 0; k < len; ++k)
-                    {
-                        double v = x[k];
-                        v = svfTick (base.bass, st.bass, v);
-                        v = svfTick (base.treble, st.treble, v);
-                        v = svfTick (base.pres, st.pres, v);
-                        v = tiltTick (base.tilt, st.tilt, v);
-                        x[k] = (float) v;
-                    }
+                    double v = p[k];
+                    v = svfTick (base.bass,   st.bass,   v);
+                    v = svfTick (base.treble, st.treble, v);
+                    v = svfTick (base.pres,   st.pres,   v);
+                    v = tiltTick (base.tilt,  st.tilt,   v);
+                    p[k] = (float) v;
                 }
             }
 
@@ -549,29 +434,11 @@ public:
         }
     }
 
-    void processTube (float* const* ch, int numCh, int numSamples) noexcept
-    {
-        tube.process (ch, numCh, numSamples);
-    }
-
-    void processOutput (float* const* ch, int numCh, int numSamples) noexcept
-    {
-        numCh = std::min (numCh, (int) channels.size());
-        if (outGain.isSettled() && sameValue (outGain.current, 1.0))
-            return;
-        for (int i = 0; i < numSamples; ++i)
-        {
-            const double g = outGain.step();
-            for (int c = 0; c < numCh; ++c)
-                ch[c][i] = (float) (ch[c][i] * g);
-        }
-    }
-
 private:
-    static constexpr int kSubBlock = 16;   // 목표 계수 재계산 간격 (샘플)
+    static constexpr int kSubBlock = 16;
 
-    struct ChannelState { SvfState bass, treble, pres; OnePoleState tilt; };
-    struct Bank { SvfCoeffs treble, bass, pres; TiltCoeffs tilt; };
+    struct State { SvfState bass, treble, pres; OnePoleState tilt; };
+    struct Bank  { SvfCoeffs treble, bass, pres; TiltCoeffs tilt; };
 
     static SvfCoeffs diffSvf (const SvfCoeffs& to, const SvfCoeffs& from, double n) noexcept
     {
@@ -609,14 +476,12 @@ private:
         return { &sTrebleDb, &sTrebleQ, &sBassDb, &sBassQ, &sTiltDb, &sPresDb, &sPresHz, &sPresQ };
     }
 
-    void applySmoothingTimes() noexcept
+    void applySmoothing() noexcept
     {
         const double ctrlRate = fs / kSubBlock;
         for (auto* s : smoothers()) s->setTimeConstant (smoothingSeconds, ctrlRate);
         sTrebleDb.eps = sBassDb.eps = sTiltDb.eps = sPresDb.eps = 1.0e-4;   // dB
         sTrebleQ.eps = sBassQ.eps = sPresHz.eps = sPresQ.eps = 1.0e-6;      // log 도메인
-        outGain.setTimeConstant (smoothingSeconds, fs);
-        outGain.eps = 1.0e-7;
     }
 
     void setTarget (Smoother& s, double v) noexcept
@@ -628,10 +493,9 @@ private:
         }
     }
 
-    // 16샘플 구간 시작: 이전 목표를 기준으로 고정하고, 필요하면 다음 목표까지 램프 설정
     void beginSubBlock() noexcept
     {
-        base = target;   // 직전 램프의 끝 = 정확한 목표 계수 (누적 오차 없음)
+        base = target;
         if (dirty)
         {
             bool settled = true;
@@ -667,44 +531,661 @@ private:
         return b;
     }
 
-    double fs = 48000.0;
-    double smoothingSeconds = 0.015;
+    double fs = 48000.0, smoothingSeconds = 0.015;
     bool dirty = false, ramping = false;
     int samplesToNextUpdate = 0, rampPos = 0;
-
-    Smoother sTrebleDb, sTrebleQ, sBassDb, sBassQ, sTiltDb, sPresDb, sPresHz, sPresQ, outGain;
+    Smoother sTrebleDb, sTrebleQ, sBassDb, sBassQ, sTiltDb, sPresDb, sPresHz, sPresQ;
     Bank base, step, target;
-    std::vector<ChannelState> channels { ChannelState {} };
-    TubeStage tube;
+    State st;
 };
 
 //==============================================================================
-//  GUI 응답 곡선 계산 (실제 처리와 동일한 계수로 해석적으로 계산)
+//  Telefunken EF804S (3극관 결선) 증폭단 — Koren 3극관 모델로 정적 전달곡선 계산
+//
+//   Ip = 2 * E1^Ex / Kg1,  E1 = (Vak/Kp) * ln(1 + exp(Kp * (1/mu + Vgk / sqrt(Kvb + Vak^2))))
+//   mu = 38      : EF804S 데이터시트 3극관 결선 값
+//   Ex, Kvb      : EF86(같은 계열) Koren 모델 기반
+//   Kg1, Kp      : 데이터시트 "3극관 결선 RC 증폭 이득 31 (250 V, 100 kOhm)"에 맞춰 보정
+//   회로         : B+ 290 V, 플레이트 부하 220 kOhm, 무바이패스 캐소드 저항 (유휴 0.5 mA)
+//                  — GroupDIY의 RZ062 실물 추정값 기반. 그리드 전류는 0.6 V 부근 소프트 클램프
+//   결과         : 이득 약 14배, 약하게 걸면 2차 배음, 세게 걸면 컷오프/그리드 전류로 3차 배음
+//==============================================================================
+class Ef804sCurve
+{
+public:
+    static constexpr double kMu = 38.0, kEx = 1.3, kKp = 900.0, kKvb = 300.0, kKg1 = 1420.0;
+    static constexpr double kBplus = 290.0, kRl = 220.0e3, kIdleA = 0.5e-3, kGridClampV = 0.6;
+    static constexpr int    kSize = 4097;              // 홀수 -> 0 V가 정확히 격자점
+    static constexpr double kV0 = 0.05, kVmax = 1500.0; // asinh 워핑: 작은 신호 쪽을 촘촘하게
+
+    Ef804sCurve() { build(); }
+
+    // 정규화 전달곡선 T(v): v = 그리드 신호 전압(V), T(0) = 0, T'(0) = 1, 위상 반전 보정됨
+    double operator() (double v) const noexcept
+    {
+        const double w = std::asinh (v / kV0);
+        const double pos = std::clamp ((w + wMax) * invDw, 1.0, (double) kSize - 3.0);
+        const int i = (int) pos;
+        const double t = pos - (double) i;
+        const double p0 = table[(size_t) i - 1], p1 = table[(size_t) i];
+        const double p2 = table[(size_t) i + 1], p3 = table[(size_t) i + 2];
+        return p1 + 0.5 * t * (p2 - p0 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)));
+    }
+
+    // 회로 그대로 풀기 (테이블 생성·테스트용)
+    static double plateCurrent (double vak, double vgk) noexcept
+    {
+        if (vak <= 0.0) return 0.0;
+        const double z  = kKp * (1.0 / kMu + vgk / std::sqrt (kKvb + vak * vak));
+        const double sp = z > 30.0 ? z : std::log1p (std::exp (z));
+        const double e1 = vak / kKp * sp;
+        return e1 > 0.0 ? 2.0 * std::pow (e1, kEx) / kKg1 : 0.0;
+    }
+
+    static double gridClamp (double vgk) noexcept
+    {
+        return vgk <= 0.0 ? vgk : vgk / (1.0 + vgk / kGridClampV);
+    }
+
+    // 무바이패스 캐소드 증폭단의 애노드 전류 (입력 = 그리드 신호 전압)
+    static double stageCurrent (double vin, double rk) noexcept
+    {
+        double lo = 0.0, hi = kBplus / (kRl + rk);
+        for (int it = 0; it < 64; ++it)
+        {
+            const double ia = 0.5 * (lo + hi);
+            const double g  = ia - plateCurrent (kBplus - ia * (kRl + rk), gridClamp (vin - ia * rk));
+            (g > 0.0 ? hi : lo) = ia;
+        }
+        return 0.5 * (lo + hi);
+    }
+
+    double cathodeResistor() const noexcept { return rk; }
+    double idlePlateVoltage() const noexcept { return vp0; }
+    double stageGain() const noexcept { return gain; }
+
+private:
+    void build()
+    {
+        // 1) 유휴 전류 0.5 mA가 되는 캐소드 저항
+        double lo = 100.0, hi = 100.0e3;
+        for (int it = 0; it < 64; ++it)
+        {
+            rk = 0.5 * (lo + hi);
+            (stageCurrent (0.0, rk) > kIdleA ? lo : hi) = rk;
+        }
+        rk  = 0.5 * (lo + hi);
+        vp0 = kBplus - stageCurrent (0.0, rk) * kRl;
+
+        // 2) 소신호 이득 (중앙 차분)
+        const double d = 1.0e-4;
+        gain = ((kBplus - stageCurrent (-d, rk) * kRl) - (kBplus - stageCurrent (d, rk) * kRl)) / (2.0 * d);
+
+        // 3) asinh 워핑 격자에 T(v) 저장
+        wMax  = std::asinh (kVmax / kV0);
+        const double dw = 2.0 * wMax / (double) (kSize - 1);
+        invDw = 1.0 / dw;
+        for (int k = 0; k < kSize; ++k)
+        {
+            const double w = -wMax + dw * (double) k;
+            const double v = (k == (kSize - 1) / 2) ? 0.0 : kV0 * std::sinh (w);
+            const double vp = kBplus - stageCurrent (v, rk) * kRl;
+            table[(size_t) k] = (vp0 - vp) / gain;
+        }
+        table[(size_t) (kSize - 1) / 2] = 0.0;
+    }
+
+    std::array<double, kSize> table {};
+    double wMax = 1.0, invDw = 1.0, rk = 0.0, vp0 = 0.0, gain = 1.0;
+};
+
+// 프로세스 전체에서 한 번만 계산 (prepare 때 먼저 불러서 오디오 스레드에서 생성되지 않게 함)
+inline const Ef804sCurve& ef804sCurve()
+{
+    static const Ef804sCurve curve;
+    return curve;
+}
+
+//==============================================================================
+//  튜브 스테이지 (채널 1개, 오버샘플된 레이트)
+//   - Drive: 그리드에 들어가는 신호 크기 (0 dB = 풀스케일이 그리드 0.5 Vpk, 거의 깨끗)
+//   - Focus: 전달곡선의 홀수 성분 + (1 + focus) x 짝수 성분
+//   - 보상: -12 dBFS 사인의 기본파 레벨이 드라이브와 상관없이 같도록 정규화
+//   - DC 블로커는 "왜곡 성분(y - x)"에만 -> 원신호 저역은 그대로
+//   - Drive off면 완전 바이패스 (비트 단위 동일)
+//==============================================================================
+class TubeStage
+{
+public:
+    static constexpr double kGridVoltsPerFullScale = 0.5;
+    static constexpr double kRefAmp = 0.25;   // -12 dBFS
+
+    TubeStage()
+    {
+        for (int k = 0; k < kDfPoints; ++k)
+            sinTable[(size_t) k] = std::sin (2.0 * kPi * ((double) k + 0.5) / (double) kDfPoints);
+    }
+
+    void prepare (double sampleRate)
+    {
+        fs    = sampleRate > 0.0 ? sampleRate : 48000.0;
+        dcR   = std::exp (-2.0 * kPi * 5.0 / fs);
+        curve = &ef804sCurve();
+        applySmoothing();
+        reset();
+    }
+
+    void setSmoothingSeconds (double s) { smoothingSeconds = std::max (0.0, s); applySmoothing(); }
+
+    void setTargets (bool on, double driveDb, double focus) noexcept
+    {
+        wet.target   = on ? 1.0 : 0.0;
+        drive.target = std::clamp (driveDb, 0.0, (double) kDriveMaxDb);
+        foc.target   = std::clamp (focus, -1.0, 1.0);
+    }
+
+    void reset() noexcept
+    {
+        wet.snap(); drive.snap(); foc.snap();
+        clearState();
+        samplesToNextUpdate = 0;
+        updateDerived();
+    }
+
+    void clearState() noexcept { dcX1 = dcY1 = 0.0; }
+
+    void process (float* x, int n) noexcept
+    {
+        int i = 0;
+        while (i < n)
+        {
+            if (samplesToNextUpdate <= 0)
+            {
+                if (! (wet.isSettled() && drive.isSettled() && foc.isSettled()))
+                {
+                    wet.step(); drive.step(); foc.step();
+                    updateDerived();
+                }
+                samplesToNextUpdate = kChunk;
+            }
+            const int len = std::min (samplesToNextUpdate, n - i);
+
+            if (wetNow > 0.0)
+            {
+                float* p = x + i;
+                for (int k = 0; k < len; ++k)
+                {
+                    const double in = p[k];
+                    const double r  = shape (in) * norm - in;     // 왜곡 성분
+                    const double hp = r - dcX1 + dcR * dcY1;      // DC 블로커 (5 Hz)
+                    dcX1 = r;
+                    dcY1 = hp;
+                    p[k] = (float) (in + wetNow * hp);
+                }
+            }
+            else
+            {
+                clearState();
+            }
+
+            samplesToNextUpdate -= len;
+            i += len;
+        }
+    }
+
+    // 테스트용: 현재 설정의 정적 곡선 (보상 포함)
+    double transfer (double x) const noexcept { return shape (x) * norm; }
+
+private:
+    static constexpr int kChunk = 32, kDfPoints = 32;
+
+    double shape (double x) const noexcept
+    {
+        const double v  = x * scale;
+        const double tp = (*curve) (v), tn = (*curve) (-v);
+        return (0.5 * (tp - tn) + evenMul * 0.5 * (tp + tn)) * invScale;
+    }
+
+    void applySmoothing() noexcept
+    {
+        const double rate = fs / kChunk;
+        wet.setTimeConstant (std::max (smoothingSeconds, 0.005), rate);  wet.eps = 1.0e-5;
+        drive.setTimeConstant (smoothingSeconds, rate);                   drive.eps = 1.0e-4;
+        foc.setTimeConstant (smoothingSeconds, rate);                     foc.eps = 1.0e-5;
+    }
+
+    void updateDerived() noexcept
+    {
+        wetNow   = wet.current;
+        scale    = kGridVoltsPerFullScale * dbToGain (drive.current);
+        invScale = 1.0 / scale;
+        evenMul  = 1.0 + foc.current;
+
+        // 기준 레벨(-12 dBFS)에서의 기본파 이득 (describing function)
+        double sum = 0.0;
+        for (int k = 0; k < kDfPoints; ++k)
+            sum += shape (kRefAmp * sinTable[(size_t) k]) * sinTable[(size_t) k];
+        const double df = (2.0 / (double) kDfPoints) * sum / kRefAmp;
+        norm = df > 1.0e-9 ? 1.0 / df : 1.0;
+    }
+
+    const Ef804sCurve* curve = &ef804sCurve();
+    std::array<double, kDfPoints> sinTable {};
+    double fs = 48000.0, dcR = 0.9999, smoothingSeconds = 0.02;
+    double wetNow = 0.0, scale = kGridVoltsPerFullScale, invScale = 1.0 / kGridVoltsPerFullScale;
+    double evenMul = 1.0, norm = 1.0, dcX1 = 0.0, dcY1 = 0.0;
+    Smoother wet, drive, foc;
+    int samplesToNextUpdate = 0;
+};
+
+//==============================================================================
+//  출력 트랜스포머 색채 — 저역 / 중역 / 고역 따로
+//   LR4 크로스오버(200 Hz, 4 kHz)로 나눈 각 구간에서 "왜곡 성분"만 만들어 원신호에 더함
+//   -> 모든 양이 0이면 완전 바이패스, 크로스오버 위상이 원신호에 묻지 않음
+//   LOW : 코어 포화 (대칭, 3차 위주, 큰 저음일수록 진해짐)
+//   MID : 은은한 밀도 (약한 비대칭, 2차+3차)
+//   HIGH: 고역 포화 + 12 kHz 위를 최대 -1.5 dB 부드럽게 (누설 인덕턴스/권선 용량 느낌)
+//==============================================================================
+class TransformerStage
+{
+public:
+    static constexpr double kXoverLowHz = 200.0, kXoverHighHz = 4000.0;
+    static constexpr double kLowDrive = 1.4;
+    static constexpr double kMidDrive = 0.45, kMidBias = 0.12;
+    static constexpr double kHighDrive = 1.2;
+    static constexpr double kShelfHz = 12000.0, kShelfQ = 0.5, kShelfMaxCutDb = 1.5;
+
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate > 0.0 ? sampleRate : 48000.0;
+        const double q = 1.0 / std::sqrt (2.0);
+        lpLo = makeLowpass  (kXoverLowHz,  q, fs);
+        hpLo = makeHighpass (kXoverLowHz,  q, fs);
+        lpHi = makeLowpass  (kXoverHighHz, q, fs);
+        hpHi = makeHighpass (kXoverHighHz, q, fs);
+        dcR  = std::exp (-2.0 * kPi * 5.0 / fs);
+        midT = std::tanh (kMidBias);
+        midNorm = 1.0 / (kMidDrive * (1.0 - midT * midT));
+        applySmoothing();
+        reset();
+    }
+
+    void setSmoothingSeconds (double s) { smoothingSeconds = std::max (0.0, s); applySmoothing(); }
+
+    void setAmounts (double low, double mid, double high) noexcept
+    {
+        aLow.target  = clamp01 (low);
+        aMid.target  = clamp01 (mid);
+        aHigh.target = clamp01 (high);
+    }
+
+    void reset() noexcept
+    {
+        aLow.snap(); aMid.snap(); aHigh.snap();
+        clearState();
+        samplesToNextUpdate = 0;
+        updateDerived();
+    }
+
+    void clearState() noexcept
+    {
+        for (auto& s : xs) s = SvfState {};
+        shelfState = SvfState {};
+        dcX1 = dcY1 = 0.0;
+    }
+
+    void process (float* x, int n) noexcept
+    {
+        int i = 0;
+        while (i < n)
+        {
+            if (samplesToNextUpdate <= 0)
+            {
+                if (! (aLow.isSettled() && aMid.isSettled() && aHigh.isSettled()))
+                {
+                    aLow.step(); aMid.step(); aHigh.step();
+                    updateDerived();
+                }
+                samplesToNextUpdate = kChunk;
+            }
+            const int len = std::min (samplesToNextUpdate, n - i);
+
+            if (active)
+            {
+                float* p = x + i;
+                for (int k = 0; k < len; ++k)
+                {
+                    const double in  = p[k];
+                    const double lo  = svfTick (lpLo, xs[1], svfTick (lpLo, xs[0], in));
+                    const double hb  = svfTick (hpLo, xs[3], svfTick (hpLo, xs[2], in));
+                    const double mid = svfTick (lpHi, xs[5], svfTick (lpHi, xs[4], hb));
+                    const double hi  = svfTick (hpHi, xs[7], svfTick (hpHi, xs[6], hb));
+
+                    const double r = curLow  * (std::tanh (kLowDrive * lo) / kLowDrive - lo)
+                                   + curMid  * ((std::tanh (kMidDrive * mid + kMidBias) - midT) * midNorm - mid)
+                                   + curHigh * (std::tanh (kHighDrive * hi) / kHighDrive - hi);
+
+                    const double hp = r - dcX1 + dcR * dcY1;
+                    dcX1 = r;
+                    dcY1 = hp;
+
+                    p[k] = (float) (svfTick (shelf, shelfState, in) + hp);
+                }
+            }
+            else
+            {
+                clearState();
+            }
+
+            samplesToNextUpdate -= len;
+            i += len;
+        }
+    }
+
+private:
+    static constexpr int kChunk = 32;
+
+    void applySmoothing() noexcept
+    {
+        const double rate = fs / kChunk;
+        for (auto* s : { &aLow, &aMid, &aHigh })
+        {
+            s->setTimeConstant (std::max (smoothingSeconds, 0.005), rate);
+            s->eps = 1.0e-5;
+        }
+    }
+
+    void updateDerived() noexcept
+    {
+        curLow  = aLow.current;
+        curMid  = aMid.current;
+        curHigh = aHigh.current;
+        active  = curLow > 0.0 || curMid > 0.0 || curHigh > 0.0;
+        shelf   = makeHighShelf (kShelfHz, kShelfQ, -kShelfMaxCutDb * curHigh, fs);
+    }
+
+    double fs = 48000.0, dcR = 0.9999, smoothingSeconds = 0.02;
+    double midT = 0.0, midNorm = 1.0, curLow = 0.0, curMid = 0.0, curHigh = 0.0;
+    double dcX1 = 0.0, dcY1 = 0.0;
+    bool active = false;
+    SvfCoeffs lpLo, hpLo, lpHi, hpHi, shelf;
+    std::array<SvfState, 8> xs {};
+    SvfState shelfState;
+    Smoother aLow, aMid, aHigh;
+    int samplesToNextUpdate = 0;
+};
+
+//==============================================================================
+//  모듈 체인 (채널 1개): EQ -> EF804S -> 트랜스포머 -> Mix -> Level
+//==============================================================================
+class ModuleChain
+{
+public:
+    void prepare (double sampleRate, int maxBlock)
+    {
+        fs = sampleRate > 0.0 ? sampleRate : 48000.0;
+        eq.prepare (fs);
+        tube.prepare (fs);
+        xf.prepare (fs);
+        dry.assign ((size_t) std::max (1, maxBlock), 0.0f);
+        applySmoothing();
+        reset();
+    }
+
+    void setSmoothingSeconds (double s)
+    {
+        smoothingSeconds = std::max (0.0, s);
+        eq.setSmoothingSeconds (s);
+        tube.setSmoothingSeconds (s);
+        xf.setSmoothingSeconds (s);
+        applySmoothing();
+    }
+
+    void setTargets (const ResolvedModule& r, const Params& p) noexcept
+    {
+        eq.setTargets (r);
+        tube.setTargets (p.driveOn, r.driveDb, p.focus);
+        xf.setAmounts (p.xfLow, p.xfMid, p.xfHigh);
+        mix.target = clamp01 (p.mix);
+        outGain.target = dbToGain (r.outputDb);
+    }
+
+    void reset() noexcept
+    {
+        eq.reset();
+        tube.reset();
+        xf.reset();
+        mix.snap();
+        outGain.snap();
+    }
+
+    void clearState() noexcept
+    {
+        eq.clearState();
+        tube.clearState();
+        xf.clearState();
+    }
+
+    void process (float* x, int n) noexcept
+    {
+        const int cap = (int) dry.size();
+        int i = 0;
+        while (i < n)
+        {
+            const int len = std::min (cap, n - i);
+            float* p = x + i;
+
+            const bool useMix = ! (mix.isSettled() && sameValue (mix.current, 1.0));
+            if (useMix)
+                std::copy (p, p + len, dry.begin());
+
+            eq.process (p, len);
+            tube.process (p, len);
+            xf.process (p, len);
+
+            if (useMix)
+                for (int k = 0; k < len; ++k)
+                {
+                    const double m = mix.step();
+                    p[k] = (float) ((double) dry[(size_t) k] + m * ((double) p[k] - (double) dry[(size_t) k]));
+                }
+
+            if (! (outGain.isSettled() && sameValue (outGain.current, 1.0)))
+                for (int k = 0; k < len; ++k)
+                    p[k] = (float) ((double) p[k] * outGain.step());
+
+            i += len;
+        }
+    }
+
+    // 테스트용 접근
+    EqSection& getEq() noexcept { return eq; }
+    TubeStage& getTube() noexcept { return tube; }
+    TransformerStage& getTransformer() noexcept { return xf; }
+
+private:
+    void applySmoothing() noexcept
+    {
+        mix.setTimeConstant (smoothingSeconds, fs);      mix.eps = 1.0e-6;
+        outGain.setTimeConstant (smoothingSeconds, fs);  outGain.eps = 1.0e-7;
+    }
+
+    double fs = 48000.0, smoothingSeconds = 0.015;
+    EqSection eq;
+    TubeStage tube;
+    TransformerStage xf;
+    Smoother mix, outGain;
+    std::vector<float> dry = std::vector<float> (512, 0.0f);
+};
+
+//==============================================================================
+//  오버샘플링 배율 (플러그인과 테스트가 같은 규칙 사용)
+//==============================================================================
+inline int oversamplingOrderFor (double sampleRate) noexcept
+{
+    if (sampleRate <= 50000.0)  return 2;   // 44.1 / 48 kHz -> 4배
+    if (sampleRate <= 100000.0) return 1;   // 88.2 / 96 kHz -> 2배
+    return 0;
+}
+
+inline double processingRateFor (double sampleRate) noexcept
+{
+    return sampleRate * (double) (1 << oversamplingOrderFor (sampleRate));
+}
+
+//==============================================================================
+//  엔진: 라우팅(L/R, M/S) + 모듈 2개
+//   라우팅 전환은 5 ms 페이드아웃 -> 전환(필터 상태 초기화) -> 5 ms 페이드인
+//==============================================================================
+class Engine
+{
+public:
+    static constexpr double kDuckSeconds = 0.005;
+
+    Engine() { setParams (Params {}); }
+
+    void prepare (double processingRate, int numChannels, int maxBlock)
+    {
+        fs = processingRate > 0.0 ? processingRate : 48000.0;
+        numCh = std::clamp (numChannels, 1, 2);
+        for (auto& m : modules) m.prepare (fs, maxBlock);
+        duckStep = 1.0 / std::max (1.0, kDuckSeconds * fs);
+        reset();
+    }
+
+    double getProcessingRate() const noexcept { return fs; }
+
+    void setSmoothingMs (double ms)
+    {
+        for (auto& m : modules) m.setSmoothingSeconds (std::max (0.0, ms) * 0.001);
+    }
+
+    void setParams (const Params& p) noexcept
+    {
+        modules[0].setTargets (resolveModule (p, 0), p);
+        modules[1].setTargets (resolveModule (p, 1), p);
+        targetRouting = p.routing;
+    }
+
+    void reset() noexcept
+    {
+        for (auto& m : modules) m.reset();
+        currentRouting = targetRouting;
+        duckGain = 1.0;
+    }
+
+    void process (float* const* ch, int numChannels, int n) noexcept
+    {
+        const int nc = std::min (numChannels, numCh);
+        if (nc <= 0 || n <= 0)
+            return;
+
+        if (nc == 1)
+        {
+            modules[0].process (ch[0], n);
+            return;
+        }
+
+        int i = 0;
+        while (i < n)
+        {
+            int len = n - i, dir = 0;
+
+            if (currentRouting != targetRouting)
+            {
+                if (duckGain <= 0.0)
+                {
+                    currentRouting = targetRouting;   // 무음 상태에서 전환
+                    for (auto& m : modules) m.clearState();
+                    continue;
+                }
+                len = std::min (len, std::max (1, (int) std::ceil (duckGain / duckStep - 1.0e-9)));
+                dir = -1;
+            }
+            else if (duckGain < 1.0)
+            {
+                len = std::min (len, std::max (1, (int) std::ceil ((1.0 - duckGain) / duckStep - 1.0e-9)));
+                dir = +1;
+            }
+
+            processSpan (ch[0] + i, ch[1] + i, len, dir);
+            i += len;
+        }
+    }
+
+    ModuleChain& getModule (int m) noexcept { return modules[(size_t) std::clamp (m, 0, 1)]; }
+
+private:
+    void processSpan (float* L, float* R, int n, int dir) noexcept
+    {
+        const bool ms = (currentRouting == Routing::MidSide);
+        if (ms)
+            for (int k = 0; k < n; ++k)
+            {
+                const double l = L[k], r = R[k];
+                L[k] = (float) (0.5 * (l + r));
+                R[k] = (float) (0.5 * (l - r));
+            }
+
+        modules[0].process (L, n);
+        modules[1].process (R, n);
+
+        if (ms)
+            for (int k = 0; k < n; ++k)
+            {
+                const double m = L[k], s = R[k];
+                L[k] = (float) (m + s);
+                R[k] = (float) (m - s);
+            }
+
+        if (dir != 0)
+            for (int k = 0; k < n; ++k)
+            {
+                duckGain = clamp01 (duckGain + (double) dir * duckStep);
+                L[k] = (float) ((double) L[k] * duckGain);
+                R[k] = (float) ((double) R[k] * duckGain);
+            }
+    }
+
+    double fs = 48000.0, duckGain = 1.0, duckStep = 0.001;
+    int numCh = 2;
+    Routing currentRouting = Routing::Stereo, targetRouting = Routing::Stereo;
+    std::array<ModuleChain, 2> modules;
+};
+
+//==============================================================================
+//  GUI 응답 곡선 (실제 처리와 같은 계수로 계산)
+//   포함: EQ, 트랜스포머 고역 셸프(선형 부분), Mix 블렌드
+//   제외: 튜브/트랜스포머 비선형 성분(기준 레벨에서 이득 1), 모듈 Level
 //==============================================================================
 class ResponseModel
 {
 public:
-    ResponseModel (const Params& p, double sampleRate) noexcept
+    ResponseModel (const Params& p, int module, double sampleRate) noexcept
         : fs (sampleRate > 0.0 ? sampleRate : 48000.0)
     {
-        const Resolved r = resolve (p);
+        const ResolvedModule r = resolveModule (p, module);
         treble = makeHighShelf (kTrebleShelfHz, r.trebleQ, r.trebleDb, fs);
         bass   = makeLowShelf  (kBassShelfHz,   r.bassQ,   r.bassDb,   fs);
         pres   = makeBell      (r.presHz, r.presQ, r.presDb, fs);
         tilt   = makeTilt      (kTiltPivotHz, r.tiltDb, fs);
+        shelf  = makeHighShelf (TransformerStage::kShelfHz, TransformerStage::kShelfQ,
+                                -TransformerStage::kShelfMaxCutDb * clamp01 (p.xfHigh), fs);
+        mix    = clamp01 (p.mix);
     }
 
-    // EQ 곡선만 (출력 게인/튜브 제외)
     double magnitudeDb (double freqHz) const noexcept
     {
-        const auto h = svfResponse (treble, freqHz, fs) * svfResponse (bass, freqHz, fs)
-                     * svfResponse (pres, freqHz, fs) * tiltResponse (tilt, freqHz, fs);
+        const auto wet = svfResponse (treble, freqHz, fs) * svfResponse (bass, freqHz, fs)
+                       * svfResponse (pres, freqHz, fs) * tiltResponse (tilt, freqHz, fs)
+                       * svfResponse (shelf, freqHz, fs);
+        const auto h = (1.0 - mix) + mix * wet;
         return 20.0 * std::log10 (std::max (std::abs (h), 1.0e-12));
     }
 
 private:
-    double fs;
-    SvfCoeffs treble, bass, pres;
+    double fs, mix = 1.0;
+    SvfCoeffs treble, bass, pres, shelf;
     TiltCoeffs tilt;
 };
 
