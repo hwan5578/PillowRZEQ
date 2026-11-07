@@ -537,6 +537,23 @@ void GraphView::paint (juce::Graphics& g)
             g.setFont (uiFont (10.5f, true));
             g.drawText (juce::String (i + 1), circle, juce::Justification::centred, false);
 
+            // 이 밴드 부분을 튜브 · 트랜스포머로 보냄 (ALL이 켜져 있으면 이미 전체가 지나가므로 흐리게)
+            const float dotY = c.y + r + 5.0f;
+            auto dot = [&] (float x, juce::Colour dc, bool redundant)
+            {
+                g.setColour (palette::graphBg);
+                g.fillEllipse (juce::Rectangle<float> (8.0f, 8.0f).withCentre ({ x, dotY }));
+                g.setColour (dc.withAlpha (redundant || inert ? 0.4f : 1.0f));
+                g.fillEllipse (juce::Rectangle<float> (6.0f, 6.0f).withCentre ({ x, dotY }));
+            };
+            if (b.tube && b.xfmr)
+            {
+                dot (c.x - 4.0f, juce::Colour (0xffff8f4f), params.driveOn);
+                dot (c.x + 4.0f, palette::accent2, params.xfAll);
+            }
+            else if (b.tube) dot (c.x, juce::Colour (0xffff8f4f), params.driveOn);
+            else if (b.xfmr) dot (c.x, palette::accent2, params.xfAll);
+
             if (b.place != rz::Placement::Stereo)
             {
                 const auto badge = juce::Rectangle<float> (13.0f, 13.0f).withCentre (c + juce::Point<float> (r * 0.95f, -r * 0.95f));
@@ -588,6 +605,8 @@ void GraphView::paint (juce::Graphics& g)
             if (rz::typeHasSlope (b.type)) text += "   " + pillow::slopeNames()[b.slope];
             if (rz::typeHasQ (b.type))     text += "   Q " + pillow::formatQ (b.q);
             if (b.place != rz::Placement::Stereo) text += "   " + pillow::placementNames()[(int) b.place].toUpperCase();
+            if (b.tube) text += "   TUBE";
+            if (b.xfmr) text += "   XFMR";
             if (! b.on) text += "   OFF";
             col = bandColour (shownBand);
         }
@@ -844,6 +863,8 @@ void GraphView::showBandMenu (int band)
 
     menu.addSeparator();
     menu.addItem (1, "Band On", true, bp.on);
+    menu.addItem (4, "Tube (EF804S) on this band", true, bp.tube);
+    menu.addItem (5, "Transformer on this band", true, bp.xfmr);
     if (rz::typeHasGain (bp.type))
         menu.addItem (2, "Reset Gain");
     menu.addItem (3, "Delete Band");
@@ -866,6 +887,8 @@ void GraphView::handleBandMenu (int band, int r)
     else if (r >= 300 && r < 300 + rz::kNumPlacements)  setParameter (bandParam (proc, band, pillow::ids::place), (float) (r - 300));
     else if (r == 1) setParameter (bandParam (proc, band, pillow::ids::on), params.bands[(size_t) band].on ? 0.0f : 1.0f);
     else if (r == 2) setParameter (bandParam (proc, band, pillow::ids::gain), 0.0f);
+    else if (r == 4) setParameter (bandParam (proc, band, pillow::ids::tube), params.bands[(size_t) band].tube ? 0.0f : 1.0f);
+    else if (r == 5) setParameter (bandParam (proc, band, pillow::ids::xfmr), params.bands[(size_t) band].xfmr ? 0.0f : 1.0f);
     else if (r == 3)
     {
         if (selected == band)

@@ -104,7 +104,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
         juce::ParameterID { pillow::ids::eqOn, 2 }, "EQ On", true));
 
     layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { pillow::ids::driveOn, 2 }, "Drive On", false));
+        juce::ParameterID { pillow::ids::driveOn, 2 }, "Tube All", false));
+
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { pillow::ids::xfAll, 6 }, "Transformer All", true));
 
     layout.add (std::make_unique<FloatParam> (
         juce::ParameterID { pillow::ids::drive, 2 }, "Drive",
@@ -170,6 +173,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
         layout.add (std::make_unique<juce::AudioParameterChoice> (
             juce::ParameterID { band (i, pillow::ids::place), 5 }, n + "Placement",
             pillow::placementNames(), (int) rz::Placement::Stereo));
+
+        layout.add (std::make_unique<juce::AudioParameterBool> (
+            juce::ParameterID { band (i, pillow::ids::tube), 6 }, n + "Tube", false));
+
+        layout.add (std::make_unique<juce::AudioParameterBool> (
+            juce::ParameterID { band (i, pillow::ids::xfmr), 6 }, n + "Transformer", false));
     }
 
     return layout;
@@ -192,10 +201,11 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
     paramXfMid   = apvts.getRawParameterValue (pillow::ids::xfMid);
     paramXfHigh  = apvts.getRawParameterValue (pillow::ids::xfHigh);
     paramOutput  = apvts.getRawParameterValue (pillow::ids::output);
+    paramXfAll   = apvts.getRawParameterValue (pillow::ids::xfAll);
 
     jassert (paramQuality != nullptr && paramEqOn != nullptr && paramDriveOn != nullptr && paramDrive != nullptr
              && paramFocus != nullptr && paramMix != nullptr && paramXfLow != nullptr && paramXfMid != nullptr
-             && paramXfHigh != nullptr && paramOutput != nullptr);
+             && paramXfHigh != nullptr && paramOutput != nullptr && paramXfAll != nullptr);
 
     for (int i = 0; i < rz::kMaxBands; ++i)
     {
@@ -209,8 +219,11 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
         b.q     = get (pillow::ids::q);
         b.slope = get (pillow::ids::slope);
         b.place = get (pillow::ids::place);
+        b.tube  = get (pillow::ids::tube);
+        b.xfmr  = get (pillow::ids::xfmr);
         jassert (b.used != nullptr && b.on != nullptr && b.type != nullptr && b.freq != nullptr
-                 && b.gain != nullptr && b.q != nullptr && b.slope != nullptr && b.place != nullptr);
+                 && b.gain != nullptr && b.q != nullptr && b.slope != nullptr && b.place != nullptr
+                 && b.tube != nullptr && b.xfmr != nullptr);
     }
 
     // 모드를 바꾸면 오디오 스레드는 플래그만 세우고, 호스트 알림(setLatencySamples)은 여기 타이머에서
@@ -240,6 +253,7 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
     p.xfMid    = paramXfMid->load() * 0.01f;
     p.xfHigh   = paramXfHigh->load() * 0.01f;
     p.outputDb = paramOutput->load();
+    p.xfAll    = paramXfAll->load() >= 0.5f;
 
     for (size_t i = 0; i < p.bands.size(); ++i)
     {
@@ -253,6 +267,8 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
         b.q     = ptr.q->load();
         b.slope = index (ptr.slope, (int) rz::kCutSlopes.size());
         b.place = (rz::Placement) index (ptr.place, rz::kNumPlacements);
+        b.tube  = ptr.tube->load() >= 0.5f;
+        b.xfmr  = ptr.xfmr->load() >= 0.5f;
     }
     return p;
 }

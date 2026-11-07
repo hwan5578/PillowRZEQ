@@ -11,7 +11,7 @@ namespace pillow::ids
     // 전역 — v0.4 이하와 같은 ID는 의미·범위도 같음 (기존 자동화가 그대로 이어짐)
     inline constexpr const char* quality = "quality";   // 0 = ZERO LATENCY, 1 = HQ
     inline constexpr const char* eqOn    = "eqOn";
-    inline constexpr const char* driveOn = "driveOn";
+    inline constexpr const char* driveOn = "driveOn";   // 튜브를 신호 전체에 (ALL). v0.5까지는 튜브 켜기 스위치
     inline constexpr const char* drive   = "drive";     // EF804S 드라이브 (v0.4까지는 모듈 1의 드라이브)
     inline constexpr const char* focus   = "focus";
     inline constexpr const char* mix     = "mix";
@@ -19,6 +19,7 @@ namespace pillow::ids
     inline constexpr const char* xfMid   = "xfMid";
     inline constexpr const char* xfHigh  = "xfHigh";
     inline constexpr const char* output  = "output";    // 최종 출력 (v0.4까지는 모듈 1의 Level)
+    inline constexpr const char* xfAll   = "xfAll";     // v0.6: 트랜스포머를 신호 전체에 (ALL)
 
     // 밴드 항목 — 실제 ID는 band (i, 항목) = "b1_freq" ... "b16_place"
     inline constexpr const char* used  = "used";
@@ -29,6 +30,8 @@ namespace pillow::ids
     inline constexpr const char* q     = "q";
     inline constexpr const char* slope = "slope";
     inline constexpr const char* place = "place";
+    inline constexpr const char* tube  = "tube";        // v0.6: 이 밴드 부분을 EF804S로
+    inline constexpr const char* xfmr  = "xfmr";        // v0.6: 이 밴드 부분을 트랜스포머로
 
     inline juce::String band (int index, const char* field)
     {
@@ -163,6 +166,8 @@ private:
         std::atomic<float>* q     = nullptr;
         std::atomic<float>* slope = nullptr;
         std::atomic<float>* place = nullptr;
+        std::atomic<float>* tube  = nullptr;
+        std::atomic<float>* xfmr  = nullptr;
     };
 
     std::atomic<float>* paramQuality = nullptr;
@@ -175,6 +180,7 @@ private:
     std::atomic<float>* paramXfMid   = nullptr;
     std::atomic<float>* paramXfHigh  = nullptr;
     std::atomic<float>* paramOutput  = nullptr;
+    std::atomic<float>* paramXfAll   = nullptr;
     std::array<BandPtrs, pillow::rz::kMaxBands> bandPtrs;
 
     // ZERO LATENCY: 세션 레이트 그대로 (ADAA 안티에일리어싱 + 매칭 EQ), 레이턴시 0

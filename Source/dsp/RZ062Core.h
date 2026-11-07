@@ -151,12 +151,15 @@ struct BandParams
     float     q     = 1.0f;
     int       slope = kDefaultSlope;    // kCutSlopes 인덱스 (컷)
     Placement place = Placement::Stereo;
+    bool      tube  = false;            // v0.6: 이 밴드의 주파수 부분을 EF804S 튜브로
+    bool      xfmr  = false;            // v0.6: 이 밴드의 주파수 부분을 출력 트랜스포머로
 
     bool isActive() const noexcept { return used && on; }
 
     bool operator== (const BandParams& o) const noexcept
     {
         return used == o.used && on == o.on && type == o.type && slope == o.slope && place == o.place
+            && tube == o.tube && xfmr == o.xfmr
             && sameValue (freq, o.freq) && sameValue (gain, o.gain) && sameValue (q, o.q);
     }
     bool operator!= (const BandParams& o) const noexcept { return ! (*this == o); }
@@ -165,7 +168,8 @@ struct BandParams
 struct Params
 {
     bool  eqOn    = true;
-    bool  driveOn = false;
+    bool  driveOn = false;    // 튜브를 신호 전체에 (ALL). 꺼져 있으면 TUBE를 켠 밴드의 부분에만
+    bool  xfAll   = true;     // 트랜스포머를 신호 전체에 (ALL). 꺼져 있으면 XFMR을 켠 밴드의 부분에만
     float drive   = 0.0f;     // EF804S 드라이브 0..48 dB
     float focus   = 0.0f;     // -1 = 홀수 배음(대칭)  0 = EF804S 그대로  +1 = 짝수 배음 2배
     float mix     = 1.0f;     // 0..1 (원음 블렌드)
@@ -175,7 +179,7 @@ struct Params
 
     bool operator== (const Params& o) const noexcept
     {
-        return eqOn == o.eqOn && driveOn == o.driveOn
+        return eqOn == o.eqOn && driveOn == o.driveOn && xfAll == o.xfAll
             && sameValue (drive, o.drive) && sameValue (focus, o.focus) && sameValue (mix, o.mix)
             && sameValue (xfLow, o.xfLow) && sameValue (xfMid, o.xfMid) && sameValue (xfHigh, o.xfHigh)
             && sameValue (outputDb, o.outputDb) && bands == o.bands;
@@ -927,6 +931,9 @@ public:
     // 테스트용: 현재 설정의 정적 곡선 (보상 포함, 안티에일리어싱 없음)
     double transfer (double x) const noexcept { return (x + deviation (x)) * norm; }
 
+    // 켜져 있거나 꺼지는 중 (false면 process가 아무것도 바꾸지 않음)
+    bool isEngaged() const noexcept { return wet.target > 0.0 || wetNow > 0.0; }
+
 private:
     static constexpr int kChunk = 32, kDfPoints = 32;
 
@@ -1112,6 +1119,8 @@ public:
         }
     }
 
+    bool isEngaged() const noexcept { return active || aLow.target > 0.0 || aMid.target > 0.0 || aHigh.target > 0.0; }
+
     // 구간별 왜곡 성분 h(u) = f(u) - u 와 그 역도함수 H(u) (H(0) = 0)
     static double hLow (double u) noexcept  { return std::tanh (kLowDrive * u) / kLowDrive - u; }
     static double HLow (double u) noexcept  { return logCosh (kLowDrive * u) / (kLowDrive * kLowDrive) - 0.5 * u * u; }
@@ -1234,6 +1243,41 @@ inline BandDesign designBand (BandType type, double freq, double gainDb, double 
     return d;
 }
 
+//==============================================================================
+//  밴드의 "영역" (v0.6): 튜브 · 트랜스포머를 그 밴드에만 걸 때 보내는 주파수 부분
+//   벨 · 노치 = 중심 둘레 (밴드패스, 중심 이득 1, 밴드 Q), 로우 셸프 · 하이 컷 = 그 아래 (로우패스),
+//   하이 셸프 · 로우 컷 = 그 위 (하이패스), 틸트 = 전체
+//   쓰는 쪽: 원신호 = (영역 밖) + (영역 안)이 정확히 맞게 상보로 나눠서 "안"만 튜브에 -> 튜브가 투명하면 원신호 그대로
+//==============================================================================
+inline bool regionIsAll (BandType t) noexcept { return t == BandType::Tilt; }
+
+inline SvfCoeffs makeRegion (BandType t, double freq, double q, double fs) noexcept
+{
+    const double f = clampFreq (std::clamp (freq, (double) kFreqMin, (double) kFreqMax), fs);
+    switch (t)
+    {
+        case BandType::Bell:
+        case BandType::Notch:
+        {
+            SvfCoeffs c;
+            c.g  = std::tan (kPi * f / fs);
+            c.k  = 1.0 / std::clamp (q, (double) kQMin, (double) kQMax);
+            c.m0 = 0.0; c.m1 = c.k; c.m2 = 0.0;
+            return finishSvf (c);
+        }
+        case BandType::LowShelf:
+        case BandType::HighCut:   return makeLowpass (f, kButterworthQ, fs);
+        case BandType::HighShelf:
+        case BandType::LowCut:    return makeHighpass (f, kButterworthQ, fs);
+        case BandType::Tilt:      break;
+    }
+    SvfCoeffs all;                    // 전체: 출력 = 입력
+    all.g = std::tan (kPi * f / fs);
+    all.k = 1.0;
+    all.m0 = 1.0; all.m1 = 0.0; all.m2 = 0.0;
+    return finishSvf (all);
+}
+
 inline std::complex<double> designResponse (const BandDesign& d, double f, double fs) noexcept
 {
     std::complex<double> h (1.0, 0.0);
@@ -1261,6 +1305,7 @@ class BandProcessor
 public:
     static constexpr int    kSubBlockBase = 16;     // 48 kHz 기준 (0.33 ms)
     static constexpr double kFadeSeconds  = 0.008;
+    static constexpr int    kMaxChunk     = 32;     // 엔진이 한 번에 넘기는 최대 길이 (영역 보내기용 페이드 기록)
 
     BandProcessor() { prepare (48000.0); }
 
@@ -1279,6 +1324,8 @@ public:
     void setTarget (const BandParams& b, bool eqOn) noexcept
     {
         targetActive = b.isActive() && eqOn;
+        sends[0].target = targetActive && b.tube;
+        sends[1].target = targetActive && b.xfmr;
         if (! targetActive)
             return;                                   // 사라지는 동안은 마지막 설정 그대로 (값이 쓸려가지 않게)
         target = b;
@@ -1294,6 +1341,12 @@ public:
         sF.snap(); sG.snap(); sQ.snap();
         mode = targetActive ? Mode::On : Mode::Off;
         fade = targetActive ? 1.0 : 0.0;
+        for (auto& s : sends)
+        {
+            s.alpha = s.target ? 1.0 : 0.0;
+            s.valid = false;
+            s.live  = false;
+        }
         clearState();
         cur = designNow();
         ramping = false;
@@ -1337,16 +1390,7 @@ public:
     void process (float* a, float* b, int nc, int n) noexcept
     {
         bool doA, doB;
-        if (nc < 2)
-        {
-            doA = cfg.place != Placement::Side;
-            doB = false;
-        }
-        else
-        {
-            doA = cfg.place == Placement::Stereo || cfg.place == Placement::Left  || cfg.place == Placement::Mid;
-            doB = cfg.place == Placement::Stereo || cfg.place == Placement::Right || cfg.place == Placement::Side;
-        }
+        channelsFor (nc, doA, doB);
 
         int i = 0;
         while (i < n)
@@ -1370,6 +1414,8 @@ public:
                 {
                     fade = std::max (0.0, fade - fadeStep);
                 }
+                if (traceIdx < kMaxChunk)
+                    fadeTrace[(size_t) traceIdx++] = fade;
 
                 if (doA) a[i + k] = (float) tick (d, st[0], (double) a[i + k]);
                 if (doB) b[i + k] = (float) tick (d, st[1], (double) b[i + k]);
@@ -1381,8 +1427,88 @@ public:
         }
     }
 
+    //--------------------------------------------------------------------------
+    //  영역 보내기 (s = 0 튜브, 1 트랜스포머)
+    //   엔진의 32샘플 덩어리(절대 시간) 단위: 덩어리 처음에 beginChunk, 그 안에서 위치(pos)로 샘플마다 계산
+    //   -> 호스트 블록이 덩어리를 어떻게 자르든 결과가 비트 단위로 같음
+    //--------------------------------------------------------------------------
+    void beginChunk() noexcept
+    {
+        traceIdx = 0;
+        for (auto& snd : sends)
+        {
+            snd.alphaStart = snd.alpha;
+            snd.rising = snd.target;
+            snd.alpha = snd.rising ? std::min (1.0, snd.alpha + fadeStep * kMaxChunk)
+                                   : std::max (0.0, snd.alpha - fadeStep * kMaxChunk);
+            snd.live = mode != Mode::Off && (snd.alphaStart > 0.0 || snd.alpha > 0.0);
+            if (! snd.live)
+            {
+                snd.valid = false;
+                continue;
+            }
+            snd.from = snd.to;
+            snd.to = makeRegion (cfg.type, std::exp (sF.current), std::exp (sQ.current), fs);
+            if (! snd.valid)             // 새로 쓰기 시작 (또는 모양이 바뀐 뒤): 보간 없이, 상태 비우고
+            {
+                snd.from = snd.to;
+                snd.st = {};
+                snd.valid = true;
+            }
+        }
+    }
+
+    bool sendLive (int s) const noexcept { return sends[(size_t) s].live; }
+
+    // c -= w R(c)   (w = 보내기 페이드 x 밴드 페이드, 계수는 덩어리 안에서 샘플마다 보간)
+    // a, b = 이 그룹의 두 채널 (L·R 또는 M·S), process와 같은 채널 규칙. pos = 덩어리 안에서의 시작 위치
+    void applyComplement (int s, float* a, float* b, int nc, int n, int pos) noexcept
+    {
+        auto& snd = sends[(size_t) s];
+        if (! snd.live)
+            return;
+        bool doA, doB;
+        channelsFor (nc, doA, doB);
+        const double dir = snd.rising ? fadeStep : -fadeStep;
+        const auto& f = snd.from;
+        const auto& t = snd.to;
+        for (int k = 0; k < n; ++k)
+        {
+            const int idx = std::min (pos + k, kMaxChunk - 1);
+            const double u = (double) (idx + 1) / (double) kMaxChunk;
+            SvfCoeffs c;
+            c.a1 = f.a1 + (t.a1 - f.a1) * u;  c.a2 = f.a2 + (t.a2 - f.a2) * u;  c.a3 = f.a3 + (t.a3 - f.a3) * u;
+            c.m0 = f.m0 + (t.m0 - f.m0) * u;  c.m1 = f.m1 + (t.m1 - f.m1) * u;  c.m2 = f.m2 + (t.m2 - f.m2) * u;
+            const double w = std::clamp (snd.alphaStart + dir * (double) (idx + 1), 0.0, 1.0) * fadeTrace[(size_t) idx];
+            if (doA) { const double x = a[k]; a[k] = (float) (x - w * svfTick (c, snd.st[0], x)); }
+            if (doB) { const double x = b[k]; b[k] = (float) (x - w * svfTick (c, snd.st[1], x)); }
+        }
+    }
+
 private:
     enum class Mode { Off, FadingIn, On, FadingOut };
+
+    struct RegionSend
+    {
+        bool   target = false, rising = false, live = false, valid = false;
+        double alpha = 0.0, alphaStart = 0.0;
+        SvfCoeffs from, to;
+        std::array<SvfState, 2> st {};
+    };
+
+    void channelsFor (int nc, bool& doA, bool& doB) const noexcept
+    {
+        if (nc < 2)
+        {
+            doA = cfg.place != Placement::Side;
+            doB = false;
+        }
+        else
+        {
+            doA = cfg.place == Placement::Stereo || cfg.place == Placement::Left  || cfg.place == Placement::Mid;
+            doB = cfg.place == Placement::Stereo || cfg.place == Placement::Right || cfg.place == Placement::Side;
+        }
+    }
 
     struct ChannelState
     {
@@ -1412,6 +1538,7 @@ private:
     {
         cfg = target;
         sF.snap(); sG.snap(); sQ.snap();
+        for (auto& s : sends) s.valid = false;   // 모양 · 채널이 바뀌었을 수 있음 -> 영역도 새로
         clearState();
         cur = designNow();
         ramping = false;
@@ -1492,6 +1619,9 @@ private:
     BandDesign cur, next, base, step, live;
     std::array<ChannelState, 2> st {};
     int subBlock = kSubBlockBase, subLeft = 0, rampPos = 0;
+    std::array<RegionSend, 2> sends {};
+    std::array<double, kMaxChunk> fadeTrace {};
+    int traceIdx = 0;
 };
 
 //==============================================================================
@@ -1512,11 +1642,14 @@ inline double processingRateFor (double sampleRate) noexcept
 //==============================================================================
 //  엔진: 밴드 16개 -> EF804S -> 트랜스포머 -> Mix -> Output (채널 1~2개)
 //   32샘플(절대 시간 기준) 덩어리마다 밴드 상태 전환을 확인 -> 호스트 블록 크기와 상관없이 같은 결과
+//   튜브 · 트랜스포머 (v0.6): ALL이면 신호 전체, 아니면 TUBE/XFMR을 켠 밴드 영역의 합집합만 통과
+//     c = (1 - ALL) x  Π (1 - w_i R_i)  x     (어느 영역에도 안 드는 부분, 상보 캐스케이드)
+//     출력 = c + 단계(x - c)                 -> 단계가 투명하면 정확히 x. 튜브 · 트랜스포머는 한 대씩
 //==============================================================================
 class Engine
 {
 public:
-    static constexpr int kChunk = 32;
+    static constexpr int kChunk = BandProcessor::kMaxChunk;   // 32
 
     Engine() { setParams (Params {}); reset(); }
 
@@ -1528,6 +1661,7 @@ public:
         for (auto& b : bands) b.prepare (fs);
         for (auto& t : tube)  t.prepare (fs);
         for (auto& x : xf)    x.prepare (fs);
+        allStep = 1.0 / std::max (1.0, BandProcessor::kFadeSeconds * fs);
         applySmoothing();
         reset();
     }
@@ -1545,10 +1679,21 @@ public:
 
     void setParams (const Params& p) noexcept
     {
+        bool anyTube = false, anyXf = false;
         for (size_t i = 0; i < bands.size(); ++i)
-            bands[i].setTarget (p.bands[i], p.eqOn);
-        for (auto& t : tube) t.setTargets (p.driveOn, p.drive, p.focus);
-        for (auto& x : xf)   x.setAmounts (p.xfLow, p.xfMid, p.xfHigh);
+        {
+            const auto& b = p.bands[i];
+            bands[i].setTarget (b, p.eqOn);
+            const bool live = b.isActive() && p.eqOn;
+            anyTube = anyTube || (live && b.tube);
+            anyXf   = anyXf   || (live && b.xfmr);
+        }
+        const bool tubeOn = p.driveOn || anyTube;
+        const bool xfOn   = p.xfAll || anyXf;
+        for (auto& t : tube) t.setTargets (tubeOn, p.drive, p.focus);
+        for (auto& x : xf)   x.setAmounts (xfOn ? p.xfLow : 0.0, xfOn ? p.xfMid : 0.0, xfOn ? p.xfHigh : 0.0);
+        allTarget[0] = p.driveOn;
+        allTarget[1] = p.xfAll;
         mix.target     = clamp01 (p.mix);
         outGain.target = dbToGain (std::clamp ((double) p.outputDb, -24.0, 24.0));
     }
@@ -1558,6 +1703,12 @@ public:
         for (auto& b : bands) b.reset();
         for (auto& t : tube)  t.reset();
         for (auto& x : xf)    x.reset();
+        for (size_t s = 0; s < 2; ++s)
+        {
+            allAlpha[s] = allStart[s] = allTarget[s] ? 1.0 : 0.0;
+            allDir[s] = 0.0;
+        }
+        stageOn = { false, false };
         mix.snap();
         outGain.snap();
         sampleCounter = 0;
@@ -1576,9 +1727,9 @@ public:
         {
             const int pos = (int) (sampleCounter % (std::uint64_t) kChunk);
             if (pos == 0)
-                for (auto& b : bands) b.updateState();
+                beginChunk();
             const int len = std::min (kChunk - pos, n - i);
-            processChunk (L + i, R != nullptr ? R + i : nullptr, nc, len);
+            processChunk (L + i, R != nullptr ? R + i : nullptr, nc, len, pos);
             i += len;
             sampleCounter += (std::uint64_t) len;
         }
@@ -1589,7 +1740,25 @@ public:
     TransformerStage& getTransformer (int c) noexcept { return xf[(size_t) std::clamp (c, 0, 1)]; }
 
 private:
-    void processChunk (float* L, float* R, int nc, int n) noexcept
+    // 32샘플 덩어리 처음 (절대 시간): 밴드 상태 전환, 보내기 · ALL 페이드 · 튜브/트랜스포머 사용 여부를 이 덩어리 동안 고정
+    void beginChunk() noexcept
+    {
+        for (auto& b : bands)
+        {
+            b.updateState();
+            b.beginChunk();
+        }
+        for (size_t s = 0; s < 2; ++s)
+        {
+            allStart[s] = allAlpha[s];
+            allDir[s]   = allTarget[s] ? allStep : -allStep;
+            allAlpha[s] = std::clamp (allStart[s] + allDir[s] * kChunk, 0.0, 1.0);
+        }
+        stageOn[0] = tube[0].isEngaged();
+        stageOn[1] = xf[0].isEngaged();
+    }
+
+    void processChunk (float* L, float* R, int nc, int n, int pos) noexcept
     {
         const bool useMix = ! (mix.isSettled() && sameValue (mix.current, 1.0));
         if (useMix)
@@ -1625,13 +1794,8 @@ private:
             }
         }
 
-        tube[0].process (L, n);
-        xf[0].process (L, n);
-        if (R != nullptr)
-        {
-            tube[1].process (R, n);
-            xf[1].process (R, n);
-        }
+        runStage (0, L, R, nc, n, pos);   // EF804S
+        runStage (1, L, R, nc, n, pos);   // 출력 트랜스포머
 
         if (useMix)
             for (int k = 0; k < n; ++k)
@@ -1651,13 +1815,105 @@ private:
             }
     }
 
+    // s = 0 튜브, 1 트랜스포머. ALL이면 신호 전체, 아니면 보내기를 켠 밴드 영역의 합집합만
+    void runStage (int s, float* L, float* R, int nc, int n, int pos) noexcept
+    {
+        const double a0  = allStart[(size_t) s];
+        const double dir = allDir[(size_t) s];
+
+        auto stage = [&] (float* x, int ch)
+        {
+            if (s == 0) tube[(size_t) ch].process (x, n);
+            else        xf[(size_t) ch].process (x, n);
+        };
+        if (! stageOn[(size_t) s])
+            return;                                                   // 꺼져 있음: 비트 단위 그대로
+
+        bool anyLive = false, anyMs = false;
+        for (auto& b : bands)
+            if (b.sendLive (s))
+            {
+                anyLive = true;
+                anyMs = anyMs || (nc == 2 && isMsPlacement (b.placement()));
+            }
+
+        const bool allFull = a0 >= 1.0 && allAlpha[(size_t) s] >= 1.0;
+        if (! anyLive && allFull)
+        {
+            stage (L, 0);                                             // 신호 전체 (v0.5와 비트 단위로 같음)
+            if (R != nullptr) stage (R, 1);
+            return;
+        }
+        if (! anyLive && a0 <= 0.0 && allAlpha[(size_t) s] <= 0.0)
+            return;                                                   // 보낼 부분이 없음
+
+        // c = 영역 밖 (영역 필터는 ALL일 때도 돌려서 상태를 이어 둠)
+        float* cL = cBuf[0].data();
+        float* cR = cBuf[1].data();
+        std::copy (L, L + n, cL);
+        if (R != nullptr) std::copy (R, R + n, cR);
+
+        for (auto& b : bands)
+            if (b.sendLive (s) && ! (nc == 2 && isMsPlacement (b.placement())))
+                b.applyComplement (s, cL, cR, nc, n, pos);
+        if (anyMs)
+        {
+            for (int k = 0; k < n; ++k)
+            {
+                const double l = cL[k], r = cR[k];
+                cL[k] = (float) (0.5 * (l + r));
+                cR[k] = (float) (0.5 * (l - r));
+            }
+            for (auto& b : bands)
+                if (b.sendLive (s) && isMsPlacement (b.placement()))
+                    b.applyComplement (s, cL, cR, nc, n, pos);
+            for (int k = 0; k < n; ++k)
+            {
+                const double m = cL[k], d = cR[k];
+                cL[k] = (float) (m + d);
+                cR[k] = (float) (m - d);
+            }
+        }
+
+        if (allFull)
+        {
+            stage (L, 0);
+            if (R != nullptr) stage (R, 1);
+            return;
+        }
+
+        float* iL = insBuf[0].data();
+        float* iR = insBuf[1].data();
+        for (int k = 0; k < n; ++k)
+        {
+            const double keep = 1.0 - std::clamp (a0 + dir * (double) (pos + k + 1), 0.0, 1.0);   // ALL 페이드
+            cL[k] = (float) (keep * cL[k]);
+            iL[k] = L[k] - cL[k];
+            if (R != nullptr)
+            {
+                cR[k] = (float) (keep * cR[k]);
+                iR[k] = R[k] - cR[k];
+            }
+        }
+        stage (iL, 0);
+        if (R != nullptr) stage (iR, 1);
+        for (int k = 0; k < n; ++k)
+        {
+            L[k] = cL[k] + iL[k];
+            if (R != nullptr) R[k] = cR[k] + iR[k];
+        }
+    }
+
     void applySmoothing() noexcept
     {
         mix.setTimeConstant (smoothingSeconds, fs);      mix.eps = 1.0e-6;
         outGain.setTimeConstant (smoothingSeconds, fs);  outGain.eps = 1.0e-7;
     }
 
-    double fs = 48000.0, smoothingSeconds = 0.015;
+    double fs = 48000.0, smoothingSeconds = 0.015, allStep = 0.003;
+    std::array<double, 2> allAlpha { 0.0, 1.0 }, allStart { 0.0, 1.0 }, allDir { 0.0, 0.0 };
+    std::array<bool, 2>   allTarget { false, true }, stageOn { false, false };
+    std::array<std::array<float, kChunk>, 2> cBuf {}, insBuf {};
     int numCh = 2;
     std::uint64_t sampleCounter = 0;
     std::array<BandProcessor, kMaxBands> bands;
@@ -1669,7 +1925,7 @@ private:
 
 //==============================================================================
 //  GUI 응답 곡선 (실제 처리와 같은 계수로 계산)
-//   포함: 밴드, 트랜스포머 고역 셸프(선형 부분), Mix 블렌드
+//   포함: 밴드, 트랜스포머 고역 셸프(선형 부분, ALL이 아니면 XFMR 밴드 영역에만), Mix 블렌드
 //   제외: 튜브/트랜스포머 비선형 성분(기준 레벨에서 이득 1), Output
 //   뷰: Stereo = 스테레오 밴드만, Left/Right/Mid/Side = 스테레오 밴드 + 그 채널 밴드
 //       (L/R 밴드와 M/S 밴드를 함께 쓰면 실제로는 서로 섞이므로 표시는 근사)
@@ -1680,6 +1936,7 @@ public:
     ResponseModel (const Params& p, double sampleRate) noexcept
         : fs (sampleRate > 0.0 ? sampleRate : 48000.0)
     {
+        bool anyXf = false;
         for (size_t i = 0; i < p.bands.size(); ++i)
         {
             const auto& b = p.bands[i];
@@ -1687,9 +1944,18 @@ public:
             place[i]  = b.place;
             if (active[i])
                 designs[i] = designBand (b.type, b.freq, b.gain, b.q, b.slope, fs);
+            xfRegion[i] = active[i] && b.xfmr;
+            if (xfRegion[i])
+            {
+                anyXf = true;
+                regionAll[i] = regionIsAll (b.type);
+                regions[i]   = makeRegion (b.type, b.freq, b.q, fs);
+            }
         }
+        xfAll = p.xfAll;
+        const bool xfOn = p.xfAll || anyXf;
         shelf = makeHighShelfMatched (TransformerStage::kShelfHz, TransformerStage::kShelfQ,
-                                      -TransformerStage::kShelfMaxCutDb * clamp01 (p.xfHigh), fs);
+                                      -TransformerStage::kShelfMaxCutDb * (xfOn ? clamp01 (p.xfHigh) : 0.0), fs);
         mix = clamp01 (p.mix);
     }
 
@@ -1716,15 +1982,31 @@ public:
         return h;
     }
 
+    // 트랜스포머의 선형 부분: 1 + (S - 1) U,  U = 트랜스포머가 걸리는 부분 (ALL이면 1)
+    std::complex<double> transformerResponse (double f, Placement view = Placement::Stereo) const noexcept
+    {
+        const auto S = svfResponse (shelf, f, fs);
+        if (xfAll)
+            return S;
+        std::complex<double> outside (1.0, 0.0);
+        for (size_t i = 0; i < xfRegion.size(); ++i)
+            if (xfRegion[i] && (place[i] == Placement::Stereo || place[i] == view))
+                outside *= regionAll[i] ? std::complex<double> (0.0, 0.0) : 1.0 - svfResponse (regions[i], f, fs);
+        return 1.0 + (S - 1.0) * (1.0 - outside);
+    }
+
     double magnitudeDb (double f, Placement view = Placement::Stereo) const noexcept
     {
-        const auto h = (1.0 - mix) + mix * eqResponse (f, view) * svfResponse (shelf, f, fs);
+        const auto h = (1.0 - mix) + mix * eqResponse (f, view) * transformerResponse (f, view);
         return 20.0 * std::log10 (std::max (std::abs (h), 1.0e-12));
     }
 
 private:
     double fs, mix = 1.0;
+    bool xfAll = true;
     SvfCoeffs shelf;
+    std::array<bool, kMaxBands> xfRegion {}, regionAll {};
+    std::array<SvfCoeffs, kMaxBands> regions {};
     std::array<bool, kMaxBands> active {};
     std::array<Placement, kMaxBands> place {};
     std::array<BandDesign, kMaxBands> designs {};

@@ -36,10 +36,21 @@ BandPanel::BandPanel (PillowRZAudioProcessor& p) : proc (p)
 
     onButton.setButtonText ("ON");
     onButton.setTooltip ("Band on / off (Alt + click on the graph point)");
-    onButton.setWantsKeyboardFocus (false);       // Return 키가 버튼을 누르지 않게
+    tubeButton.setButtonText ("TUBE");
+    tubeButton.setTooltip ("Send this band's frequency range through the EF804S tube\n"
+                           "(DRIVE / FOCUS in the main panel; ALL there sends the whole signal)");
+    tubeButton.getProperties().set ("rzLed", (juce::int64) juce::Colour (0xffff8f4f).getARGB());
+    xfmrButton.setButtonText ("XFMR");
+    xfmrButton.setTooltip ("Send this band's frequency range through the output transformer\n"
+                           "(LOW / MID / HIGH amounts in the main panel; ALL there sends the whole signal)");
+    xfmrButton.getProperties().set ("rzLed", (juce::int64) palette::accent2.getARGB());
+    for (auto* b : { &onButton, &tubeButton, &xfmrButton })
+    {
+        b->setWantsKeyboardFocus (false);         // Return 키가 버튼을 누르지 않게
+        addChildComponent (*b);
+    }
     removeButton.setWantsKeyboardFocus (false);
     setMouseClickGrabsKeyboardFocus (false);
-    addChildComponent (onButton);
 
     removeButton.setTooltip ("Delete this band (Delete key on the graph)");
     removeButton.onClick = [this]
@@ -96,11 +107,12 @@ void BandPanel::attach (int band)
     attachedBand = band;
 
     freqAtt.reset(); gainAtt.reset(); qAtt.reset(); slopeAtt.reset();
-    onAtt.reset(); shapeAtt.reset(); placeAtt.reset();
+    onAtt.reset(); tubeAtt.reset(); xfmrAtt.reset(); shapeAtt.reset(); placeAtt.reset();
 
     const bool show = band >= 0;
     for (auto* c : std::initializer_list<juce::Component*> { &freqKnob, &gainKnob, &qKnob, &slopeKnob,
-                                                             &shapes, &placement, &onButton, &removeButton })
+                                                             &shapes, &placement, &onButton, &tubeButton,
+                                                             &xfmrButton, &removeButton })
         c->setVisible (show);
     if (! show)
         return;
@@ -110,6 +122,8 @@ void BandPanel::attach (int band)
     qAtt     = std::make_unique<SliderAttachment> (proc.apvts, pillow::ids::band (band, pillow::ids::q),     qKnob);
     slopeAtt = std::make_unique<SliderAttachment> (proc.apvts, pillow::ids::band (band, pillow::ids::slope), slopeKnob);
     onAtt    = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::band (band, pillow::ids::on),    onButton);
+    tubeAtt  = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::band (band, pillow::ids::tube),  tubeButton);
+    xfmrAtt  = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::band (band, pillow::ids::xfmr),  xfmrButton);
 
     freqKnob.setDoubleClickReturnValue (false, 0.0);
     gainKnob.setDoubleClickReturnValue (true, 0.0);
@@ -164,6 +178,10 @@ void BandPanel::updateTypeDependent()
             k->dimmed = ! live;
             k->repaint();
         }
+
+    // 메인 패널의 ALL이 켜져 있으면 이 밴드 부분도 이미 지나가므로 흐리게 (눌러 둘 수는 있음)
+    tubeButton.setAlpha (params.driveOn ? 0.45f : 1.0f);
+    xfmrButton.setAlpha (params.xfAll ? 0.45f : 1.0f);
 }
 
 void BandPanel::timerCallback()
@@ -195,8 +213,10 @@ void BandPanel::resized()
 {
     shapes.setBounds    (22, 72, 300, 36);
     placement.setBounds (22, 132, 300, 28);
-    onButton.setBounds  (22, 178, 78, 28);
-    removeButton.setBounds (110, 178, 92, 28);
+    onButton.setBounds     (22, 178, 64, 28);
+    tubeButton.setBounds   (92, 178, 72, 28);
+    xfmrButton.setBounds   (170, 178, 76, 28);
+    removeButton.setBounds (252, 178, 70, 28);
 
     freqKnob.setBounds  (352, 64, 92, 138);
     gainKnob.setBounds  (448, 64, 92, 138);
@@ -220,9 +240,11 @@ void BandPanel::paint (juce::Graphics& g)
         g.drawText ("BAND " + juce::String (selected + 1), 48, 10, 90, 24, juce::Justification::centredLeft, false);
         g.setColour (palette::dim);
         g.setFont (uiFont (11.0f, true, 0.08f));
-        g.drawText (pillow::bandTypeNames()[(int) b.type].toUpperCase() + "   /   "
-                        + pillow::placementNames()[(int) b.place].toUpperCase(),
-                    136, 10, 200, 24, juce::Justification::centredLeft, false);
+        juce::String info = pillow::bandTypeNames()[(int) b.type].toUpperCase() + "   /   "
+                          + pillow::placementNames()[(int) b.place].toUpperCase();
+        if (b.tube) info += "   /   TUBE";
+        if (b.xfmr) info += "   /   XFMR";
+        g.drawFittedText (info, 136, 10, 200, 24, juce::Justification::centredLeft, 1, 0.8f);
     }
     else
     {
@@ -285,8 +307,9 @@ void BandPanel::paint (juce::Graphics& g)
         g.drawFittedText ("Double-click the graph to add a band, or right-click it to pick a shape.\n"
                           "Drag a point: frequency and gain   /   mouse wheel: Q   /   hold Shift: fine\n"
                           "Ctrl (Cmd) + drag: Q   /   Alt + click: band on/off   /   Delete: remove band\n"
-                          "Click a point (or a number above) to open that band's settings here.",
-                          juce::Rectangle<int> (30, 56, getWidth() - 60, 150), juce::Justification::centred, 4);
+                          "Click a point (or a number above) to open that band's settings here.\n"
+                          "TUBE / XFMR on a band: only that band's range goes through the tube / transformer.",
+                          juce::Rectangle<int> (30, 52, getWidth() - 60, 160), juce::Justification::centred, 5);
     }
 }
 
@@ -321,14 +344,24 @@ MainPanel::MainPanel (PillowRZAudioProcessor& p) : proc (p)
     addAndMakeVisible (eqSwitch);
     eqAttachment = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::eqOn, eqSwitch);
 
-    driveSwitch.setButtonText ("DRIVE");
-    driveSwitch.setTooltip ("EF804S tube stage on / off");
-    eqSwitch.setWantsKeyboardFocus (false);
-    driveSwitch.setWantsKeyboardFocus (false);
+    tubeAllSwitch.setButtonText ("ALL");
+    tubeAllSwitch.setTooltip ("On: the whole signal goes through the EF804S (classic RZ062)\n"
+                              "Off: only the bands with TUBE on");
+    tubeAllSwitch.getProperties().set ("rzLed", (juce::int64) juce::Colour (0xffff8f4f).getARGB());
+    xfAllSwitch.setButtonText ("ALL");
+    xfAllSwitch.setTooltip ("On: the whole signal goes through the output transformer\n"
+                            "Off: only the bands with XFMR on");
+    xfAllSwitch.getProperties().set ("rzLed", (juce::int64) palette::accent2.getARGB());
+    for (auto* b : { &eqSwitch, &tubeAllSwitch, &xfAllSwitch })
+    {
+        b->setWantsKeyboardFocus (false);
+        addAndMakeVisible (*b);
+    }
     setMouseClickGrabsKeyboardFocus (false);
-    addAndMakeVisible (driveSwitch);
-    driveAttachment = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::driveOn, driveSwitch);
+    tubeAllAttachment = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::driveOn, tubeAllSwitch);
+    xfAllAttachment   = std::make_unique<ButtonAttachment> (proc.apvts, pillow::ids::xfAll, xfAllSwitch);
 
+    timerCallback();
     startTimerHz (10);
 }
 
@@ -350,19 +383,56 @@ void MainPanel::setupKnob (RZKnob& knob, const char* paramId, bool large)
 
 void MainPanel::timerCallback()
 {
-    const bool on = proc.readParams().driveOn;
-    for (auto* k : { &drive, &focus })
-        if (k->dimmed == on)
+    const auto p = proc.readParams();
+
+    // 어디에 걸리고 있는지: 신호 전체 / 밴드 목록 / 꺼짐
+    auto usage = [&p] (bool all, bool tube, bool& used)
+    {
+        used = all;
+        if (all)
+            return juce::String ("whole signal (ALL)");
+        juce::StringArray list;
+        for (int i = 0; i < pillow::rz::kMaxBands; ++i)
         {
-            k->dimmed = ! on;
+            const auto& b = p.bands[(size_t) i];
+            if (p.eqOn && b.isActive() && (tube ? b.tube : b.xfmr))
+                list.add (juce::String (i + 1));
+        }
+        used = ! list.isEmpty();
+        if (! used)
+            return juce::String (tube ? "off   /   ALL, or TUBE on a band" : "off   /   ALL, or XFMR on a band");
+        return (list.size() == 1 ? "band " : "bands ") + list.joinIntoString (", ");
+    };
+
+    bool tubeUsed = false, xfUsed = false;
+    const auto t = usage (p.driveOn, true, tubeUsed);
+    const auto x = usage (p.xfAll, false, xfUsed);
+    if (t != tubeUsage || x != xfUsage)
+    {
+        tubeUsage = t;
+        xfUsage = x;
+        repaint();
+    }
+
+    for (auto* k : { &drive, &focus })
+        if (k->dimmed == tubeUsed)
+        {
+            k->dimmed = ! tubeUsed;
+            k->repaint();
+        }
+    for (auto* k : { &xfLow, &xfMid, &xfHigh })
+        if (k->dimmed == xfUsed)
+        {
+            k->dimmed = ! xfUsed;
             k->repaint();
         }
 }
 
 void MainPanel::resized()
 {
-    eqSwitch.setBounds    (24, 54, 74, 28);
-    driveSwitch.setBounds (106, 54, 94, 28);
+    eqSwitch.setBounds      (24, 54, 74, 28);
+    tubeAllSwitch.setBounds (214, 100, 70, 26);
+    xfAllSwitch.setBounds   (214, 274, 70, 26);
 
     drive.setBounds (14,  142, 92, 110);
     focus.setBounds (106, 142, 92, 110);
@@ -380,11 +450,22 @@ void MainPanel::paint (juce::Graphics& g)
     drawPanelBackground (g, getLocalBounds().toFloat());
     const float w = (float) getWidth();
 
-    drawSectionTitle (g, 26, 12, "MAIN", "whole signal, after the bands");
+    drawSectionTitle (g, 26, 12, "MAIN", "tube & transformer settings, output");
+
+    g.setColour (palette::dim);
+    g.setFont (uiFont (10.5f));
+    g.drawText ("all bands on / off", 106, 54, 180, 28, juce::Justification::centredLeft, false);
 
     g.setColour (palette::panelEdge.withAlpha (0.7f));
     g.drawHorizontalLine (94, 20.0f, w - 20.0f);
-    drawSectionTitle (g, 26, 100, "EF804S TUBE", "drive  /  odd-even focus  /  dry mix");
+    drawSectionTitle (g, 26, 100, "EF804S TUBE", {});
+    auto drawUsage = [&g] (const juce::String& text, int y)
+    {
+        g.setColour (palette::dim);
+        g.setFont (uiFont (10.5f));
+        g.drawFittedText (text, 26, y, 182, 14, juce::Justification::centredLeft, 1, 0.75f);   // ALL 스위치와 겹치지 않게
+    };
+    drawUsage (tubeUsage, 115);
     drawSmallLabel (g, drive, "DRIVE");
     drawSmallLabel (g, focus, "FOCUS");
     drawSmallLabel (g, mix, "MIX");
@@ -396,7 +477,8 @@ void MainPanel::paint (juce::Graphics& g)
 
     g.setColour (palette::panelEdge.withAlpha (0.7f));
     g.drawHorizontalLine (268, 20.0f, w - 20.0f);
-    drawSectionTitle (g, 26, 274, "OUTPUT TRANSFORMER", "colour per range");
+    drawSectionTitle (g, 26, 274, "TRANSFORMER", {});
+    drawUsage (xfUsage, 289);
     drawSmallLabel (g, xfLow,  "LOW < 200");
     drawSmallLabel (g, xfMid,  "MID");
     drawSmallLabel (g, xfHigh, "HIGH > 4k");
