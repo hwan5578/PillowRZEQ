@@ -254,10 +254,10 @@ static void testBandShapes()
             {
                 const auto m = single (makeBand (t, 1000, 0, 1.0, Placement::Stereo, s), fs);
                 const int order = kCutSlopes[(size_t) s] / 6;
-                const double far = t == BandType::LowCut ? 250.0 : 4000.0;
+                const double farHz = t == BandType::LowCut ? 250.0 : 4000.0;   // ("far"는 MSVC에서 매크로)
                 const double expected = -10.0 * std::log10 (1.0 + std::pow (4.0, 2.0 * order));
                 wFc  = std::max (wFc, std::abs (m.magnitudeDb (1000.0) + 3.0103));
-                wFar = std::max (wFar, std::abs (m.magnitudeDb (far) - expected));
+                wFar = std::max (wFar, std::abs (m.magnitudeDb (farHz) - expected));
             }
         const auto res = single (makeBand (BandType::LowCut, 1000, 0, 2.0), fs);
         double peak = -100.0;
