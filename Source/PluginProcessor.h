@@ -4,42 +4,40 @@
 #include <juce_dsp/juce_dsp.h>
 
 #include "dsp/RZ062Core.h"
+#include "AnalyzerTap.h"
 
 namespace pillow::ids
 {
-    // 전역
-    inline constexpr const char* quality = "quality";   // v0.3: 0 = ZERO LATENCY, 1 = HQ
-    inline constexpr const char* routing = "routing";
-    inline constexpr const char* link    = "link";
-    inline constexpr const char* steps   = "steps";
+    // 전역 — v0.4 이하와 같은 ID는 의미·범위도 같음 (기존 자동화가 그대로 이어짐)
+    inline constexpr const char* quality = "quality";   // 0 = ZERO LATENCY, 1 = HQ
     inline constexpr const char* eqOn    = "eqOn";
     inline constexpr const char* driveOn = "driveOn";
+    inline constexpr const char* drive   = "drive";     // EF804S 드라이브 (v0.4까지는 모듈 1의 드라이브)
     inline constexpr const char* focus   = "focus";
     inline constexpr const char* mix     = "mix";
     inline constexpr const char* xfLow   = "xfLow";
     inline constexpr const char* xfMid   = "xfMid";
     inline constexpr const char* xfHigh  = "xfHigh";
+    inline constexpr const char* output  = "output";    // 최종 출력 (v0.4까지는 모듈 1의 Level)
 
-    // 모듈별 — 모듈 1은 v0.1과 같은 ID(기존 세션 호환), 모듈 2는 뒤에 "2"
-    inline constexpr const char* mode     = "mode";
-    inline constexpr const char* treble   = "treble";
-    inline constexpr const char* trebleQ  = "trebleQ";
-    inline constexpr const char* bass     = "bass";
-    inline constexpr const char* bassQ    = "bassQ";
-    inline constexpr const char* tilt     = "tilt";
-    inline constexpr const char* trebleHz = "trebleHz";   // v0.4: 기준 주파수 (연속)
-    inline constexpr const char* bassHz   = "bassHz";     // v0.4
-    inline constexpr const char* presHz   = "presHz";     // v0.4: 연속 (v0.3 이하의 4단계 presFreq를 대체)
-    inline constexpr const char* presFreqLegacy = "presFreq";   // v0.3 이하 세션 변환용 (파라미터로는 없음)
-    inline constexpr const char* presGain = "presGain";
-    inline constexpr const char* presQ    = "presQ";
-    inline constexpr const char* drive    = "drive";
-    inline constexpr const char* output   = "output";
+    // 밴드 항목 — 실제 ID는 band (i, 항목) = "b1_freq" ... "b16_place"
+    inline constexpr const char* used  = "used";
+    inline constexpr const char* on    = "on";
+    inline constexpr const char* type  = "type";
+    inline constexpr const char* freq  = "freq";
+    inline constexpr const char* gain  = "gain";
+    inline constexpr const char* q     = "q";
+    inline constexpr const char* slope = "slope";
+    inline constexpr const char* place = "place";
 
-    inline juce::String forModule (const char* base, int module)
+    inline juce::String band (int index, const char* field)
     {
-        return module <= 0 ? juce::String (base) : juce::String (base) + "2";
+        return "b" + juce::String (index + 1) + "_" + field;
     }
+
+    // 화면 설정 (파라미터가 아니라 상태 트리의 속성으로 저장)
+    inline constexpr const char* uiRange    = "uiRange";      // 그래프 범위 6 / 12 / 24 dB
+    inline constexpr const char* uiAnalyzer = "uiAnalyzer";   // 0 = 끔, 1 = POST, 2 = PRE + POST
 }
 
 namespace pillow
@@ -53,7 +51,7 @@ namespace pillow
         return (r > 0.0f ? "+" : "") + juce::String (r, 1) + " dB";
     }
 
-    inline juce::String formatQ (float q)  { return "Q " + juce::String (q, 2); }
+    inline juce::String formatQ (float q)  { return q >= 9.995f ? juce::String (q, 1) : juce::String (q, 2); }
 
     inline juce::String formatHz (float hz)
     {
@@ -64,14 +62,23 @@ namespace pillow
         return (std::abs (r - std::round (r)) < 0.05f ? juce::String (juce::roundToInt (r)) : juce::String (r, 1)) + " Hz";
     }
 
-    // "2.8k", "2800", "2.8 kHz" 모두 받음. 단위 없이 범위보다 작은 수를 치면 kHz로 봄 (예: Presence에 "2.5")
-    inline float parseHz (const juce::String& text, float minHz)
+    // "2.8k", "2800", "2.8 kHz" 모두 받음
+    inline float parseHz (const juce::String& text)
     {
         const auto t = text.trim().toLowerCase();
         float v = t.retainCharacters ("0123456789.").getFloatValue();
-        if (t.containsChar ('k') || (v < minHz && v * 1000.0f >= minHz))
+        if (t.containsChar ('k'))
             v *= 1000.0f;
         return v;
+    }
+
+    inline juce::StringArray bandTypeNames()  { return { "Bell", "Low Shelf", "High Shelf", "Low Cut", "High Cut", "Notch", "Tilt" }; }
+    inline juce::StringArray placementNames() { return { "Stereo", "Left", "Right", "Mid", "Side" }; }
+    inline juce::StringArray slopeNames()
+    {
+        juce::StringArray s;
+        for (int v : rz::kCutSlopes) s.add (juce::String (v) + " dB/oct");
+        return s;
     }
 }
 
@@ -102,7 +109,7 @@ public:
     bool acceptsMidi() const override  { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.1; }   // 필터 잔향 여유
+    double getTailLengthSeconds() const override { return 0.5; }   // 낮은 주파수 · 높은 Q 밴드의 잔향 여유
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -116,11 +123,18 @@ public:
     //==========================================================================
     // UI에서도 쓰는 헬퍼 (atomic 읽기라 어느 스레드에서든 안전)
     pillow::rz::Params readParams() const noexcept;
-    bool isSteppedMode() const noexcept { return paramSteps->load() >= 0.5f; }
     int getNumChannelsInUse() const noexcept { return numChannelsInUse.load(); }
 
     // 응답 곡선 계산용 처리 레이트 (지금 소리를 내는 모드 기준). 아직 준비 전이면 48k 기준.
     double getProcessingRate() const noexcept { return processingRate.load(); }
+    double getSessionRate() const noexcept    { return sessionRate.load(); }
+
+    // 분석기: 0 = 처리 전(PRE), 1 = 처리 후(POST). 에디터가 열려 있을 때만 채움
+    pillow::AnalyzerTap& getAnalyzerTap (int which) noexcept { return taps[(size_t) juce::jlimit (0, 1, which)]; }
+    void setAnalyzerActive (bool shouldBeActive) noexcept { analyzerActive.store (shouldBeActive); }
+
+    // v0.4 이하 세션(모듈 방식)을 밴드로 바꿈. 바꿨으면 true (테스트에서도 사용)
+    static bool migrateLegacyState (juce::ValueTree& state);
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     juce::AudioProcessorValueTreeState apvts;
@@ -136,36 +150,32 @@ private:
     void resetActivePath() noexcept;
     void runActivePath (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
     void applyFade (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
+    void pushAnalyzer (int which, const juce::AudioBuffer<float>& buffer, int numCh) noexcept;
+    void fillMissingParameters (juce::ValueTree& state) const;
 
-    struct ModulePtrs
+    struct BandPtrs
     {
-        std::atomic<float>* mode = nullptr;
-        std::atomic<float>* treble = nullptr;
-        std::atomic<float>* trebleQ = nullptr;
-        std::atomic<float>* bass = nullptr;
-        std::atomic<float>* bassQ = nullptr;
-        std::atomic<float>* tilt = nullptr;
-        std::atomic<float>* trebleHz = nullptr;
-        std::atomic<float>* bassHz = nullptr;
-        std::atomic<float>* presHz = nullptr;
-        std::atomic<float>* presGain = nullptr;
-        std::atomic<float>* presQ = nullptr;
-        std::atomic<float>* drive = nullptr;
-        std::atomic<float>* output = nullptr;
+        std::atomic<float>* used  = nullptr;
+        std::atomic<float>* on    = nullptr;
+        std::atomic<float>* type  = nullptr;
+        std::atomic<float>* freq  = nullptr;
+        std::atomic<float>* gain  = nullptr;
+        std::atomic<float>* q     = nullptr;
+        std::atomic<float>* slope = nullptr;
+        std::atomic<float>* place = nullptr;
     };
 
     std::atomic<float>* paramQuality = nullptr;
-    std::atomic<float>* paramRouting = nullptr;
-    std::atomic<float>* paramLink    = nullptr;
-    std::atomic<float>* paramSteps   = nullptr;
     std::atomic<float>* paramEqOn    = nullptr;
     std::atomic<float>* paramDriveOn = nullptr;
+    std::atomic<float>* paramDrive   = nullptr;
     std::atomic<float>* paramFocus   = nullptr;
     std::atomic<float>* paramMix     = nullptr;
     std::atomic<float>* paramXfLow   = nullptr;
     std::atomic<float>* paramXfMid   = nullptr;
     std::atomic<float>* paramXfHigh  = nullptr;
-    std::array<ModulePtrs, 2> modulePtrs;
+    std::atomic<float>* paramOutput  = nullptr;
+    std::array<BandPtrs, pillow::rz::kMaxBands> bandPtrs;
 
     // ZERO LATENCY: 세션 레이트 그대로 (ADAA 안티에일리어싱 + 매칭 EQ), 레이턴시 0
     // HQ: 오버샘플링 (44.1/48k 4배, 88.2/96k 2배, 그 위는 그대로), 레이턴시 = 오버샘플링 필터 지연
@@ -175,7 +185,8 @@ private:
     int hqOrder = 0;
     int maxBlockSize = 0;
     int numProcessChannels = 0;
-    bool prepared = false;
+    std::atomic<bool> prepared { false };
+    std::atomic<int>  hqLatency { 0 };   // HQ로 처리할 때의 레이턴시 (이 세션 레이트에서)
 
     bool  hq = false;                 // 오디오 스레드 전용: 지금 쓰는 경로
     Fade  fade = Fade::None;
@@ -185,6 +196,10 @@ private:
     std::atomic<bool>   latencyDirty { false };
     std::atomic<int>    numChannelsInUse { 2 };
     std::atomic<double> processingRate { 48000.0 };
+    std::atomic<double> sessionRate { 48000.0 };
+
+    std::array<pillow::AnalyzerTap, 2> taps;
+    std::atomic<bool> analyzerActive { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PillowRZAudioProcessor)
 };

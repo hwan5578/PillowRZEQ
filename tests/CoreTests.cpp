@@ -1,5 +1,5 @@
 // =============================================================================
-//  Pillow RZ EQ v0.4 — DSP 코어 단독 테스트 (JUCE 불필요)
+//  Pillow RZ EQ v0.5 — DSP 코어 단독 테스트 (JUCE 불필요)
 //
 //    빌드:  g++ -std=c++17 -O2 -I../Source CoreTests.cpp -o CoreTests
 //    실행:  ./CoreTests            (모든 테스트)
@@ -75,46 +75,6 @@ static std::vector<float> impulseResponse (const Params& p, double fs, int len, 
     return out;
 }
 
-static ModuleParams randomModule (std::mt19937& rng)
-{
-    std::uniform_real_distribution<float> u (0.0f, 1.0f);
-    ModuleParams m;
-    m.mode      = u (rng) < 0.5f ? Mode::A_Tilt : Mode::B_Presence;
-    m.trebleDb  = kTrebleMinDb + u (rng) * (kTrebleMaxDb - kTrebleMinDb);
-    m.bassDb    = kBassMinDb + u (rng) * (kBassMaxDb - kBassMinDb);
-    m.trebleQ   = kShelfQMin * std::pow (kShelfQMax / kShelfQMin, u (rng));
-    m.bassQ     = kShelfQMin * std::pow (kShelfQMax / kShelfQMin, u (rng));
-    m.tiltDb    = -kTiltMaxDb + u (rng) * 2.0f * kTiltMaxDb;
-    m.presHz    = (float) (kPresenceSteps.front() * std::pow (kPresenceSteps.back() / kPresenceSteps.front(), (double) u (rng)));
-    m.bassHz    = (float) (kBassSteps.front() * std::pow (kBassSteps.back() / kBassSteps.front(), (double) u (rng)));
-    m.trebleHz  = (float) (kTrebleSteps.front() * std::pow (kTrebleSteps.back() / kTrebleSteps.front(), (double) u (rng)));
-    m.presDb    = u (rng) * kPresMaxDb;
-    m.presQ     = kPresQMin * std::pow (kPresQMax / kPresQMin, u (rng));
-    m.driveDb   = u (rng) * kDriveMaxDb;
-    m.outputDb  = -6.0f + 12.0f * u (rng);
-    return m;
-}
-
-// 모든 기능을 무작위로 (스트레스·블록 크기 테스트용)
-static Params randomParams (std::mt19937& rng)
-{
-    std::uniform_real_distribution<float> u (0.0f, 1.0f);
-    Params p;
-    p.routing = u (rng) < 0.5f ? Routing::Stereo : Routing::MidSide;
-    p.link    = u (rng) < 0.5f;
-    p.stepped = u (rng) < 0.3f;
-    p.eqOn    = u (rng) < 0.9f;
-    p.driveOn = u (rng) < 0.6f;
-    p.focus   = -1.0f + 2.0f * u (rng);
-    p.mix     = u (rng) < 0.3f ? u (rng) : 1.0f;
-    p.xfLow   = u (rng) < 0.5f ? u (rng) : 0.0f;
-    p.xfMid   = u (rng) < 0.5f ? u (rng) : 0.0f;
-    p.xfHigh  = u (rng) < 0.5f ? u (rng) : 0.0f;
-    p.mod[0]  = randomModule (rng);
-    p.mod[1]  = randomModule (rng);
-    return p;
-}
-
 static void harmonics (const std::vector<float>& y, double fs, double f0, int start, int len,
                        double* amps, int nh, double* dcOut)
 {
@@ -146,102 +106,200 @@ static std::vector<float> sine (double fs, double f0, double level, int len)
     return x;
 }
 
-//------------------------------------------------------------------------------
-static void testQuantizers()
+static float logRandom (std::mt19937& rng, double lo, double hi)
 {
-    std::printf ("[1] 원본 스텝 양자화\n");
-    CHECK (quantizeBass (12.0f) == 12.0f, "bass 12");
-    CHECK (quantizeBass (1.1f) == 2.0f, "bass 1.1 -> 2");
-    CHECK (quantizeBass (-1.0f) == 0.0f, "bass -1 -> 0");
-    CHECK (quantizeBass (-2.5f) == -4.0f, "bass -2.5 -> -4");
-    CHECK (quantizeBass (-5.1f) == -6.0f, "bass -5.1 -> -6");
-    CHECK (quantizeBass (-30.0f) == -20.0f, "bass clamp");
-    CHECK (quantizeTreble (-17.2f) == -18.0f, "treble -17.2 -> -18");
-    CHECK (std::abs (quantizeTilt (3.9f) - 4.0f) < 1e-5f, "tilt 3.9 -> 4");
-    CHECK (std::abs (quantizeTilt (-1.3f) + 1.0f) < 1e-5f, "tilt -1.3 -> -1 (got %f)", quantizeTilt (-1.3f));
-    CHECK (std::abs (quantizePresence (4.5f) - 5.0f) < 1e-5f, "pres 4.5 -> 5");
-    CHECK (std::abs (quantizePresence (6.4f) - 6.0f) < 1e-5f, "pres clamp 6");
-    CHECK (quantizePresence (-1.0f) == 0.0f, "pres clamp low");
-    CHECK (bassDetents().size() == 16, "bass detents");
-    CHECK (trebleDetents().size() == 16, "treble detents");
-    CHECK (tiltDetents().size() == 9, "tilt detents %zu", tiltDetents().size());
-    CHECK (presenceDetents().size() == 7, "presence detents");
+    std::uniform_real_distribution<double> u (0.0, 1.0);
+    return (float) (lo * std::pow (hi / lo, u (rng)));
+}
+
+static BandParams makeBand (BandType t, double f, double g, double q = 1.0, Placement pl = Placement::Stereo,
+                            int slope = kDefaultSlope)
+{
+    BandParams b;
+    b.used = true;  b.on = true;  b.type = t;  b.place = pl;  b.slope = slope;
+    b.freq = (float) f;  b.gain = (float) g;  b.q = (float) q;
+    return b;
+}
+
+// 무작위 밴드. typeMask: 허용할 모양 (비트 = BandType)
+static BandParams randomBand (std::mt19937& rng, unsigned typeMask = 0x7Fu, bool anyPlacement = false,
+                              double maxGain = 18.0)
+{
+    std::uniform_real_distribution<float> u (0.0f, 1.0f);
+    BandType t;
+    do { t = (BandType) (int) (u (rng) * (float) kNumBandTypes * 0.9999f); } while (! (typeMask & (1u << (int) t)));
+    const auto pl = anyPlacement ? (Placement) (int) (u (rng) * (float) kNumPlacements * 0.9999f) : Placement::Stereo;
+    return makeBand (t, logRandom (rng, 30.0, 16000.0), -maxGain + 2.0 * maxGain * u (rng), logRandom (rng, 0.2, 8.0),
+                     pl, (int) (u (rng) * 7.999f));
+}
+
+// 모든 기능을 무작위로 (스트레스·블록 크기 테스트용)
+static Params randomParams (std::mt19937& rng)
+{
+    std::uniform_real_distribution<float> u (0.0f, 1.0f);
+    Params p;
+    p.eqOn     = u (rng) < 0.9f;
+    p.driveOn  = u (rng) < 0.6f;
+    p.drive    = u (rng) * kDriveMaxDb;
+    p.focus    = -1.0f + 2.0f * u (rng);
+    p.mix      = u (rng) < 0.3f ? u (rng) : 1.0f;
+    p.xfLow    = u (rng) < 0.5f ? u (rng) : 0.0f;
+    p.xfMid    = u (rng) < 0.5f ? u (rng) : 0.0f;
+    p.xfHigh   = u (rng) < 0.5f ? u (rng) : 0.0f;
+    p.outputDb = -6.0f + 12.0f * u (rng);
+    for (auto& b : p.bands)
+        if (u (rng) < 0.35f)
+        {
+            b = randomBand (rng, 0x7Fu, true, 12.0);
+            b.on = u (rng) < 0.85f;
+        }
+    return p;
 }
 
 //------------------------------------------------------------------------------
 static void testNeutral()
 {
-    std::printf ("[2] 기본 상태(게인 0, Drive off, 트랜스포머 0) -> 투명\n");
+    std::printf ("[1] 밴드 없음 / 게인 0 밴드 / 꺼진 밴드 -> 투명\n");
     std::mt19937 rng (1);
     std::uniform_real_distribution<float> d (-1.0f, 1.0f);
     std::vector<float> L0 (8192), R0 (8192);
     for (size_t i = 0; i < L0.size(); ++i) { L0[i] = d (rng); R0[i] = d (rng); }
 
-    for (int routing = 0; routing < 2; ++routing)
-        for (int link = 0; link < 2; ++link)
-        {
-            Params p;
-            p.routing = routing == 0 ? Routing::Stereo : Routing::MidSide;
-            p.link = link == 1;
-            p.mod[0].bassQ = 1.7f; p.mod[0].presQ = 5.0f;   // 게인 0이면 Q는 영향 없어야 함
-            p.mod[1].trebleQ = 0.35f; p.mod[1].mode = Mode::A_Tilt;
-            Engine e;
-            e.prepare (192000.0, 2, 2048);
-            e.setParams (p);
-            e.reset();
-            auto L = L0, R = R0;
-            float* ptr[2] = { L.data(), R.data() };
-            e.process (ptr, 2, (int) L.size());
-            double err = 0.0;
-            for (size_t i = 0; i < L.size(); ++i)
-                err = std::max ({ err, (double) std::abs (L[i] - L0[i]), (double) std::abs (R[i] - R0[i]) });
-            if (routing == 0)
-                CHECK (err == 0.0, "stereo link=%d not bit-exact (%.3g)", link, err);
-            else
-                CHECK (err < 1.0e-6, "M/S link=%d error %.3g", link, err);
-        }
+    auto run = [&] (const Params& p, int nch, double fs)
+    {
+        Engine e;
+        e.prepare (fs, nch, 2048);
+        e.setParams (p);
+        e.reset();
+        auto L = L0, R = R0;
+        float* ptr[2] = { L.data(), R.data() };
+        e.process (ptr, nch, (int) L.size());
+        double err = 0.0;
+        for (size_t i = 0; i < L.size(); ++i)
+            err = std::max ({ err, (double) std::abs (L[i] - L0[i]), nch > 1 ? (double) std::abs (R[i] - R0[i]) : 0.0 });
+        return err;
+    };
 
-    // 모노
-    Engine e;
-    e.prepare (192000.0, 1, 2048);
-    e.setParams (Params {});
-    e.reset();
-    auto L = L0;
-    float* ptr[1] = { L.data() };
-    e.process (ptr, 1, (int) L.size());
-    CHECK (L == L0, "mono not bit-exact");
+    for (double fs : { 48000.0, 192000.0 })
+    {
+        Params none;
+        CHECK (run (none, 2, fs) == 0.0 && run (none, 1, fs) == 0.0, "no bands must be bit-exact");
+
+        Params zero;   // 게인 0 벨·셸프·틸트 (Q 여러 가지, L/R/스테레오) -> 비트 단위 동일
+        zero.bands[0] = makeBand (BandType::Bell, 1000, 0, 7.0);
+        zero.bands[1] = makeBand (BandType::LowShelf, 120, 0, 2.5, Placement::Left);
+        zero.bands[2] = makeBand (BandType::HighShelf, 6000, 0, 0.4, Placement::Right);
+        zero.bands[3] = makeBand (BandType::Tilt, 650, 0);
+        CHECK (run (zero, 2, fs) == 0.0 && run (zero, 1, fs) == 0.0, "zero-gain bands must be bit-exact");
+
+        Params ms = zero;   // Mid/Side 밴드가 있으면 M/S 변환 반올림만
+        ms.bands[4] = makeBand (BandType::Bell, 3000, 0, 1.0, Placement::Mid);
+        ms.bands[5] = makeBand (BandType::LowShelf, 200, 0, 1.0, Placement::Side);
+        CHECK (run (ms, 2, fs) < 1.0e-6, "M/S zero-gain error %.3g", run (ms, 2, fs));
+
+        Params off;   // 꺼진 밴드 · EQ off
+        off.bands[0] = makeBand (BandType::LowCut, 500, 0, 1.0, Placement::Stereo, 5);
+        off.bands[0].on = false;
+        off.bands[1] = makeBand (BandType::Bell, 2000, 12, 2.0);
+        off.eqOn = false;
+        CHECK (run (off, 2, fs) == 0.0, "disabled bands / EQ off must be bit-exact");
+    }
+}
+
+//------------------------------------------------------------------------------
+static ResponseModel single (const BandParams& b, double fs)
+{
+    Params p;
+    p.bands[0] = b;
+    return ResponseModel (p, fs);
+}
+
+static void testBandShapes()
+{
+    std::printf ("[2] 밴드 모양 (HQ 레이트 = 거의 아날로그)\n");
+    const double fs = processingRateFor (48000.0);
+
+    {   // 벨: 중심 이득 정확
+        double worst = 0.0;
+        for (double f : { 40.0, 500.0, 3000.0, 12000.0 })
+            for (double g : { -18.0, -6.0, 6.0, 18.0 })
+                for (double q : { 0.3, 1.0, 8.0 })
+                    worst = std::max (worst, std::abs (single (makeBand (BandType::Bell, f, g, q), fs).magnitudeDb (f) - g));
+        std::printf ("    벨: 중심 이득 오차 최대 %.4f dB\n", worst);
+        CHECK (worst < 0.01, "bell center %.4f", worst);
+    }
+    {   // 셸프: 끝 = 게인, 중심 주파수 = 게인의 절반, Q 1은 출렁임 없음
+        double wEnd = 0.0, wMid = 0.0, over = 0.0;
+        for (double f : { 100.0, 1000.0, 6000.0 })
+            for (double g : { -12.0, 12.0 })
+            {
+                const auto ls = single (makeBand (BandType::LowShelf, f, g, 1.0), fs);
+                const auto hs = single (makeBand (BandType::HighShelf, f, g, 1.0), fs);
+                wEnd = std::max ({ wEnd, std::abs (ls.magnitudeDb (f / 20.0) - g), std::abs (hs.magnitudeDb (std::min (f * 10.0, 0.4 * fs)) - g) });
+                wMid = std::max ({ wMid, std::abs (ls.magnitudeDb (f) - g / 2), std::abs (hs.magnitudeDb (f) - g / 2) });
+                for (double ff : logFreqs (10.0, 40000.0, 400))
+                    for (const auto* m : { &ls, &hs })
+                    {
+                        const double v = m->magnitudeDb (ff);
+                        over = std::max ({ over, v - std::max (g, 0.0), std::min (g, 0.0) - v });   // 0 ~ g 범위 밖으로 넘침
+                    }
+            }
+        std::printf ("    셸프: 끝 이득 오차 %.3f dB, 중심 = 절반 오차 %.3f dB, Q 1 출렁임 %.3f dB\n", wEnd, wMid, over);
+        CHECK (wEnd < 0.1 && wMid < 0.05 && over < 0.02, "shelf shape end %.3f mid %.3f over %.3f", wEnd, wMid, over);
+    }
+    {   // 컷: Q 1 = 버터워스. 차단 주파수 -3.01 dB, 2옥타브 떨어진 곳 = 아날로그 버터워스
+        double wFc = 0.0, wFar = 0.0;
+        for (int s = 0; s < (int) kCutSlopes.size(); ++s)
+            for (auto t : { BandType::LowCut, BandType::HighCut })
+            {
+                const auto m = single (makeBand (t, 1000, 0, 1.0, Placement::Stereo, s), fs);
+                const int order = kCutSlopes[(size_t) s] / 6;
+                const double far = t == BandType::LowCut ? 250.0 : 4000.0;
+                const double expected = -10.0 * std::log10 (1.0 + std::pow (4.0, 2.0 * order));
+                wFc  = std::max (wFc, std::abs (m.magnitudeDb (1000.0) + 3.0103));
+                wFar = std::max (wFar, std::abs (m.magnitudeDb (far) - expected));
+            }
+        const auto res = single (makeBand (BandType::LowCut, 1000, 0, 2.0), fs);
+        double peak = -100.0;
+        for (double f : logFreqs (200.0, 20000.0, 400)) peak = std::max (peak, res.magnitudeDb (f));
+        std::printf ("    컷 6~96 dB/oct: 차단점 오차 %.4f dB, 2옥타브 지점 오차 %.3f dB, Q 2 공진 +%.2f dB\n", wFc, wFar, peak);
+        CHECK (wFc < 0.02 && wFar < 0.3, "cut shape fc %.4f far %.3f", wFc, wFar);
+        CHECK (peak > 3.0, "resonant cut expected (%.2f)", peak);
+    }
+    {   // 노치 / 틸트
+        const auto n = single (makeBand (BandType::Notch, 2000, 0, 8.0), fs);
+        const double depth = n.magnitudeDb (2000.0), side = n.magnitudeDb (4000.0);
+        const auto t = single (makeBand (BandType::Tilt, 650, 4.0), fs);
+        std::printf ("    노치 Q 8: 중심 %.1f dB, 1옥타브 위 %.2f dB / 틸트 +4: 축 %.3f, 20 Hz %.2f, 20 kHz %.2f dB\n",
+                     depth, side, t.magnitudeDb (650.0), t.magnitudeDb (20.0), t.magnitudeDb (20000.0));
+        CHECK (depth < -60.0 && std::abs (side) < 0.1, "notch depth %.1f side %.2f", depth, side);
+        CHECK (std::abs (t.magnitudeDb (650.0)) < 0.01 && t.magnitudeDb (20.0) < -3.6 && t.magnitudeDb (20000.0) > 3.6, "tilt shape");
+    }
 }
 
 //------------------------------------------------------------------------------
 static void testAnalyticMatchesProcessing()
 {
-    std::printf ("[3] GUI 해석 곡선 == 실제 처리 응답 (모듈별, 트랜스포머 셸프·Mix 포함)\n");
+    std::printf ("[3] GUI 해석 곡선 == 실제 처리 응답 (모든 모양, 트랜스포머 셸프·Mix 포함)\n");
     std::mt19937 rng (42);
     std::uniform_real_distribution<float> u (0.0f, 1.0f);
-    const double rates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };   // ZERO LATENCY(세션 레이트) + HQ
     double worst = 0.0;
-    for (double fs : rates)
-        for (int t = 0; t < 8; ++t)
+    for (double fs : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        for (int t = 0; t < 10; ++t)
         {
             Params p;
-            p.link = false;
-            p.stepped = u (rng) < 0.3f;
-            p.mod[0] = randomModule (rng);
-            p.mod[1] = randomModule (rng);
-            p.xfLow = u (rng); p.xfMid = u (rng); p.xfHigh = u (rng);
-            p.mix = u (rng) < 0.4f ? 0.3f + 0.7f * u (rng) : 1.0f;
-            const int len = (int) (fs * 0.6);
-            for (int m = 0; m < 2; ++m)
+            const int nb = 1 + (int) (u (rng) * 5.99f);
+            for (int i = 0; i < nb; ++i)
+                p.bands[(size_t) (i * 2 + (t % 2))] = randomBand (rng);   // 빈 칸 섞어서
+            p.xfHigh = u (rng) < 0.5f ? u (rng) : 0.0f;
+            p.mix    = u (rng) < 0.4f ? 0.3f + 0.7f * u (rng) : 1.0f;
+            const auto h = impulseResponse (p, fs, (int) (fs * 0.6), 1.0f, 1.0f, 0);
+            const ResponseModel m (p, fs);
+            for (double f : logFreqs (20.0, 20000.0, 50))
             {
-                const auto h = impulseResponse (p, fs, len, m == 0 ? 1.0f : 0.0f, m == 1 ? 1.0f : 0.0f, m);
-                const ResponseModel model (p, m, fs);
-                const double level = resolveModule (p, m).outputDb;   // GUI 곡선은 모듈 Level 제외
-                for (double f : logFreqs (20.0, 20000.0, 50))
-                {
-                    const double ref = model.magnitudeDb (f) + level;
-                    if (ref > -40.0)
-                        worst = std::max (worst, std::abs (dftDb (h, f, fs) - ref));
-                }
+                const double ref = m.magnitudeDb (f);
+                if (ref > -40.0)
+                    worst = std::max (worst, std::abs (dftDb (h, f, fs) - ref));
             }
         }
     std::printf ("    최대 오차 %.5f dB\n", worst);
@@ -249,63 +307,72 @@ static void testAnalyticMatchesProcessing()
 }
 
 //------------------------------------------------------------------------------
-static void testSpecPoints()
+static void testPlacements()
 {
-    std::printf ("[4] 원본 사양 지점 (빈티지 Q, 48 kHz 세션: ZERO LATENCY 48k / HQ 192k)\n");
-    for (const double fs : { 48000.0, processingRateFor (48000.0) })
+    std::printf ("[4] 적용 채널 (스테레오 · L · R · Mid · Side, 모노)\n");
+    const double fs = 96000.0;
+    const int len = (int) (fs * 0.5);
+    auto with = [] (Placement pl)
     {
-    std::printf ("  처리 레이트 %.0f Hz\n", fs);
-    auto at = [&] (const Params& p, double f) { return ResponseModel (p, 0, fs).magnitudeDb (f); };
-
-    Params p;
-    p.mod[0].bassDb = 12.0f;
-    const double b40 = at (p, 40.0), b1k = at (p, 1000.0);
-    std::printf ("    Bass +12 : 40 Hz %.2f dB, 1 kHz %.2f dB\n", b40, b1k);
-    CHECK (b40 > 11.0 && b40 <= 12.05, "bass +12 @40Hz = %.2f", b40);
-    CHECK (b1k < 0.6, "bass +12 @1kHz = %.2f", b1k);
-
-    p = Params {}; p.mod[0].bassDb = -20.0f;
-    CHECK (at (p, 40.0) < -18.0, "bass -20 @40Hz");
-
-    p = Params {}; p.mod[0].trebleDb = 12.0f;
-    const double t10 = at (p, 10000.0), t400 = at (p, 400.0);
-    std::printf ("    Treble +12 : 10 kHz %.2f dB, 400 Hz %.2f dB\n", t10, t400);
-    CHECK (t10 > 11.0 && t10 <= 12.05, "treble +12 @10k = %.2f", t10);
-    CHECK (t400 < 0.6, "treble +12 @400Hz = %.2f", t400);
-
-    p = Params {}; p.mod[0].mode = Mode::A_Tilt; p.mod[0].tiltDb = 4.0f;
-    const double p650 = at (p, 650.0), p10k = at (p, 10000.0), p100 = at (p, 100.0);
-    std::printf ("    Pivot +4 : 100 Hz %.2f, 650 Hz %.3f, 10 kHz %.2f dB\n", p100, p650, p10k);
-    CHECK (std::abs (p650) < 0.05, "pivot center %.3f", p650);
-    CHECK (std::abs (p10k - 4.0) < 0.2, "pivot 10k %.2f", p10k);
-    CHECK (std::abs (p100 + 4.0) < 0.35, "pivot 100Hz %.2f", p100);
-
-    for (double hz : kPresenceSteps)
+        Params p;
+        p.bands[0] = makeBand (BandType::Bell, 1000, 9.0, 2.0, pl);
+        p.bands[1] = makeBand (BandType::HighShelf, 6000, -6.0, 1.0);   // 스테레오 밴드도 같이
+        return p;
+    };
+    double worst = 0.0, leak = 0.0;
+    auto cmp = [&] (const std::vector<float>& h, const ResponseModel& m, Placement view)
     {
-        p = Params {}; p.mod[0].presHz = (float) hz; p.mod[0].presDb = 6.0f;
-        const double pk = at (p, hz);
-        CHECK (std::abs (pk - 6.0) < 0.02, "presence %.0f Hz peak %.3f", hz, pk);
-    }
+        for (double f : logFreqs (20.0, 20000.0, 40))
+            worst = std::max (worst, std::abs (dftDb (h, f, fs) - m.magnitudeDb (f, view)));
+    };
+    auto peakAbs = [] (const std::vector<float>& h) { double a = 0.0; for (float v : h) a = std::max (a, (double) std::abs (v)); return a; };
 
-    p = Params {}; p.mod[0].mode = Mode::A_Tilt; p.mod[0].presDb = 6.0f;
-    CHECK (std::abs (at (p, 2800.0)) < 1e-6, "presence must be off in A mode");
-    p = Params {}; p.mod[0].tiltDb = 4.0f;
-    CHECK (std::abs (at (p, 10000.0)) < 1e-6, "pivot must be off in B mode");
-    p = Params {}; p.mod[0].bassDb = 12.0f; p.eqOn = false;
-    CHECK (std::abs (at (p, 40.0)) < 1e-6, "EQ off must be flat");
-    p = Params {}; p.xfHigh = 1.0f;
-    const double sh = at (p, 20000.0);
-    std::printf ("    트랜스포머 HIGH 100%% : 20 kHz %.2f dB\n", sh);
-    CHECK (sh < -1.0 && sh > -1.6, "transformer HF softening %.2f", sh);
+    for (auto pl : { Placement::Left, Placement::Right })
+    {
+        const auto p = with (pl);
+        const ResponseModel m (p, fs);
+        const bool left = pl == Placement::Left;
+        cmp (impulseResponse (p, fs, len, left ? 1.0f : 0.0f, left ? 0.0f : 1.0f, left ? 0 : 1), m, pl);              // 그 채널
+        cmp (impulseResponse (p, fs, len, left ? 0.0f : 1.0f, left ? 1.0f : 0.0f, left ? 1 : 0), m, Placement::Stereo); // 다른 채널
+        leak = std::max (leak, peakAbs (impulseResponse (p, fs, len, left ? 1.0f : 0.0f, left ? 0.0f : 1.0f, left ? 1 : 0)));
     }
+    for (auto pl : { Placement::Mid, Placement::Side })
+    {
+        const auto p = with (pl);
+        const ResponseModel m (p, fs);
+        const bool mid = pl == Placement::Mid;
+        // L = R 임펄스 = Mid만, L = -R 임펄스 = Side만
+        cmp (impulseResponse (p, fs, len, 1.0f, mid ? 1.0f : -1.0f, 0), m, pl);
+        cmp (impulseResponse (p, fs, len, 1.0f, mid ? -1.0f : 1.0f, 0), m, Placement::Stereo);
+    }
+    {   // 모노: Mid 밴드는 적용, Side 밴드는 없음
+        for (auto pl : { Placement::Mid, Placement::Side })
+        {
+            const auto p = with (pl);
+            const ResponseModel m (p, fs);
+            Engine e;
+            e.prepare (fs, 1, 4096);
+            e.setParams (p);
+            e.reset();
+            std::vector<float> h ((size_t) len, 0.0f);
+            h[0] = 1.0e-3f;
+            float* ptr[1] = { h.data() };
+            e.process (ptr, 1, len);
+            for (auto& v : h) v /= 1.0e-3f;
+            cmp (h, m, pl == Placement::Mid ? Placement::Mid : Placement::Stereo);
+        }
+    }
+    std::printf ("    채널별 응답 오차 최대 %.5f dB, 다른 채널로 새는 양 %.1e\n", worst, leak);
+    CHECK (worst < 0.01, "placement response error %.5f", worst);
+    CHECK (leak < 1.0e-9, "L/R band leaks into other channel %.2e", leak);
 }
 
 //------------------------------------------------------------------------------
-static double halfGainBandwidthOct (const Params& p, double fs, double fc)
+static double halfGainBandwidthOct (const ResponseModel& m, double fc)
 {
-    const ResponseModel m (p, 0, fs);
     const double half = 0.5 * m.magnitudeDb (fc);
-    auto edge = [&] (double dir) {
+    auto edge = [&] (double dir)
+    {
         double f = fc;
         for (int i = 0; i < 20000; ++i)
         {
@@ -319,36 +386,32 @@ static double halfGainBandwidthOct (const Params& p, double fs, double fc)
 
 static void testQBehaviour()
 {
-    std::printf ("[5] Q 조절 동작\n");
+    std::printf ("[5] Q 동작\n");
     const double fs = processingRateFor (48000.0);
     double prevBw = 1e9;
-    for (float q : { 0.3f, 0.6f, 1.0f, 2.0f, 4.0f, 6.0f })
+    for (double q : { 0.3, 0.6, 1.0, 2.0, 4.0, 8.0, 16.0 })
     {
-        Params p; p.mod[0].presHz = 2800.0f; p.mod[0].presDb = 6.0f; p.mod[0].presQ = q;
-        const double bw = halfGainBandwidthOct (p, fs, 2800.0);
-        std::printf ("    Presence 2.8 kHz +6 dB, Q %.1f -> 대역폭 %.2f oct\n", q, bw);
+        const double bw = halfGainBandwidthOct (single (makeBand (BandType::Bell, 2800, 6.0, q), fs), 2800.0);
+        std::printf ("    벨 2.8 kHz +6 dB, Q %4.1f -> 대역폭 %.2f oct\n", q, bw);
         CHECK (bw < prevBw, "bandwidth must shrink as Q grows (Q %.1f)", q);
         prevBw = bw;
     }
-
     double prevSlope = 0.0;
-    for (float q : { 0.3f, 0.5f, 0.707f, 1.0f, 2.0f })
+    for (double q : { 0.4, 0.7, 1.0, 1.5, 3.0 })
     {
-        Params p; p.mod[0].bassDb = 12.0f; p.mod[0].bassQ = q;
-        const ResponseModel m (p, 0, fs);
+        const auto m = single (makeBand (BandType::LowShelf, 160, 12.0, q), fs);
         double maxSlope = 0.0, maxGain = -100.0, minGain = 100.0;
-        for (double f : logFreqs (20.0, 20000.0, 2000))
+        for (double f : logFreqs (10.0, 20000.0, 2000))
         {
             const double g = m.magnitudeDb (f);
             maxSlope = std::max (maxSlope, std::abs (m.magnitudeDb (f * 1.01) - g) / std::log2 (1.01));
             maxGain  = std::max (maxGain, g);
             minGain  = std::min (minGain, g);
         }
-        std::printf ("    Bass +12, Q %.3f -> 최대 기울기 %.2f dB/oct, 최대 %.2f dB, 최소 %.2f dB\n",
-                     q, maxSlope, maxGain, minGain);
-        CHECK (maxSlope > prevSlope, "shelf slope must grow with Q (Q %.3f)", q);
-        if (q <= 0.71f) CHECK (maxGain < 12.05, "no overshoot expected at Q %.3f", q);
-        if (q >= 1.0f)  CHECK (maxGain > 12.3 && minGain < -0.3, "resonant shelf expected at Q %.3f", q);
+        std::printf ("    로우 셸프 +12, Q %.1f -> 최대 기울기 %.2f dB/oct, 최대 %.2f / 최소 %.2f dB\n", q, maxSlope, maxGain, minGain);
+        CHECK (maxSlope > prevSlope, "shelf slope must grow with Q (Q %.1f)", q);
+        if (q <= 1.0) CHECK (maxGain < 12.05 && minGain > -0.05, "no overshoot expected at Q %.1f", q);
+        if (q >= 1.5) CHECK (maxGain > 12.3 && minGain < -0.3, "resonant shelf expected at Q %.1f", q);
         prevSlope = maxSlope;
     }
 }
@@ -357,38 +420,73 @@ static void testQBehaviour()
 static void testSampleRateConsistency()
 {
     std::printf ("[6] 세션 샘플레이트 간 일관성 (20 Hz ~ 20 kHz)\n");
-    std::mt19937 rng (7);
-    std::uniform_real_distribution<float> u (0.0f, 1.0f);
-    double worstHq = 0.0, worstZero = 0.0;
-    for (int t = 0; t < 60; ++t)
+    const unsigned mask = (1u << (int) BandType::Bell) | (1u << (int) BandType::LowShelf) | (1u << (int) BandType::HighShelf)
+                        | (1u << (int) BandType::Tilt) | (1u << (int) BandType::LowCut);
+
+    // maxHz / qMax: 무작위 범위. 반환: HQ / ZERO LATENCY 최대 차이 (768 kHz 기준과 비교)
+    auto run = [&] (unsigned seed, double maxHz, double qMax, double maxGain)
     {
-        Params p;
-        p.mod[0] = randomModule (rng);
-        p.xfHigh = u (rng);
-        const ResponseModel ref (p, 0, 768000.0);
-        for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        std::mt19937 rng (seed);
+        std::uniform_real_distribution<float> u (0.0f, 1.0f);
+        double wHq = 0.0, wZero = 0.0;
+        for (int t = 0; t < 60; ++t)
         {
-            const ResponseModel hq (p, 0, processingRateFor (sr)), zero (p, 0, sr);
-            for (double f : logFreqs (20.0, 20000.0, 100))
+            Params p;
+            const int nb = 1 + (int) (u (rng) * 3.99f);
+            for (int i = 0; i < nb; ++i)
             {
-                const double r = ref.magnitudeDb (f);
-                worstHq   = std::max (worstHq,   std::abs (hq.magnitudeDb (f) - r));
-                worstZero = std::max (worstZero, std::abs (zero.magnitudeDb (f) - r));
+                auto b = randomBand (rng, mask, false, maxGain);
+                b.freq = logRandom (rng, 30.0, maxHz);
+                b.q    = logRandom (rng, 0.3, qMax);
+                if (b.type == BandType::Tilt || b.type == BandType::LowCut)
+                    b.freq = std::min (b.freq, 1500.0f);   // 1차 틸트·컷은 고역에 두면 쌍선형 특성이 남음 (아래 따로 확인)
+                p.bands[(size_t) i] = b;
+            }
+            p.xfHigh = u (rng);
+            const ResponseModel ref (p, 768000.0);
+            for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
+            {
+                const ResponseModel hq (p, processingRateFor (sr)), zero (p, sr);
+                for (double f : logFreqs (20.0, 20000.0, 100))
+                {
+                    const double r = ref.magnitudeDb (f);
+                    if (r < -40.0) continue;
+                    wHq   = std::max (wHq,   std::abs (hq.magnitudeDb (f) - r));
+                    wZero = std::max (wZero, std::abs (zero.magnitudeDb (f) - r));
+                }
             }
         }
-    }
-    std::printf ("    44.1k/48k/96k/192k 세션 vs 아날로그 기준 최대 차이: HQ %.3f dB / ZERO LATENCY %.3f dB\n", worstHq, worstZero);
+        return std::pair<double, double> { wHq, wZero };
+    };
+
+    const auto [worstHq, worstZero] = run (7, 10000.0, 4.0, 15.0);     // 보통 쓰는 범위
+    std::printf ("    무작위 60개 (30 Hz~10 kHz, Q 0.3~4, +-15 dB) vs 아날로그 기준 최대 차이: HQ %.3f dB / ZERO LATENCY %.3f dB\n", worstHq, worstZero);
     CHECK (worstHq < 0.15, "sample-rate deviation (HQ) %.3f dB", worstHq);
     CHECK (worstZero < 0.6, "sample-rate deviation (zero latency) %.3f dB", worstZero);
+
+    const auto [xHq, xZero] = run (8, 16000.0, 8.0, 18.0);             // 극단 (참고용: 나이퀴스트 근처 한계)
+    std::printf ("    극단 범위 (~16 kHz, Q ~8, +-18 dB): HQ %.3f dB / ZERO LATENCY %.3f dB (참고)\n", xHq, xZero);
+    CHECK (xHq < 0.6, "sample-rate deviation (HQ, extreme) %.3f dB", xHq);
+
+    // 하이 컷 · 노치는 세션 레이트에서도 차단점 / 중심이 정확 (나이퀴스트 근처 기울기는 쌍선형)
+    double wCut = 0.0, wNotch = -1.0e9;
+    for (double sr : { 44100.0, 48000.0 })
+        for (double f : { 1000.0, 8000.0, 16000.0 })
+        {
+            wCut   = std::max (wCut, std::abs (single (makeBand (BandType::HighCut, f, 0, 1.0, Placement::Stereo, 3), sr).magnitudeDb (f) + 3.0103));
+            wNotch = std::max (wNotch, single (makeBand (BandType::Notch, f, 0, 4.0), sr).magnitudeDb (f));
+        }
+    std::printf ("    44.1/48k 하이 컷 차단점 오차 %.4f dB, 노치 중심 %.1f dB\n", wCut, wNotch);
+    CHECK (wCut < 0.01 && wNotch < -60.0, "session-rate cut/notch %.4f %.1f", wCut, wNotch);
 }
 
 //------------------------------------------------------------------------------
-// 300 Hz 사인(양 채널 동일 또는 약간 다르게) -> 6 kHz 고역통과 후 최대값으로 클릭 측정
+// 300 Hz 사인 -> 6 kHz 고역통과 후 최대값으로 클릭 측정
 struct ClickResult { double steady, transition; };
 
 static ClickResult measureClick (const Params& before, const Params& after, double smoothingMs)
 {
-    const double fs = 48000.0;   // 실제 플러그인(192k 처리)보다 불리한 조건
+    const double fs = 48000.0;
     Engine e;
     e.prepare (fs, 2, 1024);
     e.setSmoothingMs (smoothingMs);
@@ -423,68 +521,67 @@ static ClickResult measureClick (const Params& before, const Params& after, doub
 
 static void testClicks()
 {
-    std::printf ("[7] 파라미터·라우팅 변경 시 클릭 (스무딩 on vs off)\n");
+    std::printf ("[7] 바꿀 때 클릭 (스무딩·페이드 on vs off)\n");
     struct Case { const char* name; Params a, b; };
     std::vector<Case> cases;
     auto add = [&] (const char* n, Params a, Params b) { cases.push_back ({ n, a, b }); };
+    const auto bell = makeBand (BandType::Bell, 1000, 12, 2.0);
     {
-        Params a; a.mod[0].bassDb = 12; Params b = a; b.mod[0].bassDb = -20;
-        add ("Bass +12 -> -20", a, b);
+        Params a; a.bands[0] = bell; Params b = a; b.bands[0].gain = -12;
+        add ("Bell +12 -> -12", a, b);
     }
     {
-        Params a; a.mod[0].presDb = 6; a.mod[0].presQ = 6; a.mod[0].presHz = 1400;
-        Params b = a; b.mod[0].presHz = 4000;
-        add ("Presence 1.4k -> 4k (Q 6)", a, b);
+        // (측정용 300 Hz 사인을 가로지르지 않는 범위: 지나가면 그 사인 자체가 +9 dB 커지는 게 정상이라)
+        Params a; a.bands[0] = makeBand (BandType::Bell, 1000, 9, 6.0); Params b = a; b.bands[0].freq = 12000;
+        add ("Bell 1 kHz -> 12 kHz (Q 6)", a, b);
     }
     {
-        Params a; a.mod[0].presDb = 6; a.mod[0].presQ = 6; a.mod[0].presHz = 700;
-        Params b = a; b.mod[0].presHz = 8000;
-        add ("Presence 0.7k -> 8k (Q 6)", a, b);
+        Params a; a.bands[0] = makeBand (BandType::LowShelf, 200, 9, 0.4); Params b = a; b.bands[0].q = 3.0f;
+        add ("Low shelf Q 0.4 -> 3", a, b);
     }
     {
-        Params a; a.mod[0].bassDb = 12; a.mod[0].bassQ = 2; a.mod[0].bassHz = 20;
-        Params b = a; b.mod[0].bassHz = 120;
-        add ("Bass freq 20 -> 120 (+12, Q 2)", a, b);
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 9, 1.0); Params b = a; b.bands[0].type = BandType::HighShelf;
+        add ("Shape bell -> high shelf", a, b);
     }
     {
-        Params a; a.mod[0].trebleDb = -18; a.mod[0].trebleQ = 2; a.mod[0].trebleHz = 5000;
-        Params b = a; b.mod[0].trebleHz = 16000;
-        add ("Treble freq 5k -> 16k (-18, Q 2)", a, b);
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 9, 1.0); Params b = a; b.bands[0].place = Placement::Mid;
+        add ("Placement stereo -> mid", a, b);
     }
     {
-        Params a; a.mod[0].mode = Mode::A_Tilt; a.mod[0].tiltDb = -4; a.mod[0].presDb = 6;
-        Params b = a; b.mod[0].mode = Mode::B_Presence;
-        add ("Type A -> B", a, b);
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 9, 1.0); Params b = a; b.bands[0].on = false;
+        add ("Band on -> off", a, b);
     }
     {
-        Params a; a.mod[0].bassDb = 9; a.mod[0].bassQ = 0.3f; Params b = a; b.mod[0].bassQ = 2.0f;
-        add ("Bass Q 0.3 -> 2.0", a, b);
+        Params a; Params b = a; b.bands[3] = makeBand (BandType::Bell, 300, 12, 1.0);
+        add ("Add band (+12 at 300 Hz)", a, b);
     }
     {
-        Params a; a.mod[0].bassDb = -3; a.mod[0].trebleDb = 5; Params b = a; b.stepped = true;
-        add ("Steps off -> on", a, b);
+        Params a; a.bands[3] = makeBand (BandType::Bell, 300, 12, 1.0); Params b = a; b.bands[3].used = false;
+        add ("Delete band", a, b);
     }
     {
-        Params a; a.link = false; a.mod[0].bassDb = 8; a.mod[1].bassDb = -12; a.mod[1].trebleDb = 6;
-        Params b = a; b.routing = Routing::MidSide;
-        add ("Routing L/R -> M/S", a, b);
+        Params a; a.bands[0] = makeBand (BandType::LowCut, 200, 0, 1.0, Placement::Stereo, 1); Params b = a; b.bands[0].slope = 5;
+        add ("Low cut 12 -> 48 dB/oct", a, b);
     }
     {
-        Params a; a.link = true; a.mod[0].bassDb = 8; a.mod[1].bassDb = -12;
-        Params b = a; b.link = false;
-        add ("Link on -> off", a, b);
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 9, 1.0); a.eqOn = false; Params b = a; b.eqOn = true;
+        add ("EQ off -> on", a, b);
     }
     {
-        Params a; a.mod[0].driveDb = 18; Params b = a; b.driveOn = true;
+        Params a; a.drive = 18; Params b = a; b.driveOn = true;
         add ("Drive off -> on (18 dB)", a, b);
     }
     {
-        Params a; a.mod[0].presDb = 6; a.mod[0].presHz = 1400; Params b = a; b.mix = 0.3f;
+        Params a; a.bands[0] = bell; Params b = a; b.mix = 0.3f;
         add ("Mix 100 -> 30 %", a, b);
     }
     {
         Params a; Params b = a; b.xfLow = 1; b.xfMid = 1; b.xfHigh = 1;
         add ("Transformer 0 -> 100 %", a, b);
+    }
+    {
+        Params a; Params b = a; b.outputDb = -12;
+        add ("Output 0 -> -12 dB", a, b);
     }
     for (auto& c : cases)
     {
@@ -499,7 +596,7 @@ static void testClicks()
 //------------------------------------------------------------------------------
 static void testStress()
 {
-    std::printf ("[8] 무작위 자동화 스트레스 (모든 기능, NaN/발산 없음)\n");
+    std::printf ("[8] 무작위 자동화 스트레스 (모양·채널·추가/삭제 포함, NaN/발산 없음)\n");
     for (double fs : { 44100.0, 192000.0 })
         for (int nch : { 1, 2 })
         {
@@ -525,14 +622,14 @@ static void testStress()
             }
             std::printf ("    fs %.0f, %d ch: 최대 피크 %.2f\n", fs, nch, peak);
             CHECK (finite, "non-finite output at %.0f/%d", fs, nch);
-            CHECK (peak < 50.0, "output too large at %.0f/%d (%.2f)", fs, nch, peak);
+            CHECK (peak < 1000.0, "output diverged at %.0f/%d (%.2f)", fs, nch, peak);
         }
 }
 
 //------------------------------------------------------------------------------
 static void testBlockSizeIndependence()
 {
-    std::printf ("[9] 블록 크기와 무관하게 같은 결과 (라우팅 전환·튜브·트랜스포머 포함)\n");
+    std::printf ("[9] 블록 크기와 무관하게 같은 결과 (밴드 전환·튜브·트랜스포머 포함)\n");
     const double fs = 96000.0;
     const int total = 2048 * 24;
     std::mt19937 rng (3);
@@ -542,7 +639,8 @@ static void testBlockSizeIndependence()
     std::vector<Params> plist;
     for (int i = 0; i < total / 2048; ++i) plist.push_back (randomParams (rng));
 
-    auto run = [&] (int block) {
+    auto run = [&] (int block)
+    {
         Engine e;
         e.prepare (fs, 2, 600);
         e.setParams (plist[0]);
@@ -735,55 +833,6 @@ static void testTransformer()
     CHECK (hi8k.thd > 1.0 && hi8k.thd < 6.0, "high band THD %.2f", hi8k.thd);
     CHECK (hi1k.thd < hi8k.thd / 5.0, "high band must stay in the highs");
     CHECK (std::abs (low60.dc) < 1e-3 && std::abs (mid1k.dc) < 1e-3, "transformer DC");
-}
-
-//------------------------------------------------------------------------------
-static void testRoutingAndLink()
-{
-    std::printf ("[13] 링크 / Mid-Side / Mix\n");
-    const double fs = 192000.0;
-    const int len = (int) (fs * 0.4);
-
-    // 링크: 모듈 2 설정이 달라도 무시
-    {
-        Params p; p.link = true;
-        p.mod[0].bassDb = 6.0f; p.mod[0].driveDb = 20.0f;
-        p.mod[1].bassDb = -15.0f; p.mod[1].trebleDb = 9.0f;
-        p.driveOn = true;
-        Engine e; e.prepare (fs, 2, 1024); e.setParams (p); e.reset();
-        auto L = sine (fs, 220.0, 0.4, len), R = L;
-        float* ptr[2] = { L.data(), R.data() };
-        e.process (ptr, 2, len);
-        CHECK (L == R, "linked modules must process identically");
-    }
-
-    // M/S: 미드만 들어오면 모듈 1, 사이드만 들어오면 모듈 2 응답
-    {
-        Params p; p.link = false; p.routing = Routing::MidSide;
-        p.mod[0].presDb = 6.0f; p.mod[0].presHz = 2800.0f;
-        p.mod[1].bassDb = -12.0f; p.mod[1].trebleDb = 6.0f;
-        const auto hMid  = impulseResponse (p, fs, len, 1.0f,  1.0f, 0);
-        const auto hSide = impulseResponse (p, fs, len, 1.0f, -1.0f, 0);
-        const ResponseModel mMid (p, 0, fs), mSide (p, 1, fs);
-        double worst = 0.0;
-        for (double f : logFreqs (30.0, 18000.0, 40))
-            worst = std::max ({ worst, std::abs (dftDb (hMid, f, fs) - mMid.magnitudeDb (f)),
-                                std::abs (dftDb (hSide, f, fs) - mSide.magnitudeDb (f)) });
-        std::printf ("    M/S 모듈별 응답 오차 %.4f dB\n", worst);
-        CHECK (worst < 0.01, "mid/side module response error %.4f", worst);
-    }
-
-    // Mix 0 -> 원음 그대로 (EQ, Drive, 트랜스포머가 켜져 있어도)
-    {
-        Params p; p.mix = 0.0f; p.driveOn = true; p.xfLow = 1; p.xfHigh = 1;
-        p.mod[0].bassDb = 10.0f; p.mod[0].driveDb = 30.0f;
-        Engine e; e.prepare (fs, 2, 1024); e.setParams (p); e.reset();
-        auto L = sine (fs, 100.0, 0.7, len), R = sine (fs, 333.0, 0.3, len);
-        const auto L0 = L, R0 = R;
-        float* ptr[2] = { L.data(), R.data() };
-        e.process (ptr, 2, len);
-        CHECK (L == L0 && R == R0, "mix 0 must pass the dry signal untouched");
-    }
 }
 
 //------------------------------------------------------------------------------
@@ -1123,12 +1172,14 @@ static void testRobustness()
                 for (size_t i = x.size() / 2; i < x.size(); ++i) peak = std::max (peak, (double) std::abs (x[i]));
                 worstRatio = std::max (worstRatio, peak / refPeak);
             }
-        // 엔진 전체: Bass +12 dB Q 2 + Drive 48, 100 Hz +5 dBFS
+        // 엔진 전체: 로우 셸프 +12 dB (160 Hz, 날카로운 Q) + Drive 48, 100 Hz +5 dBFS
         Engine e;
         e.prepare (fs, 1, 512);
         Params p;
         p.driveOn = true;
-        p.mod[0].bassDb = 12.0f; p.mod[0].bassQ = 2.0f; p.mod[0].driveDb = 48.0f;
+        p.drive = 48.0f;
+        p.bands[0].used = true; p.bands[0].type = BandType::LowShelf;
+        p.bands[0].freq = 160.0f; p.bands[0].gain = 12.0f; p.bands[0].q = 2.83f;
         e.setParams (p);
         e.reset();
         auto x = sine (fs, 100.0, std::pow (10.0, 5.0 / 20.0), (int) fs);
@@ -1226,75 +1277,85 @@ static void testRobustness()
 }
 
 //------------------------------------------------------------------------------
-static void testFrequencyControls()
+static void testMigration()
 {
-    std::printf ("[17] 주파수 조절 (Bass·Treble 기준 주파수, Presence 연속 + 단계)\n");
+    std::printf ("[17] v0.4 이하 세션 변환 (모듈 -> 밴드, 같은 곡선)\n");
+    const double fs = processingRateFor (48000.0);
 
-    // 1) 셸프 주파수를 옮기면 곡선 모양은 그대로 평행 이동 (HQ 레이트 = 거의 아날로그)
+    // v0.4 처리와 같은 계산 (예전 ResponseModel)
+    auto legacy = [&] (const LegacyModule& md, bool st, double f)
     {
-        const double fs = processingRateFor (48000.0);
-        double worst = 0.0;
-        for (double g : { -18.0, 12.0 })
-            for (double q : { 0.5, 2.0 })
-            {
-                Params a; a.mod[0].trebleDb = (float) g; a.mod[0].trebleQ = (float) q;
-                Params b = a; b.mod[0].trebleHz = 5000.0f;                 // 10k -> 5k: 한 옥타브 아래로
-                Params c; c.mod[0].bassDb = (float) g; c.mod[0].bassQ = (float) q;
-                Params d = c; d.mod[0].bassHz = 80.0f;                     // 40 -> 80: 한 옥타브 위로
-                const ResponseModel ma (a, 0, fs), mb (b, 0, fs), mc (c, 0, fs), md (d, 0, fs);
-                for (double f : logFreqs (40.0, 10000.0, 60))
-                {
-                    worst = std::max (worst, std::abs (mb.magnitudeDb (f * 0.5) - ma.magnitudeDb (f)));
-                    worst = std::max (worst, std::abs (md.magnitudeDb (f * 2.0) - mc.magnitudeDb (f)));
-                }
-            }
-        std::printf ("    Treble 10k->5k / Bass 40->80 Hz: 한 옥타브 평행 이동 오차 최대 %.3f dB\n", worst);
-        CHECK (worst < 0.05, "shelf frequency shift error %.3f dB", worst);
+        const double tDb = st ? quantizeTreble (md.trebleDb) : std::clamp (md.trebleDb, kTrebleMinDb, kTrebleMaxDb);
+        const double tHz = st ? nearestStep (kTrebleSteps, md.trebleHz) : clampToSteps (kTrebleSteps, md.trebleHz);
+        const double bDb = st ? quantizeBass (md.bassDb) : std::clamp (md.bassDb, kBassMinDb, kBassMaxDb);
+        const double bHz = st ? nearestStep (kBassSteps, md.bassHz) : clampToSteps (kBassSteps, md.bassHz);
+        std::complex<double> h = svfResponse (makeHighShelfMatched (tHz / kShelfRefToMid, std::clamp (md.trebleQ, kShelfQMin, kShelfQMax), tDb, fs), f, fs)
+                               * svfResponse (makeLowShelf (bHz * kShelfRefToMid, std::clamp (md.bassQ, kShelfQMin, kShelfQMax), bDb, fs), f, fs);
+        if (md.modeB)
+        {
+            const double pDb = st ? quantizePresence (md.presDb) : std::clamp (md.presDb, 0.0f, kPresMaxDb);
+            const double pHz = st ? nearestStep (kPresenceSteps, md.presHz) : clampToSteps (kPresenceSteps, md.presHz);
+            h *= svfResponse (makeBellMatched (pHz, std::clamp (md.presQ, kPresQMin, kPresQMax), pDb, fs), f, fs);
+        }
+        else
+        {
+            const double tilt = st ? quantizeTilt (md.tiltDb) : std::clamp (md.tiltDb, -kTiltMaxDb, kTiltMaxDb);
+            h *= tiltResponse (makeTilt (kTiltPivotHz, tilt, fs), f, fs);
+        }
+        return 20.0 * std::log10 (std::abs (h));
+    };
 
-        // 기본값은 v0.3과 같은 곡선 (중간점 160 Hz / 2.5 kHz)
-        Params p; p.mod[0].trebleDb = 6.0f; p.mod[0].bassDb = -8.0f;
-        const auto r = resolveModule (p, 0);
-        CHECK (std::abs (r.trebleMidHz() - 2500.0) < 1e-9 && std::abs (r.bassMidHz() - 160.0) < 1e-9, "default shelf midpoints changed");
-    }
-
-    // 2) Presence는 단계 사이 아무 주파수에서도 중심 이득이 정확 (세션 레이트·HQ 모두)
+    std::mt19937 rng (5);
+    std::uniform_real_distribution<float> u (0.0f, 1.0f);
+    auto randomLegacy = [&]
     {
-        std::mt19937 rng (11);
-        std::uniform_real_distribution<double> u (0.0, 1.0);
-        double worst = 0.0;
-        for (double fs : { 44100.0, 48000.0, 192000.0 })
-            for (int t = 0; t < 40; ++t)
-            {
-                Params p;
-                p.mod[0].presHz = (float) (700.0 * std::pow (8000.0 / 700.0, u (rng)));
-                p.mod[0].presDb = (float) (1.0 + 5.0 * u (rng));
-                p.mod[0].presQ  = (float) (kPresQMin * std::pow (kPresQMax / kPresQMin, u (rng)));
-                const ResponseModel m (p, 0, fs);
-                worst = std::max (worst, std::abs (m.magnitudeDb (p.mod[0].presHz) - p.mod[0].presDb));
-            }
-        std::printf ("    Presence 0.7~8 kHz 아무 주파수: 중심 이득 오차 최대 %.4f dB\n", worst);
-        CHECK (worst < 0.01, "presence center gain error %.4f dB", worst);
-    }
+        LegacyModule m;
+        m.modeB    = u (rng) < 0.6f;
+        m.trebleDb = u (rng) < 0.2f ? 0.0f : -18.0f + 30.0f * u (rng);
+        m.bassDb   = u (rng) < 0.2f ? 0.0f : -20.0f + 32.0f * u (rng);
+        m.trebleQ  = 0.3f + 1.7f * u (rng);
+        m.bassQ    = 0.3f + 1.7f * u (rng);
+        m.trebleHz = 5000.0f + 11000.0f * u (rng);
+        m.bassHz   = 20.0f + 100.0f * u (rng);
+        m.tiltDb   = -4.0f + 8.0f * u (rng);
+        m.presHz   = 700.0f + 7300.0f * u (rng);
+        m.presDb   = u (rng) < 0.2f ? 0.0f : 6.0f * u (rng);
+        m.presQ    = 0.3f + 5.7f * u (rng);
+        return m;
+    };
 
-    // 3) VINTAGE STEPS: 가장 가까운 단계로 (옥타브 거리)
+    double worst = 0.0;
+    int checkedViews = 0, maxBands = 0;
+    for (int t = 0; t < 80; ++t)
     {
-        Params p; p.stepped = true;
-        p.mod[0].presHz = 2500.0f; p.mod[0].bassHz = 50.0f; p.mod[0].trebleHz = 11000.0f;
-        auto r = resolveModule (p, 0);
-        CHECK (sameValue (r.presHz, 2800.0) && sameValue (r.bassHz, 60.0) && sameValue (r.trebleHz, 12000.0),
-               "stepped snap: pres %.0f bass %.0f treble %.0f", r.presHz, r.bassHz, r.trebleHz);
-        p.mod[0].presHz = 1150.0f; p.mod[0].bassHz = 34.0f; p.mod[0].trebleHz = 6100.0f;
-        r = resolveModule (p, 0);
-        CHECK (sameValue (r.presHz, 1000.0) && sameValue (r.bassHz, 30.0) && sameValue (r.trebleHz, 7000.0),
-               "stepped snap 2: pres %.0f bass %.0f treble %.0f", r.presHz, r.bassHz, r.trebleHz);
-        p.stepped = false;
-        r = resolveModule (p, 0);
-        CHECK (std::abs (r.presHz - 1150.0) < 1e-3 && std::abs (r.bassHz - 34.0) < 1e-3 && std::abs (r.trebleHz - 6100.0) < 1e-2,
-               "free mode must keep in-between values");
-        p.mod[0].presHz = 50.0f; p.mod[0].bassHz = 500.0f; p.mod[0].trebleHz = 30000.0f;
-        r = resolveModule (p, 0);
-        CHECK (sameValue (r.presHz, 700.0) && sameValue (r.bassHz, 120.0) && sameValue (r.trebleHz, 16000.0), "range clamp");
+        LegacyParams L;
+        L.link = u (rng) < 0.5f;
+        L.midSide = u (rng) < 0.5f;
+        L.stepped = u (rng) < 0.3f;
+        L.mod[0] = randomLegacy();
+        L.mod[1] = randomLegacy();
+        const auto bands = migrateLegacyBands (L);
+        maxBands = std::max (maxBands, (int) bands.size());
+        Params p;
+        for (size_t i = 0; i < bands.size(); ++i) p.bands[i] = bands[i];
+        const ResponseModel m (p, fs);
+        const int mods = L.link ? 1 : 2;
+        for (int k = 0; k < mods; ++k)
+        {
+            const Placement view = L.link ? Placement::Stereo
+                                 : (L.midSide ? (k == 0 ? Placement::Mid : Placement::Side)
+                                              : (k == 0 ? Placement::Left : Placement::Right));
+            for (double f : logFreqs (20.0, 20000.0, 60))
+                worst = std::max (worst, std::abs (m.magnitudeDb (f, view) - legacy (L.mod[(size_t) k], L.stepped, f)));
+            ++checkedViews;
+        }
     }
+    std::printf ("    무작위 80개 (링크/L·R/M·S, 스텝 포함): 예전 곡선 대비 최대 %.4f dB, 밴드 수 최대 %d\n", worst, maxBands);
+    CHECK (worst < 0.05, "migrated response differs %.4f dB", worst);
+    CHECK (maxBands <= 6, "too many migrated bands %d", maxBands);
+
+    LegacyParams flat;   // 게인 0 = 밴드 없음
+    CHECK (migrateLegacyBands (flat).empty(), "flat legacy session must create no bands");
 }
 
 //------------------------------------------------------------------------------
@@ -1302,9 +1363,10 @@ static void dumpCsv (const std::string& dir)
 {
     const double fs = processingRateFor (48000.0);
     const auto freqs = logFreqs (10.0, 22000.0, 400);
-    auto writeSet = [&] (const std::string& name, const std::vector<std::pair<std::string, Params>>& set) {
+    auto writeSet = [&] (const std::string& name, const std::vector<std::pair<std::string, Params>>& set)
+    {
         std::vector<std::vector<float>> irs;
-        for (auto& s : set) irs.push_back (impulseResponse (s.second, fs, 96000, 1.0f, 0.0f, 0));
+        for (auto& s : set) irs.push_back (impulseResponse (s.second, fs, 96000, 1.0f, 1.0f, 0));
         std::ofstream f (dir + "/" + name + ".csv");
         f << "freq";
         for (auto& s : set) f << "," << s.first;
@@ -1317,22 +1379,25 @@ static void dumpCsv (const std::string& dir)
         }
         std::printf ("  wrote %s/%s.csv\n", dir.c_str(), name.c_str());
     };
+    auto one = [] (BandParams b) { Params p; p.bands[0] = b; return p; };
 
+    // 원본 RZ062 위치 그대로: 로우 셸프 160 Hz(40 Hz 기준), 하이 셸프 2.5 kHz(10 kHz 기준), 원본 Q(0.5 -> 0.71)
+    const double vq = kVintageShelfQ / kButterworthQ;
     std::vector<std::pair<std::string, Params>> shelves;
     for (float g : { 12.f, 8.f, 4.f, -4.f, -8.f, -12.f, -16.f, -20.f })
-    { Params p; p.mod[0].bassDb = g; shelves.push_back ({ "bass" + std::to_string ((int) g), p }); }
+        shelves.push_back ({ "bass" + std::to_string ((int) g), one (makeBand (BandType::LowShelf, kBassShelfHz, g, vq)) });
     for (float g : { 12.f, 8.f, 4.f, -4.f, -8.f, -12.f, -18.f })
-    { Params p; p.mod[0].trebleDb = g; shelves.push_back ({ "treble" + std::to_string ((int) g), p }); }
+        shelves.push_back ({ "treble" + std::to_string ((int) g), one (makeBand (BandType::HighShelf, kTrebleShelfHz, g, vq)) });
     writeSet ("shelves", shelves);
 
     std::vector<std::pair<std::string, Params>> shelfq;
-    for (float q : { 0.3f, 0.5f, 0.707f, 1.0f, 2.0f })
+    for (float q : { 0.3f, 0.5f, 0.707f, 1.0f, 2.0f })   // 원본 표기 Q (새 Q = 원본 / 0.707)
     {
         char nm[32];
         std::snprintf (nm, sizeof nm, "bassQ%.3f", q);
-        Params p; p.mod[0].bassDb = 10.0f; p.mod[0].bassQ = q; shelfq.push_back ({ nm, p });
+        shelfq.push_back ({ nm, one (makeBand (BandType::LowShelf, kBassShelfHz, 10.0, q / kButterworthQ)) });
         std::snprintf (nm, sizeof nm, "trebleQ%.3f", q);
-        Params t; t.mod[0].trebleDb = -10.0f; t.mod[0].trebleQ = q; shelfq.push_back ({ nm, t });
+        shelfq.push_back ({ nm, one (makeBand (BandType::HighShelf, kTrebleShelfHz, -10.0, q / kButterworthQ)) });
     }
     writeSet ("shelfq", shelfq);
 
@@ -1341,7 +1406,7 @@ static void dumpCsv (const std::string& dir)
     {
         char nm[32];
         std::snprintf (nm, sizeof nm, "presQ%.1f", q);
-        Params p; p.mod[0].presHz = 2800.0f; p.mod[0].presDb = 6.0f; p.mod[0].presQ = q; pres.push_back ({ nm, p });
+        pres.push_back ({ nm, one (makeBand (BandType::Bell, 2800.0, 6.0, q)) });
     }
     writeSet ("presence", pres);
 
@@ -1350,9 +1415,22 @@ static void dumpCsv (const std::string& dir)
     {
         char nm[32];
         std::snprintf (nm, sizeof nm, "tilt%+.1f", (double) i);
-        Params p; p.mod[0].mode = Mode::A_Tilt; p.mod[0].tiltDb = (float) i; tilt.push_back ({ nm, p });
+        tilt.push_back ({ nm, one (makeBand (BandType::Tilt, kTiltPivotHz, (double) i)) });
     }
     writeSet ("tilt", tilt);
+
+    std::vector<std::pair<std::string, Params>> cuts;
+    for (int s : { 0, 1, 3, 5, 7 })   // 6 / 12 / 24 / 48 / 96 dB/oct
+    {
+        cuts.push_back ({ "lc" + std::to_string (kCutSlopes[(size_t) s]), one (makeBand (BandType::LowCut,  100.0,  0, 1.0, Placement::Stereo, s)) });
+        cuts.push_back ({ "hc" + std::to_string (kCutSlopes[(size_t) s]), one (makeBand (BandType::HighCut, 8000.0, 0, 1.0, Placement::Stereo, s)) });
+    }
+    writeSet ("cuts", cuts);
+
+    std::vector<std::pair<std::string, Params>> notch;
+    for (int q : { 1, 4, 12 })
+        notch.push_back ({ "notchQ" + std::to_string (q), one (makeBand (BandType::Notch, 1000.0, 0, (double) q)) });
+    writeSet ("notch", notch);
 
     // 튜브: Drive별 왜곡 (Focus -1 / 0 / +1)
     {
@@ -1392,10 +1470,10 @@ int main (int argc, char** argv)
         return 0;
     }
 
-    testQuantizers();
     testNeutral();
+    testBandShapes();
     testAnalyticMatchesProcessing();
-    testSpecPoints();
+    testPlacements();
     testQBehaviour();
     testSampleRateConsistency();
     testClicks();
@@ -1404,11 +1482,10 @@ int main (int argc, char** argv)
     testEf804sCurve();
     testTube();
     testTransformer();
-    testRoutingAndLink();
     testZeroLatencyAntiAliasing();
     testSessionRateCurves();
     testRobustness();
-    testFrequencyControls();
+    testMigration();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

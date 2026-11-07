@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(PillowRZ VERSION 0.4.0 LANGUAGES C CXX)
+project(PillowRZ VERSION 0.5.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,7 +47,10 @@ juce_add_plugin(PillowRZ
 
 target_sources(PillowRZ PRIVATE
     Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp)
+    Source/PluginEditor.cpp
+    Source/UiCommon.cpp
+    Source/GraphView.cpp
+    Source/Panels.cpp)
 
 target_include_directories(PillowRZ PRIVATE Source)
 
