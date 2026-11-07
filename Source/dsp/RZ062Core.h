@@ -151,8 +151,13 @@ struct BandParams
     float     q     = 1.0f;
     int       slope = kDefaultSlope;    // kCutSlopes 인덱스 (컷)
     Placement place = Placement::Stereo;
-    bool      tube  = false;            // v0.6: 이 밴드의 주파수 부분을 EF804S 튜브로
-    bool      xfmr  = false;            // v0.6: 이 밴드의 주파수 부분을 출력 트랜스포머로
+    // 이 밴드의 주파수 부분에만 거는 아날로그 (v0.6 켜기/끄기, v0.7 밴드마다 따로 설정)
+    bool      tube     = false;         // EF804S 튜브
+    float     drive    = 18.0f;         //   드라이브 dB (0..48)
+    float     focus    = 0.0f;          //   -1 홀수 .. +1 짝수
+    float     tubeMix  = 1.0f;          //   0..1 (그 부분에서 원음과 섞기)
+    bool      xfmr     = false;         // 출력 트랜스포머
+    float     xfAmount = 0.5f;          //   0..1 (성격은 밴드 주파수로 자동)
 
     bool isActive() const noexcept { return used && on; }
 
@@ -160,7 +165,9 @@ struct BandParams
     {
         return used == o.used && on == o.on && type == o.type && slope == o.slope && place == o.place
             && tube == o.tube && xfmr == o.xfmr
-            && sameValue (freq, o.freq) && sameValue (gain, o.gain) && sameValue (q, o.q);
+            && sameValue (freq, o.freq) && sameValue (gain, o.gain) && sameValue (q, o.q)
+            && sameValue (drive, o.drive) && sameValue (focus, o.focus) && sameValue (tubeMix, o.tubeMix)
+            && sameValue (xfAmount, o.xfAmount);
     }
     bool operator!= (const BandParams& o) const noexcept { return ! (*this == o); }
 };
@@ -168,8 +175,8 @@ struct BandParams
 struct Params
 {
     bool  eqOn    = true;
-    bool  driveOn = false;    // 튜브를 신호 전체에 (ALL). 꺼져 있으면 TUBE를 켠 밴드의 부분에만
-    bool  xfAll   = true;     // 트랜스포머를 신호 전체에 (ALL). 꺼져 있으면 XFMR을 켠 밴드의 부분에만
+    bool  driveOn = false;    // 튜브를 신호 전체에 (ALL, 밴드들 뒤). 밴드마다의 튜브는 BandParams
+    bool  xfAll   = true;     // 트랜스포머를 신호 전체에 (ALL, 튜브 뒤). 밴드마다의 트랜스포머는 BandParams
     float drive   = 0.0f;     // EF804S 드라이브 0..48 dB
     float focus   = 0.0f;     // -1 = 홀수 배음(대칭)  0 = EF804S 그대로  +1 = 짝수 배음 2배
     float mix     = 1.0f;     // 0..1 (원음 블렌드)
@@ -491,15 +498,37 @@ inline double butterworthSectionQ (int order, int k) noexcept
 struct TiltCoeffs { double g = 0.0, G1 = 0.0, lfMinus1 = 0.0, outGain = 1.0; };
 struct OnePoleState { double s = 0.0; };
 
-inline TiltCoeffs makeTilt (double pivotHz, double tiltDb, double fs) noexcept
+// 아날로그 1차 틸트의 크기 제곱: 고역 +tilt dB, 저역 -tilt dB, 축(pivot)에서 0 dB
+inline double tiltAnalogMag2 (double pivotHz, double tiltDb, double f) noexcept
 {
     const double G  = std::pow (10.0, -2.0 * tiltDb / 20.0);   // 고역 대비 저역 게인
-    const double fp = pivotHz / std::sqrt (G);
+    const double K  = std::pow (10.0, tiltDb / 20.0);
+    const double wp = pivotHz / std::sqrt (G);                 // 극점 (Hz), 영점 = wp * G
+    return K * K * (f * f + wp * wp * G * G) / (f * f + wp * wp);
+}
+
+// 1차 틸트: DC · 나이퀴스트 · 축(세션 레이트의 1/4 위면 거기서)에서 크기가 아날로그와 같도록 (TPT 1폴 구조 그대로)
+//  쌍선형 + 극점 맞춤(v0.6까지)은 극점이 나이퀴스트에 가깝거나 넘으면(높은 축 + 큰 틸트) 축 근처까지 몇~20 dB 틀어졌음.
+//  20 Hz ~ 20 kHz, 축 10 Hz ~ 30 kHz, ±24 dB, 44.1 ~ 192 kHz 전체에서 아날로그와 최대 약 0.9 dB (보통 범위 0.4 dB 이하)
+inline TiltCoeffs makeTilt (double pivotHz, double tiltDb, double fs) noexcept
+{
+    const double M0 = tiltAnalogMag2 (pivotHz, tiltDb, 0.0);
+    const double MN = tiltAnalogMag2 (pivotHz, tiltDb, 0.5 * fs);
     TiltCoeffs c;
-    c.g        = std::tan (kPi * clampFreq (fp, fs) / fs);
-    c.G1       = c.g / (1.0 + c.g);
-    c.lfMinus1 = G - 1.0;
-    c.outGain  = std::pow (10.0, tiltDb / 20.0);
+    c.outGain  = std::sqrt (MN);                  // 나이퀴스트 (1폴 로우패스가 0)
+    c.lfMinus1 = std::sqrt (M0 / MN) - 1.0;       // DC = outGain * (1 + lfMinus1)
+
+    // 극점: 세 번째 점(축)의 크기로 정함. 틸트 0 근처에서도 이어지도록 아주 작은 틸트는 작은 값으로 계산
+    const double tg = std::abs (tiltDb) < 1.0e-3 ? std::copysign (1.0e-3, tiltDb == 0.0 ? 1.0 : tiltDb) : tiltDb;
+    const double fm = std::min (std::max (pivotHz, 1.0), 0.25 * fs);
+    const double a0 = tiltAnalogMag2 (pivotHz, tg, 0.0), aN = tiltAnalogMag2 (pivotHz, tg, 0.5 * fs);
+    const double am = tiltAnalogMag2 (pivotHz, tg, fm);
+    const double ratio = (am - aN) / (a0 - am);
+    double g = std::tan (kPi * fm / fs) * std::sqrt (std::max (ratio, 0.0));
+    if (! (g > 0.0) || ! std::isfinite (g))
+        g = std::tan (kPi * clampFreq (pivotHz, fs) / fs);
+    c.g  = std::clamp (g, 1.0e-9, 1.0e9);
+    c.G1 = c.g / (1.0 + c.g);
     return c;
 }
 
@@ -597,6 +626,39 @@ public:
         const Point pp = locate (w), pn = locate (-w);
         devPos = interp (devTable, pp);  devNeg = interp (devTable, pn);
         psiPos = interp (psiTable, pp);  psiNeg = interp (psiTable, pn);
+    }
+
+    // 오디오 루프용: 홀수·짝수 성분을 한 번에 (격자 위치 한 번, Catmull-Rom 가중치 한 번)
+    //  dO = (dev(v) - dev(-v)) / 2,  dE = (dev(v) + dev(-v)) / 2,  pO = (psi(v) + psi(-v)) / 2,  pE = (psi(v) - psi(-v)) / 2
+    //  |v| 쪽 절반만 읽고 부호로 돌림 (dO · pE는 홀함수, dE · pO는 짝함수) -> 캐시에 머무는 표가 절반
+    void evalParts (double v, double& dO, double& dE, double& pO, double& pE) const noexcept
+    {
+        if (! (std::abs (v) <= vEdge))   // 표 밖 (NaN 포함)
+        {
+            const double dp = dev (v), dn = dev (-v), pp = psi (v), pn = psi (-v);
+            dO = 0.5 * (dp - dn);  dE = 0.5 * (dp + dn);
+            pO = 0.5 * (pp + pn);  pE = 0.5 * (pp - pn);
+            return;
+        }
+        const double ax = std::abs (v) / kV0;
+        const double w  = std::log (ax + std::sqrt (ax * ax + 1.0));   // asinh (|v| / kV0)
+        const Point  p  = locate (w);
+        const double f = p.f, f2 = f * f, f3 = f2 * f;
+        const double c0 = 0.5 * (2.0 * f2 - f - f3), c1 = 0.5 * (2.0 - 5.0 * f2 + 3.0 * f3);
+        const double c2 = 0.5 * (f + 4.0 * f2 - 3.0 * f3), c3 = 0.5 * (f3 - f2);
+        const Parts& a = parts[p.i - 1];
+        const Parts& b = parts[p.i];
+        const Parts& q = parts[p.i + 1];
+        const Parts& d = parts[p.i + 2];
+        dO = c0 * a.dO + c1 * b.dO + c2 * q.dO + c3 * d.dO;
+        dE = c0 * a.dE + c1 * b.dE + c2 * q.dE + c3 * d.dE;
+        pO = c0 * a.pO + c1 * b.pO + c2 * q.pO + c3 * d.pO;
+        pE = c0 * a.pE + c1 * b.pE + c2 * q.pE + c3 * d.pE;
+        if (v < 0.0)
+        {
+            dO = -dO;
+            pE = -pE;
+        }
     }
 
     // 회로 그대로 풀기 (테이블 생성·테스트용)
@@ -710,9 +772,21 @@ private:
         tEdgeNeg   = -vEdge + devTable[2];
         psiEdgePos = psiTable[(size_t) kSize - 3];
         psiEdgeNeg = psiTable[2];
+
+        // 5) 홀수·짝수 성분 표 (격자가 0 V 기준 대칭이라 -v 쪽은 거울 위치: k <-> kSize-1-k)
+        parts.resize ((size_t) kSize);
+        for (size_t k = 0; k < (size_t) kSize; ++k)
+        {
+            const size_t m = (size_t) kSize - 1 - k;
+            parts[k] = { 0.5 * (devTable[k] - devTable[m]), 0.5 * (devTable[k] + devTable[m]),
+                         0.5 * (psiTable[k] + psiTable[m]), 0.5 * (psiTable[k] - psiTable[m]) };
+        }
     }
 
+    struct Parts { double dO, dE, pO, pE; };
+
     Table devTable {}, psiTable {};
+    std::vector<Parts> parts;
     double wMax = 1.0, invDw = 1.0, rk = 0.0, vp0 = 0.0, gain = 1.0;
     double vEdge = kVmax, tEdgePos = 0.0, tEdgeNeg = 0.0, psiEdgePos = 0.0, psiEdgeNeg = 0.0;
 };
@@ -862,9 +936,10 @@ public:
 
     void setSmoothingSeconds (double s) { smoothingSeconds = std::max (0.0, s); applySmoothing(); }
 
-    void setTargets (bool on, double driveDb, double focus) noexcept
+    // mixAmount: 원음과 섞는 비율 (on/off와 함께 부드럽게 바뀜)
+    void setTargets (bool on, double driveDb, double focus, double mixAmount = 1.0) noexcept
     {
-        wet.target   = on ? 1.0 : 0.0;
+        wet.target   = on ? clamp01 (mixAmount) : 0.0;
         drive.target = std::clamp (driveDb, 0.0, (double) kDriveMaxDb);
         foc.target   = std::clamp (focus, -1.0, 1.0);
     }
@@ -948,12 +1023,12 @@ private:
     // h(x) = shape(x) - x 의 홀수·짝수 성분과 각각의 역도함수 H(x) = 적분 0..x h(u) du 를 한 번에
     void shapeAt (double x, double& hOdd, double& HOdd, double& hEven, double& HEven) const noexcept
     {
-        double dp, dn, pp, pn;
-        curve->evalPair (x * scale, dp, dn, pp, pn);
-        hOdd  = 0.5 * (dp - dn) * invScale;
-        hEven = evenMul * 0.5 * (dp + dn) * invScale;
-        HOdd  = 0.5 * (pp + pn) * invScale * invScale;
-        HEven = evenMul * 0.5 * (pp - pn) * invScale * invScale;
+        double dO, dE, pO, pE;
+        curve->evalParts (x * scale, dO, dE, pO, pE);
+        hOdd  = dO * invScale;
+        hEven = evenMul * dE * invScale;
+        HOdd  = pO * invScale2;
+        HEven = evenMul * pE * invScale2;
     }
 
     void applySmoothing() noexcept
@@ -969,29 +1044,191 @@ private:
         wetNow   = wet.current;
         scale    = kGridVoltsPerFullScale * dbToGain (drive.current);
         invScale = 1.0 / scale;
+        invScale2 = invScale * invScale;
         evenMul  = 1.0 + foc.current;
 
         // 기준 레벨(-12 dBFS)에서의 기본파 이득 (describing function)
+        //  짝수 성분은 기본파에 들어가지 않고, 사인은 반 주기 · 1/4 주기 대칭 -> 홀수 성분만 8점 (32점과 같은 값)
         double sum = 0.0;
-        for (int k = 0; k < kDfPoints; ++k)
+        for (int k = 0; k < kDfPoints / 4; ++k)
         {
-            const double xk = kRefAmp * sinTable[(size_t) k];
-            sum += (xk + deviation (xk)) * sinTable[(size_t) k];
+            const double s  = sinTable[(size_t) k];
+            const double xk = kRefAmp * s;
+            double dO, dE, pO, pE;
+            curve->evalParts (xk * scale, dO, dE, pO, pE);
+            sum += (xk + dO * invScale) * s;
         }
-        const double df = (2.0 / (double) kDfPoints) * sum / kRefAmp;
+        const double df = (2.0 / (double) kDfPoints) * 4.0 * sum / kRefAmp;
         norm = df > 1.0e-9 ? 1.0 / df : 1.0;
     }
 
     const Ef804sCurve* curve = &ef804sCurve();
     std::array<double, kDfPoints> sinTable {};
     double fs = 48000.0, dcR = 0.9999, smoothingSeconds = 0.02;
-    double wetNow = 0.0, scale = kGridVoltsPerFullScale, invScale = 1.0 / kGridVoltsPerFullScale;
+    double wetNow = 0.0, scale = kGridVoltsPerFullScale, invScale = 1.0 / kGridVoltsPerFullScale, invScale2 = invScale * invScale;
     double evenMul = 1.0, norm = 1.0, dcX1 = 0.0, dcY1 = 0.0;
     AdaaAligned oddPart;
     Adaa1 evenPart;
     Smoother wet, drive, foc;
     int samplesToNextUpdate = 0;
 };
+
+//==============================================================================
+//  트랜스포머 곡선 (LOW · HIGH · MID) — 정확한 식
+//   왜곡 성분 h(u) = f(u) - u, 역도함수 H(u) (H(0) = 0), 기울기 h'(u)
+//==============================================================================
+struct TransformerShapes
+{
+    static constexpr double kLowDrive = 1.4;
+    static constexpr double kMidDrive = 0.45, kMidBias = 0.12;
+    static constexpr double kHighDrive = 1.2;
+
+    static double hSym (double u, double k) noexcept  { return std::tanh (k * u) / k - u; }
+    static double HSym (double u, double k) noexcept  { return logCosh (k * u) / (k * k) - 0.5 * u * u; }
+    static double dhSym (double u, double k) noexcept { const double t = std::tanh (k * u); return -t * t; }
+
+    static double hMid (double u) noexcept
+    {
+        const double tb = std::tanh (kMidBias);
+        return (std::tanh (kMidDrive * u + kMidBias) - tb) / (kMidDrive * (1.0 - tb * tb)) - u;
+    }
+    static double HMid (double u) noexcept
+    {
+        const double tb = std::tanh (kMidBias);
+        const double n  = 1.0 / (kMidDrive * (1.0 - tb * tb));
+        return n * ((logCosh (kMidDrive * u + kMidBias) - logCosh (kMidBias)) / kMidDrive - tb * u) - 0.5 * u * u;
+    }
+    static double dhMid (double u) noexcept
+    {
+        const double tb = std::tanh (kMidBias), t = std::tanh (kMidDrive * u + kMidBias);
+        return (1.0 - t * t) / (1.0 - tb * tb) - 1.0;
+    }
+};
+
+//==============================================================================
+//  트랜스포머 곡선 표 (오디오 루프용, 프로세스 전체에서 하나)
+//   곡선 4개: LOW, HIGH, MID 홀수 성분, MID 짝수 성분. 격자 1/32 (u = -8..8)에 h, h', H 저장
+//   h: 3차 에르미트 (값 + 기울기 h'). H: 5차 에르미트 (값 + 기울기 h + 곡률 h')
+//    -> ADAA가 나누는 H의 차이가 격자 사이에서도 h와 맞고, 0 근처의 u^4 · u^5 항이 정확히 재현돼
+//       작은 신호에서 가짜 선형 이득이 생기지 않음. |u| > 8 (+18 dBFS 넘음)은 식 그대로 계산
+//==============================================================================
+class TransformerCurves
+{
+public:
+    enum Curve { Low = 0, High, MidOdd, MidEven, kNumCurves };
+    static constexpr int    kPerUnit = 32;
+    static constexpr double kRange   = 8.0;
+    static constexpr int    kSize    = 2 * 8 * kPerUnit + 1;
+
+    // 입력 값 하나의 격자 위치와 에르미트 기저 (곡선 여러 개에 같이 씀)
+    struct At
+    {
+        double u = 0.0;
+        double c00 = 1.0, c10 = 0.0, c01 = 0.0, c11 = 0.0;                  // 3차 (h)
+        double q0 = 1.0, q1 = 0.0, q2 = 0.0, q3 = 0.0, q4 = 0.0, q5 = 0.0;   // 5차 (H)
+        int i = 0;
+        bool inside = true;
+    };
+
+    TransformerCurves() { build(); }
+
+    At at (double u) const noexcept
+    {
+        At a;
+        a.u = u;
+        const double pos = (u + kRange) * (double) kPerUnit;
+        a.inside = pos >= 0.0 && pos < (double) (kSize - 1);     // NaN -> 밖
+        if (! a.inside)
+            return a;
+        a.i = (int) pos;
+        const double t = pos - (double) a.i, t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+        const double s = 1.0 / (double) kPerUnit, s2 = s * s;
+        a.c00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        a.c01 = 3.0 * t2 - 2.0 * t3;
+        a.c10 = (t3 - 2.0 * t2 + t) * s;
+        a.c11 = (t3 - t2) * s;
+        a.q5 = 10.0 * t3 - 15.0 * t4 + 6.0 * t5;
+        a.q0 = 1.0 - a.q5;
+        a.q1 = (t - 6.0 * t3 + 8.0 * t4 - 3.0 * t5) * s;
+        a.q4 = (7.0 * t4 - 4.0 * t3 - 3.0 * t5) * s;
+        a.q2 = 0.5 * (t2 - 3.0 * t3 + 3.0 * t4 - t5) * s2;
+        a.q3 = 0.5 * (t3 - 2.0 * t4 + t5) * s2;
+        return a;
+    }
+
+    void eval (Curve c, const At& a, double& h, double& H) const noexcept
+    {
+        if (! a.inside)
+        {
+            exact (c, a.u, h, H);
+            return;
+        }
+        const Node& n0 = table[(size_t) c][(size_t) a.i];
+        const Node& n1 = table[(size_t) c][(size_t) a.i + 1];
+        h = a.c00 * n0.h + a.c10 * n0.dh + a.c01 * n1.h + a.c11 * n1.dh;
+        H = a.q0 * n0.H + a.q1 * n0.h + a.q2 * n0.dh + a.q3 * n1.dh + a.q4 * n1.h + a.q5 * n1.H;
+    }
+
+    static void exact (Curve c, double u, double& h, double& H) noexcept
+    {
+        using S = TransformerShapes;
+        switch (c)
+        {
+            case Low:  h = S::hSym (u, S::kLowDrive);  H = S::HSym (u, S::kLowDrive);  return;
+            case High: h = S::hSym (u, S::kHighDrive); H = S::HSym (u, S::kHighDrive); return;
+            case MidOdd:
+                h = 0.5 * (S::hMid (u) - S::hMid (-u));
+                H = 0.5 * (S::HMid (u) + S::HMid (-u));
+                return;
+            case MidEven:
+            case kNumCurves:
+            default:
+                h = 0.5 * (S::hMid (u) + S::hMid (-u));
+                H = 0.5 * (S::HMid (u) - S::HMid (-u));
+                return;
+        }
+    }
+
+    static double exactSlope (Curve c, double u) noexcept
+    {
+        using S = TransformerShapes;
+        switch (c)
+        {
+            case Low:     return S::dhSym (u, S::kLowDrive);
+            case High:    return S::dhSym (u, S::kHighDrive);
+            case MidOdd:  return 0.5 * (S::dhMid (u) + S::dhMid (-u));
+            case MidEven:
+            case kNumCurves:
+            default:      return 0.5 * (S::dhMid (u) - S::dhMid (-u));
+        }
+    }
+
+private:
+    struct Node { double h, dh, H; };
+
+    void build()
+    {
+        for (int c = 0; c < kNumCurves; ++c)
+        {
+            table[(size_t) c].resize ((size_t) kSize);
+            for (int k = 0; k < kSize; ++k)
+            {
+                const double u = -kRange + (double) k / (double) kPerUnit;
+                Node& n = table[(size_t) c][(size_t) k];
+                exact ((Curve) c, u, n.h, n.H);
+                n.dh = exactSlope ((Curve) c, u);
+            }
+        }
+    }
+
+    std::array<std::vector<Node>, kNumCurves> table;
+};
+
+inline const TransformerCurves& transformerCurves()
+{
+    static const TransformerCurves curves;
+    return curves;
+}
 
 //==============================================================================
 //  출력 트랜스포머 색채 — 저역 / 중역 / 고역 따로
@@ -1008,14 +1245,15 @@ class TransformerStage
 {
 public:
     static constexpr double kXoverLowHz = 200.0, kXoverHighHz = 4000.0;
-    static constexpr double kLowDrive = 1.4;
-    static constexpr double kMidDrive = 0.45, kMidBias = 0.12;
-    static constexpr double kHighDrive = 1.2;
+    static constexpr double kLowDrive  = TransformerShapes::kLowDrive;
+    static constexpr double kMidDrive  = TransformerShapes::kMidDrive, kMidBias = TransformerShapes::kMidBias;
+    static constexpr double kHighDrive = TransformerShapes::kHighDrive;
     static constexpr double kShelfHz = 12000.0, kShelfQ = 0.5, kShelfMaxCutDb = 1.5;
 
     void prepare (double sampleRate)
     {
         fs = sampleRate > 0.0 ? sampleRate : 48000.0;
+        curves = &transformerCurves();
         const double q = 1.0 / std::sqrt (2.0);
         lpLo = makeLowpass  (kXoverLowHz,  q, fs);
         hpLo = makeHighpass (kXoverLowHz,  q, fs);
@@ -1091,13 +1329,20 @@ public:
                     const double c3   = rest - c2;
 
                     // LOW·HIGH 곡선은 홀수 함수 -> DC가 생기지 않음
-                    const auto sl = bands[0].tickSplit (lo, hLow (lo),  HLow (lo));
-                    const auto sh = bands[2].tickSplit (hi, hHigh (hi), HHigh (hi));
+                    const auto& tc = *curves;
+                    double h, H;
+                    tc.eval (TransformerCurves::Low, tc.at (lo), h, H);
+                    const auto sl = bands[0].tickSplit (lo, h, H);
+                    tc.eval (TransformerCurves::High, tc.at (hi), h, H);
+                    const auto sh = bands[2].tickSplit (hi, h, H);
 
                     // MID는 비대칭 -> 홀수 성분(압축·홀수 배음)과 짝수 성분(짝수 배음·DC)으로 나눠서
-                    const double mp = hMid (mid), mn = hMid (-mid), Mp = HMid (mid), Mn = HMid (-mid);
-                    const auto   sm = bands[1].tickSplit (mid, 0.5 * (mp - mn), 0.5 * (Mp + Mn));
-                    const double me = midEven.tick (mid, 0.5 * (mp + mn), 0.5 * (Mp - Mn));
+                    const auto am = tc.at (mid);
+                    double he, He;
+                    tc.eval (TransformerCurves::MidOdd, am, h, H);
+                    tc.eval (TransformerCurves::MidEven, am, he, He);
+                    const auto   sm = bands[1].tickSplit (mid, h, H);
+                    const double me = midEven.tick (mid, he, He);
                     const double hp = me - dcX1 + dcR * dcY1;     // DC 블로커는 짝수 성분에만
                     dcX1 = me;
                     dcY1 = hp;
@@ -1121,22 +1366,13 @@ public:
 
     bool isEngaged() const noexcept { return active || aLow.target > 0.0 || aMid.target > 0.0 || aHigh.target > 0.0; }
 
-    // 구간별 왜곡 성분 h(u) = f(u) - u 와 그 역도함수 H(u) (H(0) = 0)
-    static double hLow (double u) noexcept  { return std::tanh (kLowDrive * u) / kLowDrive - u; }
-    static double HLow (double u) noexcept  { return logCosh (kLowDrive * u) / (kLowDrive * kLowDrive) - 0.5 * u * u; }
-    static double hHigh (double u) noexcept { return std::tanh (kHighDrive * u) / kHighDrive - u; }
-    static double HHigh (double u) noexcept { return logCosh (kHighDrive * u) / (kHighDrive * kHighDrive) - 0.5 * u * u; }
-    static double hMid (double u) noexcept
-    {
-        const double tb = std::tanh (kMidBias);
-        return (std::tanh (kMidDrive * u + kMidBias) - tb) / (kMidDrive * (1.0 - tb * tb)) - u;
-    }
-    static double HMid (double u) noexcept
-    {
-        const double tb = std::tanh (kMidBias);
-        const double n  = 1.0 / (kMidDrive * (1.0 - tb * tb));
-        return n * ((logCosh (kMidDrive * u + kMidBias) - logCosh (kMidBias)) / kMidDrive - tb * u) - 0.5 * u * u;
-    }
+    // 구간별 왜곡 성분 h(u) = f(u) - u 와 그 역도함수 H(u) (H(0) = 0) — 정확한 식 (테스트용)
+    static double hLow (double u) noexcept  { return TransformerShapes::hSym (u, kLowDrive); }
+    static double HLow (double u) noexcept  { return TransformerShapes::HSym (u, kLowDrive); }
+    static double hHigh (double u) noexcept { return TransformerShapes::hSym (u, kHighDrive); }
+    static double HHigh (double u) noexcept { return TransformerShapes::HSym (u, kHighDrive); }
+    static double hMid (double u) noexcept  { return TransformerShapes::hMid (u); }
+    static double HMid (double u) noexcept  { return TransformerShapes::HMid (u); }
 
 private:
     static constexpr int kChunk = 32;
@@ -1180,6 +1416,7 @@ private:
     double gSplitLo = 0.0, gSplitHi = 0.0, splitLo = 0.0, splitHi = 0.0;
     double dcX1 = 0.0, dcY1 = 0.0;
     bool active = false;
+    const TransformerCurves* curves = &transformerCurves();
     SvfCoeffs lpLo, hpLo, lpHi, hpHi, shelf;
     std::array<SvfState, 8> xs {};
     std::array<AdaaAligned, 3> bands {};
@@ -1188,6 +1425,145 @@ private:
     Smoother aLow, aMid, aHigh;
     int samplesToNextUpdate = 0;
 };
+
+//==============================================================================
+//  밴드 하나의 트랜스포머 (v0.7) — 구간을 나누지 않고 그 밴드 부분에 거는 포화
+//   성격은 밴드 주파수로 자동: 200 Hz 아래 = LOW 곡선(코어 포화, 대칭 3차 위주),
+//   4 kHz 위 = HIGH 곡선, 그 사이 = MID 곡선(약한 비대칭, 2차 + 3차). 경계는 1옥타브에 걸쳐 섞음
+//   양 0..1 = 전체 트랜스포머의 구간별 양과 같은 뜻. 1차 ADAA + 선형 성분 정렬 (레이턴시 0)
+//==============================================================================
+class TransformerBand
+{
+public:
+    void prepare (double sampleRate)
+    {
+        fs  = sampleRate > 0.0 ? sampleRate : 48000.0;
+        dcR = std::exp (-2.0 * kPi * 5.0 / fs);
+        curves = &transformerCurves();
+        odd.prepare (fs);
+        applySmoothing();
+        reset();
+    }
+
+    void setSmoothingSeconds (double s) { smoothingSeconds = std::max (0.0, s); applySmoothing(); }
+
+    // characterHz: 성격을 고르는 주파수 (보통 밴드 주파수)
+    void setTarget (double amount, double characterHz) noexcept
+    {
+        amt.target = clamp01 (amount);
+        hzTarget   = std::max (1.0, characterHz);
+    }
+
+    void reset() noexcept
+    {
+        amt.snap();
+        hzNow = hzTarget;
+        clearState();
+        samplesToNextUpdate = 0;
+        updateDerived();
+    }
+
+    void clearState() noexcept { odd.reset(); even.reset(); dcX1 = dcY1 = 0.0; }
+
+    bool isEngaged() const noexcept { return amt.target > 0.0 || cur > 0.0; }
+
+    // 그 자리에서: x + 양 x (왜곡 성분)
+    void process (float* x, int n) noexcept
+    {
+        int i = 0;
+        while (i < n)
+        {
+            if (samplesToNextUpdate <= 0)
+            {
+                if (! amt.isSettled() || ! sameValue (hzNow, hzTarget))
+                {
+                    amt.step();
+                    hzNow = hzTarget;
+                    updateDerived();
+                    double ho, Ho, he, He;                    // 곡선이 바뀌었으니 직전 입력의 값도 새 곡선으로
+                    shapeAt (odd.lastInput(), ho, Ho, he, He);
+                    odd.rebase (ho, Ho);
+                    even.rebase (he, He);
+                }
+                samplesToNextUpdate = kChunk;
+            }
+            const int len = std::min (samplesToNextUpdate, n - i);
+
+            if (cur > 0.0)
+            {
+                float* p = x + i;
+                for (int k = 0; k < len; ++k)
+                {
+                    const double in = p[k];
+                    double ho, Ho, he, He;
+                    shapeAt (in, ho, Ho, he, He);
+                    const auto sp   = odd.tickSplit (in, ho, Ho);   // 압축 + 홀수 배음 (정렬됨)
+                    const double e  = even.tick (in, he, He);       // 짝수 배음 + DC
+                    const double hp = e - dcX1 + dcR * dcY1;        // DC 블로커는 짝수 성분에만
+                    dcX1 = e;
+                    dcY1 = hp;
+                    p[k] = (float) (in + cur * (sp.distortion + sp.slope * in + hp));
+                }
+            }
+            else
+            {
+                clearState();
+            }
+
+            samplesToNextUpdate -= len;
+            i += len;
+        }
+    }
+
+private:
+    static constexpr int kChunk = 32;
+
+    void shapeAt (double u, double& hO, double& HO, double& hE, double& HE) const noexcept
+    {
+        const auto& tc = *curves;
+        const auto a = tc.at (u);
+        double h, H;
+        hO = HO = hE = HE = 0.0;
+        if (wL > 0.0) { tc.eval (TransformerCurves::Low, a, h, H);  hO += wL * h;  HO += wL * H; }
+        if (wH > 0.0) { tc.eval (TransformerCurves::High, a, h, H); hO += wH * h;  HO += wH * H; }
+        if (wM > 0.0)
+        {
+            tc.eval (TransformerCurves::MidOdd, a, h, H);   hO += wM * h;  HO += wM * H;
+            tc.eval (TransformerCurves::MidEven, a, h, H);  hE = wM * h;   HE = wM * H;
+        }
+    }
+
+    void updateDerived() noexcept
+    {
+        cur = amt.current;
+        const double a = clamp01 (0.5 + std::log2 (hzNow / TransformerStage::kXoverLowHz));    // 0 = LOW
+        const double b = clamp01 (0.5 + std::log2 (hzNow / TransformerStage::kXoverHighHz));   // 1 = HIGH
+        wL = 1.0 - a;
+        wH = b;
+        wM = std::max (0.0, a - b);
+    }
+
+    void applySmoothing() noexcept
+    {
+        amt.setTimeConstant (std::max (smoothingSeconds, 0.005), fs / kChunk);
+        amt.eps = 1.0e-5;
+    }
+
+    double fs = 48000.0, dcR = 0.9999, smoothingSeconds = 0.02;
+    double cur = 0.0, hzNow = 1000.0, hzTarget = 1000.0, wL = 0.0, wM = 1.0, wH = 0.0;
+    double dcX1 = 0.0, dcY1 = 0.0;
+    const TransformerCurves* curves = &transformerCurves();
+    AdaaAligned odd;
+    Adaa1 even;
+    Smoother amt;
+    int samplesToNextUpdate = 0;
+};
+
+// 밴드 트랜스포머의 성격을 고르는 주파수: 컷은 남기는 쪽이 넓어서, 틸트는 전체라서 MID 성격
+inline double transformerCharacterHz (BandType t, double freq) noexcept
+{
+    return (t == BandType::LowCut || t == BandType::HighCut || t == BandType::Tilt) ? 1000.0 : freq;
+}
 
 //==============================================================================
 //  밴드 설계: 모양 · 주파수 · 게인 · Q · 기울기 -> 2차 SVF 최대 8개 + 1차 하나 (또는 1차 틸트)
@@ -1216,7 +1592,10 @@ inline BandDesign designBand (BandType type, double freq, double gainDb, double 
         case BandType::LowShelf:  d.numSections = 1; d.sec[0] = makeLowShelfMatched  (f, qq * kButterworthQ, g, fs); break;
         case BandType::HighShelf: d.numSections = 1; d.sec[0] = makeHighShelfMatched (f, qq * kButterworthQ, g, fs); break;
         case BandType::Notch:     d.numSections = 1; d.sec[0] = makeNotch (f, qq, fs); break;
-        case BandType::Tilt:      d.tilt = true; d.tiltC = makeTilt (f, g, fs); break;
+        case BandType::Tilt:      // 1차 틸트는 축이 나이퀴스트 위여도 아날로그 곡선 그대로 맞출 수 있음 (자르지 않음)
+            d.tilt = true;
+            d.tiltC = makeTilt (std::clamp (freq, (double) kFreqMin, (double) kFreqMax), g, fs);
+            break;
         case BandType::LowCut:
         case BandType::HighCut:
         {
@@ -1244,10 +1623,10 @@ inline BandDesign designBand (BandType type, double freq, double gainDb, double 
 }
 
 //==============================================================================
-//  밴드의 "영역" (v0.6): 튜브 · 트랜스포머를 그 밴드에만 걸 때 보내는 주파수 부분
+//  밴드의 "영역": 그 밴드의 튜브 · 트랜스포머가 거는 주파수 부분
 //   벨 · 노치 = 중심 둘레 (밴드패스, 중심 이득 1, 밴드 Q), 로우 셸프 · 하이 컷 = 그 아래 (로우패스),
 //   하이 셸프 · 로우 컷 = 그 위 (하이패스), 틸트 = 전체
-//   쓰는 쪽: 원신호 = (영역 밖) + (영역 안)이 정확히 맞게 상보로 나눠서 "안"만 튜브에 -> 튜브가 투명하면 원신호 그대로
+//   쓰는 쪽: 출력 = x + (아날로그(R x) - R x) -> 아날로그가 투명하면 원신호 그대로, 영역 밖은 손대지 않음
 //==============================================================================
 inline bool regionIsAll (BandType t) noexcept { return t == BandType::Tilt; }
 
@@ -1299,13 +1678,15 @@ inline std::complex<double> designResponse (const BandDesign& d, double f, doubl
 //   - 주파수(로그) · 게인 · Q(로그)는 스무딩 + 0.33 ms(48k에서 16샘플)마다 계수 재계산, 그 사이는 샘플 단위 선형 보간
 //   - 모양 · 기울기 · 적용 채널 · 켜기/끄기 · 추가/삭제는 8 ms 페이드아웃 -> 바꾸기(상태 초기화) -> 페이드인
 //     (페이드 = 그 밴드의 효과만 줄였다 키움. 원신호는 그대로라 소리가 끊기지 않음)
+//   - 아날로그 (v0.7): 이 밴드 영역 -> EF804S(이 밴드의 드라이브 · 포커스 · 믹스) -> 트랜스포머(이 밴드의 양)
+//     엔진이 EQ를 다 건 신호에서 영역을 떼어 처리하고 "바뀐 만큼"만 더함 (밴드끼리 병렬, 밴드 페이드를 따라감)
 //==============================================================================
 class BandProcessor
 {
 public:
     static constexpr int    kSubBlockBase = 16;     // 48 kHz 기준 (0.33 ms)
     static constexpr double kFadeSeconds  = 0.008;
-    static constexpr int    kMaxChunk     = 32;     // 엔진이 한 번에 넘기는 최대 길이 (영역 보내기용 페이드 기록)
+    static constexpr int    kMaxChunk     = 32;     // 엔진의 덩어리 길이 (아날로그용 페이드 기록)
 
     BandProcessor() { prepare (48000.0); }
 
@@ -1314,18 +1695,28 @@ public:
         fs = sampleRate > 0.0 ? sampleRate : 48000.0;
         subBlock = kSubBlockBase * std::max (1, (int) std::lround (fs / 48000.0));
         fadeStep = 1.0 / std::max (1.0, kFadeSeconds * fs);
+        for (auto& t : analog.tube) t.prepare (fs);
+        for (auto& x : analog.xf)   x.prepare (fs);
         applySmoothing();
         reset();
     }
 
-    void setSmoothingSeconds (double s) { smoothingSeconds = std::max (0.0, s); applySmoothing(); }
+    void setSmoothingSeconds (double s)
+    {
+        smoothingSeconds = std::max (0.0, s);
+        for (auto& t : analog.tube) t.setSmoothingSeconds (smoothingSeconds);
+        for (auto& x : analog.xf)   x.setSmoothingSeconds (smoothingSeconds);
+        applySmoothing();
+    }
 
     // 블록마다. eqOn이 꺼지면 모든 밴드가 꺼진 것처럼 페이드아웃
     void setTarget (const BandParams& b, bool eqOn) noexcept
     {
         targetActive = b.isActive() && eqOn;
-        sends[0].target = targetActive && b.tube;
-        sends[1].target = targetActive && b.xfmr;
+        for (auto& t : analog.tube)
+            t.setTargets (targetActive && b.tube, b.drive, b.focus, b.tubeMix);
+        for (auto& x : analog.xf)
+            x.setTarget (targetActive && b.xfmr ? (double) b.xfAmount : 0.0, transformerCharacterHz (b.type, b.freq));
         if (! targetActive)
             return;                                   // 사라지는 동안은 마지막 설정 그대로 (값이 쓸려가지 않게)
         target = b;
@@ -1341,12 +1732,10 @@ public:
         sF.snap(); sG.snap(); sQ.snap();
         mode = targetActive ? Mode::On : Mode::Off;
         fade = targetActive ? 1.0 : 0.0;
-        for (auto& s : sends)
-        {
-            s.alpha = s.target ? 1.0 : 0.0;
-            s.valid = false;
-            s.live  = false;
-        }
+        for (auto& t : analog.tube) t.reset();
+        for (auto& x : analog.xf)   x.reset();
+        analog.valid = false;
+        analog.live  = false;
         clearState();
         cur = designNow();
         ramping = false;
@@ -1428,72 +1817,98 @@ public:
     }
 
     //--------------------------------------------------------------------------
-    //  영역 보내기 (s = 0 튜브, 1 트랜스포머)
-    //   엔진의 32샘플 덩어리(절대 시간) 단위: 덩어리 처음에 beginChunk, 그 안에서 위치(pos)로 샘플마다 계산
+    //  아날로그 (이 밴드 영역의 튜브 · 트랜스포머)
+    //   엔진의 32샘플 덩어리(절대 시간) 단위: 덩어리 처음에 beginChunk, 그 안에서는 위치(pos)로 샘플마다
     //   -> 호스트 블록이 덩어리를 어떻게 자르든 결과가 비트 단위로 같음
     //--------------------------------------------------------------------------
     void beginChunk() noexcept
     {
         traceIdx = 0;
-        for (auto& snd : sends)
+        analog.tubeLive = analog.tube[0].isEngaged() || analog.tube[1].isEngaged();
+        analog.xfLive   = analog.xf[0].isEngaged()   || analog.xf[1].isEngaged();
+        analog.live = mode != Mode::Off && (analog.tubeLive || analog.xfLive);
+        if (! analog.live)
         {
-            snd.alphaStart = snd.alpha;
-            snd.rising = snd.target;
-            snd.alpha = snd.rising ? std::min (1.0, snd.alpha + fadeStep * kMaxChunk)
-                                   : std::max (0.0, snd.alpha - fadeStep * kMaxChunk);
-            snd.live = mode != Mode::Off && (snd.alphaStart > 0.0 || snd.alpha > 0.0);
-            if (! snd.live)
-            {
-                snd.valid = false;
-                continue;
-            }
-            snd.from = snd.to;
-            snd.to = makeRegion (cfg.type, std::exp (sF.current), std::exp (sQ.current), fs);
-            if (! snd.valid)             // 새로 쓰기 시작 (또는 모양이 바뀐 뒤): 보간 없이, 상태 비우고
-            {
-                snd.from = snd.to;
-                snd.st = {};
-                snd.valid = true;
-            }
+            analog.valid = false;
+            return;
         }
+        analog.from = analog.to;
+        const bool same = analog.valid && sameValue (analog.fHz, sF.current) && sameValue (analog.qVal, sQ.current);
+        if (! same)
+        {
+            analog.fHz  = sF.current;
+            analog.qVal = sQ.current;
+            analog.to = makeRegion (cfg.type, std::exp (sF.current), std::exp (sQ.current), fs);
+        }
+        if (! analog.valid)             // 새로 쓰기 시작 (또는 모양이 바뀐 뒤): 보간 없이, 상태 비우고
+        {
+            analog.from = analog.to;
+            analog.region = {};
+            analog.valid = true;
+        }
+        analog.moving = ! (sameValue (analog.from.a1, analog.to.a1) && sameValue (analog.from.a2, analog.to.a2)
+                           && sameValue (analog.from.a3, analog.to.a3) && sameValue (analog.from.m0, analog.to.m0)
+                           && sameValue (analog.from.m1, analog.to.m1) && sameValue (analog.from.m2, analog.to.m2));
     }
 
-    bool sendLive (int s) const noexcept { return sends[(size_t) s].live; }
+    bool analogLive() const noexcept { return analog.live; }
 
-    // c -= w R(c)   (w = 보내기 페이드 x 밴드 페이드, 계수는 덩어리 안에서 샘플마다 보간)
-    // a, b = 이 그룹의 두 채널 (L·R 또는 M·S), process와 같은 채널 규칙. pos = 덩어리 안에서의 시작 위치
-    void applyComplement (int s, float* a, float* b, int nc, int n, int pos) noexcept
+    // a, b = 이 그룹의 두 채널 (L·R 또는 M·S) = EQ를 다 건 신호, da, db 에 "바뀐 만큼"을 더함
+    // pos = 덩어리 안에서의 시작 위치. 채널 규칙은 process와 같음
+    void applyAnalog (const float* a, const float* b, float* da, float* db, int nc, int n, int pos) noexcept
     {
-        auto& snd = sends[(size_t) s];
-        if (! snd.live)
+        if (! analog.live)
             return;
         bool doA, doB;
         channelsFor (nc, doA, doB);
-        const double dir = snd.rising ? fadeStep : -fadeStep;
-        const auto& f = snd.from;
-        const auto& t = snd.to;
-        for (int k = 0; k < n; ++k)
+        std::array<float, kMaxChunk> r {}, y {};
+        const int len = std::min (n, kMaxChunk);
+
+        auto run = [&] (const float* x, float* d, size_t ch)
         {
-            const int idx = std::min (pos + k, kMaxChunk - 1);
-            const double u = (double) (idx + 1) / (double) kMaxChunk;
-            SvfCoeffs c;
-            c.a1 = f.a1 + (t.a1 - f.a1) * u;  c.a2 = f.a2 + (t.a2 - f.a2) * u;  c.a3 = f.a3 + (t.a3 - f.a3) * u;
-            c.m0 = f.m0 + (t.m0 - f.m0) * u;  c.m1 = f.m1 + (t.m1 - f.m1) * u;  c.m2 = f.m2 + (t.m2 - f.m2) * u;
-            const double w = std::clamp (snd.alphaStart + dir * (double) (idx + 1), 0.0, 1.0) * fadeTrace[(size_t) idx];
-            if (doA) { const double x = a[k]; a[k] = (float) (x - w * svfTick (c, snd.st[0], x)); }
-            if (doB) { const double x = b[k]; b[k] = (float) (x - w * svfTick (c, snd.st[1], x)); }
-        }
+            const auto& f = analog.from;
+            const auto& t = analog.to;
+            if (analog.moving)
+            {
+                for (int k = 0; k < len; ++k)
+                {
+                    const int idx = std::min (pos + k, kMaxChunk - 1);
+                    const double u = (double) (idx + 1) / (double) kMaxChunk;
+                    SvfCoeffs c;
+                    c.a1 = f.a1 + (t.a1 - f.a1) * u;  c.a2 = f.a2 + (t.a2 - f.a2) * u;  c.a3 = f.a3 + (t.a3 - f.a3) * u;
+                    c.m0 = f.m0 + (t.m0 - f.m0) * u;  c.m1 = f.m1 + (t.m1 - f.m1) * u;  c.m2 = f.m2 + (t.m2 - f.m2) * u;
+                    r[(size_t) k] = (float) svfTick (c, analog.region[ch], (double) x[k]);
+                }
+            }
+            else
+            {
+                for (int k = 0; k < len; ++k)
+                    r[(size_t) k] = (float) svfTick (t, analog.region[ch], (double) x[k]);
+            }
+            y = r;
+            if (analog.tubeLive) analog.tube[ch].process (y.data(), len);
+            if (analog.xfLive)   analog.xf[ch].process (y.data(), len);
+            for (int k = 0; k < len; ++k)
+            {
+                const int idx = std::min (pos + k, kMaxChunk - 1);
+                d[k] = (float) ((double) d[k] + fadeTrace[(size_t) idx] * ((double) y[(size_t) k] - (double) r[(size_t) k]));
+            }
+        };
+        if (doA) run (a, da, 0);
+        if (doB && b != nullptr) run (b, db, 1);
     }
 
 private:
     enum class Mode { Off, FadingIn, On, FadingOut };
 
-    struct RegionSend
+    struct Analog
     {
-        bool   target = false, rising = false, live = false, valid = false;
-        double alpha = 0.0, alphaStart = 0.0;
+        bool live = false, tubeLive = false, xfLive = false, valid = false, moving = false;
+        double fHz = 0.0, qVal = 0.0;     // to를 만든 설정 (로그 도메인)
         SvfCoeffs from, to;
-        std::array<SvfState, 2> st {};
+        std::array<SvfState, 2> region {};
+        std::array<TubeStage, 2> tube;
+        std::array<TransformerBand, 2> xf;
     };
 
     void channelsFor (int nc, bool& doA, bool& doB) const noexcept
@@ -1538,7 +1953,9 @@ private:
     {
         cfg = target;
         sF.snap(); sG.snap(); sQ.snap();
-        for (auto& s : sends) s.valid = false;   // 모양 · 채널이 바뀌었을 수 있음 -> 영역도 새로
+        analog.valid = false;                     // 모양 · 채널이 바뀌었을 수 있음 -> 영역 · 아날로그 상태도 새로
+        for (auto& t : analog.tube) t.clearState();
+        for (auto& x : analog.xf)   x.clearState();
         clearState();
         cur = designNow();
         ramping = false;
@@ -1619,7 +2036,7 @@ private:
     BandDesign cur, next, base, step, live;
     std::array<ChannelState, 2> st {};
     int subBlock = kSubBlockBase, subLeft = 0, rampPos = 0;
-    std::array<RegionSend, 2> sends {};
+    Analog analog;
     std::array<double, kMaxChunk> fadeTrace {};
     int traceIdx = 0;
 };
@@ -1640,11 +2057,11 @@ inline double processingRateFor (double sampleRate) noexcept
 }
 
 //==============================================================================
-//  엔진: 밴드 16개 -> EF804S -> 트랜스포머 -> Mix -> Output (채널 1~2개)
+//  엔진: 밴드 16개 -> 밴드 아날로그 -> EF804S(ALL) -> 트랜스포머(ALL) -> Mix -> Output (채널 1~2개)
 //   32샘플(절대 시간 기준) 덩어리마다 밴드 상태 전환을 확인 -> 호스트 블록 크기와 상관없이 같은 결과
-//   튜브 · 트랜스포머 (v0.6): ALL이면 신호 전체, 아니면 TUBE/XFMR을 켠 밴드 영역의 합집합만 통과
-//     c = (1 - ALL) x  Π (1 - w_i R_i)  x     (어느 영역에도 안 드는 부분, 상보 캐스케이드)
-//     출력 = c + 단계(x - c)                 -> 단계가 투명하면 정확히 x. 튜브 · 트랜스포머는 한 대씩
+//   밴드 아날로그 (v0.7): EQ를 다 건 신호 x에서 밴드마다 자기 영역을 떼어 자기 튜브 · 트랜스포머로
+//     출력 = x + Σ (아날로그_i(R_i x) - R_i x)   (밴드끼리 병렬, 밴드마다 드라이브 · 포커스 · 믹스 · 양이 다름)
+//     M/S 밴드는 M 또는 S 신호에서 (그 채널에만 튜브), 모노는 Side 말고 전부 그 채널에서
 //==============================================================================
 class Engine
 {
@@ -1661,7 +2078,6 @@ public:
         for (auto& b : bands) b.prepare (fs);
         for (auto& t : tube)  t.prepare (fs);
         for (auto& x : xf)    x.prepare (fs);
-        allStep = 1.0 / std::max (1.0, BandProcessor::kFadeSeconds * fs);
         applySmoothing();
         reset();
     }
@@ -1679,21 +2095,11 @@ public:
 
     void setParams (const Params& p) noexcept
     {
-        bool anyTube = false, anyXf = false;
         for (size_t i = 0; i < bands.size(); ++i)
-        {
-            const auto& b = p.bands[i];
-            bands[i].setTarget (b, p.eqOn);
-            const bool live = b.isActive() && p.eqOn;
-            anyTube = anyTube || (live && b.tube);
-            anyXf   = anyXf   || (live && b.xfmr);
-        }
-        const bool tubeOn = p.driveOn || anyTube;
-        const bool xfOn   = p.xfAll || anyXf;
-        for (auto& t : tube) t.setTargets (tubeOn, p.drive, p.focus);
-        for (auto& x : xf)   x.setAmounts (xfOn ? p.xfLow : 0.0, xfOn ? p.xfMid : 0.0, xfOn ? p.xfHigh : 0.0);
-        allTarget[0] = p.driveOn;
-        allTarget[1] = p.xfAll;
+            bands[i].setTarget (p.bands[i], p.eqOn);
+        for (auto& t : tube) t.setTargets (p.driveOn, p.drive, p.focus);
+        const double xa = p.xfAll ? 1.0 : 0.0;
+        for (auto& x : xf)   x.setAmounts (xa * p.xfLow, xa * p.xfMid, xa * p.xfHigh);
         mix.target     = clamp01 (p.mix);
         outGain.target = dbToGain (std::clamp ((double) p.outputDb, -24.0, 24.0));
     }
@@ -1703,11 +2109,6 @@ public:
         for (auto& b : bands) b.reset();
         for (auto& t : tube)  t.reset();
         for (auto& x : xf)    x.reset();
-        for (size_t s = 0; s < 2; ++s)
-        {
-            allAlpha[s] = allStart[s] = allTarget[s] ? 1.0 : 0.0;
-            allDir[s] = 0.0;
-        }
         stageOn = { false, false };
         mix.snap();
         outGain.snap();
@@ -1740,7 +2141,7 @@ public:
     TransformerStage& getTransformer (int c) noexcept { return xf[(size_t) std::clamp (c, 0, 1)]; }
 
 private:
-    // 32샘플 덩어리 처음 (절대 시간): 밴드 상태 전환, 보내기 · ALL 페이드 · 튜브/트랜스포머 사용 여부를 이 덩어리 동안 고정
+    // 32샘플 덩어리 처음 (절대 시간): 밴드 상태 전환, 아날로그 · ALL 단계 사용 여부를 이 덩어리 동안 고정
     void beginChunk() noexcept
     {
         for (auto& b : bands)
@@ -1748,14 +2149,8 @@ private:
             b.updateState();
             b.beginChunk();
         }
-        for (size_t s = 0; s < 2; ++s)
-        {
-            allStart[s] = allAlpha[s];
-            allDir[s]   = allTarget[s] ? allStep : -allStep;
-            allAlpha[s] = std::clamp (allStart[s] + allDir[s] * kChunk, 0.0, 1.0);
-        }
-        stageOn[0] = tube[0].isEngaged();
-        stageOn[1] = xf[0].isEngaged();
+        stageOn[0] = tube[0].isEngaged() || tube[1].isEngaged();
+        stageOn[1] = xf[0].isEngaged()   || xf[1].isEngaged();
     }
 
     void processChunk (float* L, float* R, int nc, int n, int pos) noexcept
@@ -1794,8 +2189,9 @@ private:
             }
         }
 
-        runStage (0, L, R, nc, n, pos);   // EF804S
-        runStage (1, L, R, nc, n, pos);   // 출력 트랜스포머
+        applyBandAnalog (L, R, nc, n, pos);                       // 밴드마다의 튜브 · 트랜스포머
+        if (stageOn[0]) { tube[0].process (L, n); if (R != nullptr) tube[1].process (R, n); }   // EF804S (ALL)
+        if (stageOn[1]) { xf[0].process (L, n);   if (R != nullptr) xf[1].process (R, n); }     // 트랜스포머 (ALL)
 
         if (useMix)
             for (int k = 0; k < n; ++k)
@@ -1815,92 +2211,52 @@ private:
             }
     }
 
-    // s = 0 튜브, 1 트랜스포머. ALL이면 신호 전체, 아니면 보내기를 켠 밴드 영역의 합집합만
-    void runStage (int s, float* L, float* R, int nc, int n, int pos) noexcept
+    // 밴드 아날로그: 모두 EQ를 다 건 같은 신호에서 영역을 떼어(병렬) 바뀐 만큼을 모아 더함
+    void applyBandAnalog (float* L, float* R, int nc, int n, int pos) noexcept
     {
-        const double a0  = allStart[(size_t) s];
-        const double dir = allDir[(size_t) s];
-
-        auto stage = [&] (float* x, int ch)
-        {
-            if (s == 0) tube[(size_t) ch].process (x, n);
-            else        xf[(size_t) ch].process (x, n);
-        };
-        if (! stageOn[(size_t) s])
-            return;                                                   // 꺼져 있음: 비트 단위 그대로
-
-        bool anyLive = false, anyMs = false;
+        bool anyLR = false, anyMS = false;
         for (auto& b : bands)
-            if (b.sendLive (s))
-            {
-                anyLive = true;
-                anyMs = anyMs || (nc == 2 && isMsPlacement (b.placement()));
-            }
-
-        const bool allFull = a0 >= 1.0 && allAlpha[(size_t) s] >= 1.0;
-        if (! anyLive && allFull)
-        {
-            stage (L, 0);                                             // 신호 전체 (v0.5와 비트 단위로 같음)
-            if (R != nullptr) stage (R, 1);
+            if (b.analogLive())
+                (nc == 2 && isMsPlacement (b.placement()) ? anyMS : anyLR) = true;
+        if (! anyLR && ! anyMS)
             return;
-        }
-        if (! anyLive && a0 <= 0.0 && allAlpha[(size_t) s] <= 0.0)
-            return;                                                   // 보낼 부분이 없음
 
-        // c = 영역 밖 (영역 필터는 ALL일 때도 돌려서 상태를 이어 둠)
-        float* cL = cBuf[0].data();
-        float* cR = cBuf[1].data();
-        std::copy (L, L + n, cL);
-        if (R != nullptr) std::copy (R, R + n, cR);
+        float* dL = dBuf[0].data();
+        float* dR = dBuf[1].data();
+        std::fill (dL, dL + n, 0.0f);
+        std::fill (dR, dR + n, 0.0f);
 
-        for (auto& b : bands)
-            if (b.sendLive (s) && ! (nc == 2 && isMsPlacement (b.placement())))
-                b.applyComplement (s, cL, cR, nc, n, pos);
-        if (anyMs)
+        if (anyLR)
+            for (auto& b : bands)
+                if (b.analogLive() && ! (nc == 2 && isMsPlacement (b.placement())))
+                    b.applyAnalog (L, R, dL, dR, nc, n, pos);
+
+        if (anyMS)
         {
+            float* M  = msBuf[0].data();
+            float* S  = msBuf[1].data();
+            float* dM = msDelta[0].data();
+            float* dS = msDelta[1].data();
             for (int k = 0; k < n; ++k)
             {
-                const double l = cL[k], r = cR[k];
-                cL[k] = (float) (0.5 * (l + r));
-                cR[k] = (float) (0.5 * (l - r));
+                M[k] = (float) (0.5 * ((double) L[k] + (double) R[k]));
+                S[k] = (float) (0.5 * ((double) L[k] - (double) R[k]));
+                dM[k] = dS[k] = 0.0f;
             }
             for (auto& b : bands)
-                if (b.sendLive (s) && isMsPlacement (b.placement()))
-                    b.applyComplement (s, cL, cR, nc, n, pos);
+                if (b.analogLive() && isMsPlacement (b.placement()))
+                    b.applyAnalog (M, S, dM, dS, nc, n, pos);
             for (int k = 0; k < n; ++k)
             {
-                const double m = cL[k], d = cR[k];
-                cL[k] = (float) (m + d);
-                cR[k] = (float) (m - d);
+                dL[k] += dM[k] + dS[k];
+                dR[k] += dM[k] - dS[k];
             }
         }
 
-        if (allFull)
-        {
-            stage (L, 0);
-            if (R != nullptr) stage (R, 1);
-            return;
-        }
-
-        float* iL = insBuf[0].data();
-        float* iR = insBuf[1].data();
         for (int k = 0; k < n; ++k)
         {
-            const double keep = 1.0 - std::clamp (a0 + dir * (double) (pos + k + 1), 0.0, 1.0);   // ALL 페이드
-            cL[k] = (float) (keep * cL[k]);
-            iL[k] = L[k] - cL[k];
-            if (R != nullptr)
-            {
-                cR[k] = (float) (keep * cR[k]);
-                iR[k] = R[k] - cR[k];
-            }
-        }
-        stage (iL, 0);
-        if (R != nullptr) stage (iR, 1);
-        for (int k = 0; k < n; ++k)
-        {
-            L[k] = cL[k] + iL[k];
-            if (R != nullptr) R[k] = cR[k] + iR[k];
+            L[k] += dL[k];
+            if (R != nullptr) R[k] += dR[k];
         }
     }
 
@@ -1910,10 +2266,9 @@ private:
         outGain.setTimeConstant (smoothingSeconds, fs);  outGain.eps = 1.0e-7;
     }
 
-    double fs = 48000.0, smoothingSeconds = 0.015, allStep = 0.003;
-    std::array<double, 2> allAlpha { 0.0, 1.0 }, allStart { 0.0, 1.0 }, allDir { 0.0, 0.0 };
-    std::array<bool, 2>   allTarget { false, true }, stageOn { false, false };
-    std::array<std::array<float, kChunk>, 2> cBuf {}, insBuf {};
+    double fs = 48000.0, smoothingSeconds = 0.015;
+    std::array<bool, 2> stageOn { false, false };
+    std::array<std::array<float, kChunk>, 2> dBuf {}, msBuf {}, msDelta {};
     int numCh = 2;
     std::uint64_t sampleCounter = 0;
     std::array<BandProcessor, kMaxBands> bands;
@@ -1925,8 +2280,8 @@ private:
 
 //==============================================================================
 //  GUI 응답 곡선 (실제 처리와 같은 계수로 계산)
-//   포함: 밴드, 트랜스포머 고역 셸프(선형 부분, ALL이 아니면 XFMR 밴드 영역에만), Mix 블렌드
-//   제외: 튜브/트랜스포머 비선형 성분(기준 레벨에서 이득 1), Output
+//   포함: 밴드, 트랜스포머(ALL)의 고역 셸프(선형 부분), Mix 블렌드
+//   제외: 튜브 · 트랜스포머의 비선형 성분 (밴드 아날로그 포함, 기준 레벨에서 이득 1), Output
 //   뷰: Stereo = 스테레오 밴드만, Left/Right/Mid/Side = 스테레오 밴드 + 그 채널 밴드
 //       (L/R 밴드와 M/S 밴드를 함께 쓰면 실제로는 서로 섞이므로 표시는 근사)
 //==============================================================================
@@ -1936,7 +2291,6 @@ public:
     ResponseModel (const Params& p, double sampleRate) noexcept
         : fs (sampleRate > 0.0 ? sampleRate : 48000.0)
     {
-        bool anyXf = false;
         for (size_t i = 0; i < p.bands.size(); ++i)
         {
             const auto& b = p.bands[i];
@@ -1944,18 +2298,9 @@ public:
             place[i]  = b.place;
             if (active[i])
                 designs[i] = designBand (b.type, b.freq, b.gain, b.q, b.slope, fs);
-            xfRegion[i] = active[i] && b.xfmr;
-            if (xfRegion[i])
-            {
-                anyXf = true;
-                regionAll[i] = regionIsAll (b.type);
-                regions[i]   = makeRegion (b.type, b.freq, b.q, fs);
-            }
         }
-        xfAll = p.xfAll;
-        const bool xfOn = p.xfAll || anyXf;
         shelf = makeHighShelfMatched (TransformerStage::kShelfHz, TransformerStage::kShelfQ,
-                                      -TransformerStage::kShelfMaxCutDb * (xfOn ? clamp01 (p.xfHigh) : 0.0), fs);
+                                      -TransformerStage::kShelfMaxCutDb * (p.xfAll ? clamp01 (p.xfHigh) : 0.0), fs);
         mix = clamp01 (p.mix);
     }
 
@@ -1982,31 +2327,15 @@ public:
         return h;
     }
 
-    // 트랜스포머의 선형 부분: 1 + (S - 1) U,  U = 트랜스포머가 걸리는 부분 (ALL이면 1)
-    std::complex<double> transformerResponse (double f, Placement view = Placement::Stereo) const noexcept
-    {
-        const auto S = svfResponse (shelf, f, fs);
-        if (xfAll)
-            return S;
-        std::complex<double> outside (1.0, 0.0);
-        for (size_t i = 0; i < xfRegion.size(); ++i)
-            if (xfRegion[i] && (place[i] == Placement::Stereo || place[i] == view))
-                outside *= regionAll[i] ? std::complex<double> (0.0, 0.0) : 1.0 - svfResponse (regions[i], f, fs);
-        return 1.0 + (S - 1.0) * (1.0 - outside);
-    }
-
     double magnitudeDb (double f, Placement view = Placement::Stereo) const noexcept
     {
-        const auto h = (1.0 - mix) + mix * eqResponse (f, view) * transformerResponse (f, view);
+        const auto h = (1.0 - mix) + mix * eqResponse (f, view) * svfResponse (shelf, f, fs);
         return 20.0 * std::log10 (std::max (std::abs (h), 1.0e-12));
     }
 
 private:
     double fs, mix = 1.0;
-    bool xfAll = true;
     SvfCoeffs shelf;
-    std::array<bool, kMaxBands> xfRegion {}, regionAll {};
-    std::array<SvfCoeffs, kMaxBands> regions {};
     std::array<bool, kMaxBands> active {};
     std::array<Placement, kMaxBands> place {};
     std::array<BandDesign, kMaxBands> designs {};

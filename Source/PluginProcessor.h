@@ -15,11 +15,14 @@ namespace pillow::ids
     inline constexpr const char* drive   = "drive";     // EF804S 드라이브 (v0.4까지는 모듈 1의 드라이브)
     inline constexpr const char* focus   = "focus";
     inline constexpr const char* mix     = "mix";
+    inline constexpr const char* output  = "output";    // 최종 출력 (v0.4까지는 모듈 1의 Level)
+    inline constexpr const char* xfAll   = "xfAll";     // v0.6: 트랜스포머를 신호 전체에 (ALL)
+    inline constexpr const char* xfAmount = "xfAmount"; // v0.7: 트랜스포머(ALL) 양 하나
+
+    // v0.6까지의 트랜스포머 구간별 양 (v0.7에서 xfAmount 하나로 바뀜, 세션 변환에만 사용)
     inline constexpr const char* xfLow   = "xfLow";
     inline constexpr const char* xfMid   = "xfMid";
     inline constexpr const char* xfHigh  = "xfHigh";
-    inline constexpr const char* output  = "output";    // 최종 출력 (v0.4까지는 모듈 1의 Level)
-    inline constexpr const char* xfAll   = "xfAll";     // v0.6: 트랜스포머를 신호 전체에 (ALL)
 
     // 밴드 항목 — 실제 ID는 band (i, 항목) = "b1_freq" ... "b16_place"
     inline constexpr const char* used  = "used";
@@ -32,6 +35,8 @@ namespace pillow::ids
     inline constexpr const char* place = "place";
     inline constexpr const char* tube  = "tube";        // v0.6: 이 밴드 부분을 EF804S로
     inline constexpr const char* xfmr  = "xfmr";        // v0.6: 이 밴드 부분을 트랜스포머로
+    // v0.7: 밴드마다의 튜브 설정은 전역과 같은 이름 (b1_drive, b1_focus, b1_mix), 트랜스포머 양은 b1_xfamt
+    inline constexpr const char* xfAmt = "xfamt";
 
     inline juce::String band (int index, const char* field)
     {
@@ -139,6 +144,9 @@ public:
     // v0.4 이하 세션(모듈 방식)을 밴드로 바꿈. 바꿨으면 true (테스트에서도 사용)
     static bool migrateLegacyState (juce::ValueTree& state);
 
+    // v0.6 이하 -> v0.7: 트랜스포머 LOW/MID/HIGH -> AMOUNT 하나, 밴드 TUBE/XFMR -> 밴드마다의 설정. 바꿨으면 true
+    static bool migrateAnalogState (juce::ValueTree& state);
+
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     juce::AudioProcessorValueTreeState apvts;
 
@@ -168,6 +176,10 @@ private:
         std::atomic<float>* place = nullptr;
         std::atomic<float>* tube  = nullptr;
         std::atomic<float>* xfmr  = nullptr;
+        std::atomic<float>* drive = nullptr;
+        std::atomic<float>* focus = nullptr;
+        std::atomic<float>* mix   = nullptr;
+        std::atomic<float>* xfAmt = nullptr;
     };
 
     std::atomic<float>* paramQuality = nullptr;
@@ -176,9 +188,7 @@ private:
     std::atomic<float>* paramDrive   = nullptr;
     std::atomic<float>* paramFocus   = nullptr;
     std::atomic<float>* paramMix     = nullptr;
-    std::atomic<float>* paramXfLow   = nullptr;
-    std::atomic<float>* paramXfMid   = nullptr;
-    std::atomic<float>* paramXfHigh  = nullptr;
+    std::atomic<float>* paramXfAmount = nullptr;
     std::atomic<float>* paramOutput  = nullptr;
     std::atomic<float>* paramXfAll   = nullptr;
     std::array<BandPtrs, pillow::rz::kMaxBands> bandPtrs;

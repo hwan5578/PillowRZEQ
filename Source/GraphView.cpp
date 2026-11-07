@@ -537,22 +537,22 @@ void GraphView::paint (juce::Graphics& g)
             g.setFont (uiFont (10.5f, true));
             g.drawText (juce::String (i + 1), circle, juce::Justification::centred, false);
 
-            // 이 밴드 부분을 튜브 · 트랜스포머로 보냄 (ALL이 켜져 있으면 이미 전체가 지나가므로 흐리게)
+            // 이 밴드만의 튜브 · 트랜스포머 (밴드가 꺼져 있으면 흐리게)
             const float dotY = c.y + r + 5.0f;
-            auto dot = [&] (float x, juce::Colour dc, bool redundant)
+            auto dot = [&] (float x, juce::Colour dc)
             {
                 g.setColour (palette::graphBg);
                 g.fillEllipse (juce::Rectangle<float> (8.0f, 8.0f).withCentre ({ x, dotY }));
-                g.setColour (dc.withAlpha (redundant || inert ? 0.4f : 1.0f));
+                g.setColour (dc.withAlpha (inert ? 0.4f : 1.0f));
                 g.fillEllipse (juce::Rectangle<float> (6.0f, 6.0f).withCentre ({ x, dotY }));
             };
             if (b.tube && b.xfmr)
             {
-                dot (c.x - 4.0f, juce::Colour (0xffff8f4f), params.driveOn);
-                dot (c.x + 4.0f, palette::accent2, params.xfAll);
+                dot (c.x - 4.0f, juce::Colour (0xffff8f4f));
+                dot (c.x + 4.0f, palette::accent2);
             }
-            else if (b.tube) dot (c.x, juce::Colour (0xffff8f4f), params.driveOn);
-            else if (b.xfmr) dot (c.x, palette::accent2, params.xfAll);
+            else if (b.tube) dot (c.x, juce::Colour (0xffff8f4f));
+            else if (b.xfmr) dot (c.x, palette::accent2);
 
             if (b.place != rz::Placement::Stereo)
             {
@@ -605,8 +605,8 @@ void GraphView::paint (juce::Graphics& g)
             if (rz::typeHasSlope (b.type)) text += "   " + pillow::slopeNames()[b.slope];
             if (rz::typeHasQ (b.type))     text += "   Q " + pillow::formatQ (b.q);
             if (b.place != rz::Placement::Stereo) text += "   " + pillow::placementNames()[(int) b.place].toUpperCase();
-            if (b.tube) text += "   TUBE";
-            if (b.xfmr) text += "   XFMR";
+            if (b.tube) text += "   TUBE " + juce::String (juce::roundToInt (b.drive)) + " dB";
+            if (b.xfmr) text += "   XFMR " + juce::String (juce::roundToInt (b.xfAmount * 100.0f)) + " %";
             if (! b.on) text += "   OFF";
             col = bandColour (shownBand);
         }

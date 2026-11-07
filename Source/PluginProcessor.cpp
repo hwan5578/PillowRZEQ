@@ -106,8 +106,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { pillow::ids::driveOn, 2 }, "Tube All", false));
 
+    // v0.7: 기본은 꺼짐 (켜면 AMOUNT 50 %). v0.6 이하 세션은 migrateAnalogState에서 예전 소리 그대로 맞춤
     layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { pillow::ids::xfAll, 6 }, "Transformer All", true));
+        juce::ParameterID { pillow::ids::xfAll, 6 }, "Transformer All", false));
 
     layout.add (std::make_unique<FloatParam> (
         juce::ParameterID { pillow::ids::drive, 2 }, "Drive",
@@ -121,17 +122,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
         juce::ParameterID { pillow::ids::mix, 2 }, "Mix",
         Range (0.0f, 100.0f, 0.1f), 100.0f, percentAttr()));
 
+    // v0.7: 구간별(LOW · MID · HIGH) 양 3개 대신 하나 (구간 나누기는 안에서 그대로)
     layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::xfLow, 2 }, "Transformer Low",
-        Range (0.0f, 100.0f, 0.1f), 0.0f, percentAttr()));
-
-    layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::xfMid, 2 }, "Transformer Mid",
-        Range (0.0f, 100.0f, 0.1f), 0.0f, percentAttr()));
-
-    layout.add (std::make_unique<FloatParam> (
-        juce::ParameterID { pillow::ids::xfHigh, 2 }, "Transformer High",
-        Range (0.0f, 100.0f, 0.1f), 0.0f, percentAttr()));
+        juce::ParameterID { pillow::ids::xfAmount, 7 }, "Transformer Amount",
+        Range (0.0f, 100.0f, 0.1f), 50.0f, percentAttr()));
 
     layout.add (std::make_unique<FloatParam> (
         juce::ParameterID { pillow::ids::output, 1 }, "Output",
@@ -179,6 +173,23 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
 
         layout.add (std::make_unique<juce::AudioParameterBool> (
             juce::ParameterID { band (i, pillow::ids::xfmr), 6 }, n + "Transformer", false));
+
+        // v0.7: 밴드마다의 튜브 · 트랜스포머 설정
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::drive), 7 }, n + "Tube Drive",
+            Range (0.0f, rz::kDriveMaxDb, 0.01f), 18.0f, driveAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::focus), 7 }, n + "Tube Focus",
+            Range (-100.0f, 100.0f, 0.1f), 0.0f, focusAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::mix), 7 }, n + "Tube Mix",
+            Range (0.0f, 100.0f, 0.1f), 100.0f, percentAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::xfAmt), 7 }, n + "Transformer Amount",
+            Range (0.0f, 100.0f, 0.1f), 50.0f, percentAttr()));
     }
 
     return layout;
@@ -197,15 +208,13 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
     paramDrive   = apvts.getRawParameterValue (pillow::ids::drive);
     paramFocus   = apvts.getRawParameterValue (pillow::ids::focus);
     paramMix     = apvts.getRawParameterValue (pillow::ids::mix);
-    paramXfLow   = apvts.getRawParameterValue (pillow::ids::xfLow);
-    paramXfMid   = apvts.getRawParameterValue (pillow::ids::xfMid);
-    paramXfHigh  = apvts.getRawParameterValue (pillow::ids::xfHigh);
+    paramXfAmount = apvts.getRawParameterValue (pillow::ids::xfAmount);
     paramOutput  = apvts.getRawParameterValue (pillow::ids::output);
     paramXfAll   = apvts.getRawParameterValue (pillow::ids::xfAll);
 
     jassert (paramQuality != nullptr && paramEqOn != nullptr && paramDriveOn != nullptr && paramDrive != nullptr
-             && paramFocus != nullptr && paramMix != nullptr && paramXfLow != nullptr && paramXfMid != nullptr
-             && paramXfHigh != nullptr && paramOutput != nullptr && paramXfAll != nullptr);
+             && paramFocus != nullptr && paramMix != nullptr && paramXfAmount != nullptr
+             && paramOutput != nullptr && paramXfAll != nullptr);
 
     for (int i = 0; i < rz::kMaxBands; ++i)
     {
@@ -221,9 +230,14 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
         b.place = get (pillow::ids::place);
         b.tube  = get (pillow::ids::tube);
         b.xfmr  = get (pillow::ids::xfmr);
+        b.drive = get (pillow::ids::drive);
+        b.focus = get (pillow::ids::focus);
+        b.mix   = get (pillow::ids::mix);
+        b.xfAmt = get (pillow::ids::xfAmt);
         jassert (b.used != nullptr && b.on != nullptr && b.type != nullptr && b.freq != nullptr
                  && b.gain != nullptr && b.q != nullptr && b.slope != nullptr && b.place != nullptr
-                 && b.tube != nullptr && b.xfmr != nullptr);
+                 && b.tube != nullptr && b.xfmr != nullptr && b.drive != nullptr && b.focus != nullptr
+                 && b.mix != nullptr && b.xfAmt != nullptr);
     }
 
     // 모드를 바꾸면 오디오 스레드는 플래그만 세우고, 호스트 알림(setLatencySamples)은 여기 타이머에서
@@ -249,9 +263,7 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
     p.drive    = paramDrive->load();
     p.focus    = paramFocus->load() * 0.01f;
     p.mix      = paramMix->load() * 0.01f;
-    p.xfLow    = paramXfLow->load() * 0.01f;
-    p.xfMid    = paramXfMid->load() * 0.01f;
-    p.xfHigh   = paramXfHigh->load() * 0.01f;
+    p.xfLow    = p.xfMid = p.xfHigh = paramXfAmount->load() * 0.01f;   // ALL: 세 구간에 같은 양
     p.outputDb = paramOutput->load();
     p.xfAll    = paramXfAll->load() >= 0.5f;
 
@@ -267,8 +279,12 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
         b.q     = ptr.q->load();
         b.slope = index (ptr.slope, (int) rz::kCutSlopes.size());
         b.place = (rz::Placement) index (ptr.place, rz::kNumPlacements);
-        b.tube  = ptr.tube->load() >= 0.5f;
-        b.xfmr  = ptr.xfmr->load() >= 0.5f;
+        b.tube     = ptr.tube->load() >= 0.5f;
+        b.xfmr     = ptr.xfmr->load() >= 0.5f;
+        b.drive    = ptr.drive->load();
+        b.focus    = ptr.focus->load() * 0.01f;
+        b.tubeMix  = ptr.mix->load() * 0.01f;
+        b.xfAmount = ptr.xfAmt->load() * 0.01f;
     }
     return p;
 }
@@ -648,6 +664,81 @@ bool PillowRZAudioProcessor::migrateLegacyState (juce::ValueTree& tree)
     return true;
 }
 
+bool PillowRZAudioProcessor::migrateAnalogState (juce::ValueTree& tree)
+{
+    using pillow::ids::band;
+    auto child = [&tree] (const juce::String& id) { return tree.getChildWithProperty ("id", id); };
+    auto has   = [&child] (const juce::String& id) { return child (id).isValid(); };
+    auto value = [&child] (const juce::String& id, double fallback)
+    {
+        const auto c = child (id);
+        return c.isValid() ? (double) c.getProperty ("value", fallback) : fallback;
+    };
+    auto set = [&tree, &child] (const juce::String& id, double v)
+    {
+        auto c = child (id);
+        if (c.isValid()) c.setProperty ("value", v, nullptr);
+        else             tree.appendChild (juce::ValueTree ("PARAM", { { "id", id }, { "value", v } }), nullptr);
+    };
+    auto remove = [&tree, &child] (const juce::String& id)
+    {
+        for (auto c = child (id); c.isValid(); c = child (id))
+            tree.removeChild (c, nullptr);
+    };
+
+    bool changed = false;
+
+    // 1) 트랜스포머: 구간별 양 3개 -> AMOUNT 하나 (가장 큰 값)
+    //    ALL은 v0.5 이하에는 없었음 (= 신호 전체). 양이 다 0이었으면 소리가 없던 것 -> ALL 끔, AMOUNT는 기본값
+    //    v0.6 밴드 XFMR: ALL이 켜져 있었으면 효과가 없었으므로 끔, 아니면 같은 양으로
+    if (! has (pillow::ids::xfAmount)
+        && (has (pillow::ids::xfLow) || has (pillow::ids::xfMid) || has (pillow::ids::xfHigh)))
+    {
+        const double amount  = juce::jlimit (0.0, 100.0, std::max ({ value (pillow::ids::xfLow, 0.0),
+                                                                     value (pillow::ids::xfMid, 0.0),
+                                                                     value (pillow::ids::xfHigh, 0.0) }));
+        const bool   audible = amount > 0.0;
+        const bool   wasAll  = value (pillow::ids::xfAll, 1.0) >= 0.5;
+
+        set (pillow::ids::xfAmount, audible ? amount : 50.0);
+        set (pillow::ids::xfAll, audible && wasAll ? 1.0 : 0.0);
+        for (int i = 0; i < rz::kMaxBands; ++i)
+        {
+            const auto id = band (i, pillow::ids::xfmr);
+            if (! has (id))
+                continue;
+            const bool keep = value (id, 0.0) >= 0.5 && audible && ! wasAll;
+            set (id, keep ? 1.0 : 0.0);
+            if (keep)
+                set (band (i, pillow::ids::xfAmt), amount);
+        }
+        remove (pillow::ids::xfLow);
+        remove (pillow::ids::xfMid);
+        remove (pillow::ids::xfHigh);
+        changed = true;
+    }
+
+    // 2) v0.6 밴드 TUBE (밴드마다의 드라이브가 없던 때): 그때의 전체 DRIVE · FOCUS를 물려받음
+    //    튜브 ALL이 켜져 있었으면 밴드 쪽은 효과가 없었으므로 끔
+    const bool allTube = value (pillow::ids::driveOn, 0.0) >= 0.5;
+    for (int i = 0; i < rz::kMaxBands; ++i)
+    {
+        const auto id = band (i, pillow::ids::tube);
+        if (! has (id) || has (band (i, pillow::ids::drive)))
+            continue;
+        const bool keep = value (id, 0.0) >= 0.5 && ! allTube;
+        set (id, keep ? 1.0 : 0.0);
+        if (keep)
+        {
+            set (band (i, pillow::ids::drive), juce::jlimit (0.0, (double) rz::kDriveMaxDb, value (pillow::ids::drive, 0.0)));
+            set (band (i, pillow::ids::focus), juce::jlimit (-100.0, 100.0, value (pillow::ids::focus, 0.0)));
+            set (band (i, pillow::ids::mix), 100.0);
+        }
+        changed = true;
+    }
+    return changed;
+}
+
 void PillowRZAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
@@ -658,6 +749,7 @@ void PillowRZAudioProcessor::setStateInformation (const void* data, int sizeInBy
                 return;
 
             migrateLegacyState (tree);       // v0.4 이하 -> 같은 곡선의 밴드
+            migrateAnalogState (tree);       // v0.6 이하 -> 트랜스포머 AMOUNT 하나, 밴드마다의 튜브 · 트랜스포머 설정
             fillMissingParameters (tree);
             apvts.replaceState (tree);
         }

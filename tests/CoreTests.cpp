@@ -1,5 +1,5 @@
 // =============================================================================
-//  Pillow RZ EQ v0.6 — DSP 코어 단독 테스트 (JUCE 불필요)
+//  Pillow RZ EQ v0.7 — DSP 코어 단독 테스트 (JUCE 불필요)
 //
 //    빌드:  g++ -std=c++17 -O2 -I../Source CoreTests.cpp -o CoreTests
 //    실행:  ./CoreTests            (모든 테스트)
@@ -129,8 +129,12 @@ static BandParams randomBand (std::mt19937& rng, unsigned typeMask = 0x7Fu, bool
     BandType t;
     do { t = (BandType) (int) (u (rng) * (float) kNumBandTypes * 0.9999f); } while (! (typeMask & (1u << (int) t)));
     const auto pl = anyPlacement ? (Placement) (int) (u (rng) * (float) kNumPlacements * 0.9999f) : Placement::Stereo;
-    return makeBand (t, logRandom (rng, 30.0, 16000.0), -maxGain + 2.0 * maxGain * u (rng), logRandom (rng, 0.2, 8.0),
-                     pl, (int) (u (rng) * 7.999f));
+    // 함수 인자의 계산 순서는 컴파일러마다 다름 (GCC · MSVC는 오른쪽부터, Clang은 왼쪽부터) -> 뽑는 순서를 고정
+    const int    slope = (int) (u (rng) * 7.999f);
+    const float  q     = logRandom (rng, 0.2, 8.0);
+    const double gain  = -maxGain + 2.0 * maxGain * u (rng);
+    const float  freq  = logRandom (rng, 30.0, 16000.0);
+    return makeBand (t, freq, gain, q, pl, slope);
 }
 
 // 모든 기능을 무작위로 (스트레스·블록 크기 테스트용)
@@ -153,8 +157,12 @@ static Params randomParams (std::mt19937& rng)
         {
             b = randomBand (rng, 0x7Fu, true, 12.0);
             b.on = u (rng) < 0.85f;
-            b.tube = u (rng) < 0.3f;
-            b.xfmr = u (rng) < 0.3f;
+            b.tube     = u (rng) < 0.3f;
+            b.drive    = 48.0f * u (rng);
+            b.focus    = -1.0f + 2.0f * u (rng);
+            b.tubeMix  = u (rng) < 0.3f ? u (rng) : 1.0f;
+            b.xfmr     = u (rng) < 0.3f;
+            b.xfAmount = u (rng);
         }
     return p;
 }
@@ -283,7 +291,7 @@ static void testBandShapes()
 //------------------------------------------------------------------------------
 static void testAnalyticMatchesProcessing()
 {
-    std::printf ("[3] GUI 해석 곡선 == 실제 처리 응답 (모든 모양, 트랜스포머 셸프(밴드 영역 포함)·Mix)\n");
+    std::printf ("[3] GUI 해석 곡선 == 실제 처리 응답 (모든 모양, 트랜스포머 셸프·Mix)\n");
     std::mt19937 rng (42);
     std::uniform_real_distribution<float> u (0.0f, 1.0f);
     double worst = 0.0;
@@ -295,12 +303,7 @@ static void testAnalyticMatchesProcessing()
             for (int i = 0; i < nb; ++i)
                 p.bands[(size_t) (i * 2 + (t % 2))] = randomBand (rng);   // 빈 칸 섞어서
             p.xfHigh = u (rng) < 0.5f ? u (rng) : 0.0f;
-            if (u (rng) < 0.5f)                                             // 트랜스포머를 일부 밴드 영역에만
-            {
-                p.xfAll = false;
-                p.xfHigh = 0.5f + 0.5f * u (rng);
-                for (auto& b : p.bands) b.xfmr = b.used && u (rng) < 0.5f;
-            }
+            p.xfAll  = u (rng) < 0.7f;                                      // 트랜스포머(ALL) 셸프 켜기/끄기
             p.mix    = u (rng) < 0.4f ? 0.3f + 0.7f * u (rng) : 1.0f;
             const auto h = impulseResponse (p, fs, (int) (fs * 0.6), 1.0f, 1.0f, 0);
             const ResponseModel m (p, fs);
@@ -487,6 +490,27 @@ static void testSampleRateConsistency()
         }
     std::printf ("    44.1/48k 하이 컷 차단점 오차 %.4f dB, 노치 중심 %.1f dB\n", wCut, wNotch);
     CHECK (wCut < 0.01 && wNotch < -60.0, "session-rate cut/notch %.4f %.1f", wCut, wNotch);
+
+    // 틸트 (1차): 축 10 Hz ~ 30 kHz, +-24 dB, 세션 레이트 44.1 ~ 192k 전체에서 아날로그 곡선과
+    double wTilt = 0.0, wTiltNormal = 0.0, tiltAtPivot = 0.0;
+    for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        for (double pivot = 10.0; pivot <= 30000.0; pivot *= 1.25)
+            for (double g = -24.0; g <= 24.0; g += 3.0)
+            {
+                const ResponseModel m = single (makeBand (BandType::Tilt, pivot, g, 1.0), sr);
+                for (double f : logFreqs (20.0, std::min (20000.0, 0.499 * sr), 200))
+                {
+                    const double d = std::abs (m.magnitudeDb (f) - 10.0 * std::log10 (tiltAnalogMag2 (pivot, g, f)));
+                    wTilt = std::max (wTilt, d);
+                    if (pivot <= 3000.0 && std::abs (g) <= 15.0)
+                        wTiltNormal = std::max (wTiltNormal, d);
+                }
+                if (pivot < 0.25 * sr)
+                    tiltAtPivot = std::max (tiltAtPivot, std::abs (m.magnitudeDb (pivot)));
+            }
+    std::printf ("    틸트 세션 레이트: 아날로그 대비 최대 %.3f dB (축 3 kHz 이하 +-15 dB: %.3f dB), 축에서 %.4f dB\n",
+                 wTilt, wTiltNormal, tiltAtPivot);
+    CHECK (wTilt < 1.0 && wTiltNormal < 0.45 && tiltAtPivot < 1e-6, "session-rate tilt %.3f / %.3f / %.2g", wTilt, wTiltNormal, tiltAtPivot);
 }
 
 //------------------------------------------------------------------------------
@@ -593,28 +617,43 @@ static void testClicks()
         add ("Output 0 -> -12 dB", a, b);
     }
     {
-        Params a; a.drive = 30; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0); Params b = a; b.bands[0].tube = true;
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0); a.bands[0].drive = 30; Params b = a; b.bands[0].tube = true;
         add ("Band tube on (drive 30)", a, b);
     }
     {
         Params a; a.drive = 30; a.driveOn = true; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0); a.bands[0].tube = true;
         Params b = a; b.driveOn = false;
-        add ("Tube ALL -> band only", a, b);
+        add ("Tube ALL off, band tube stays", a, b);
     }
     {
-        Params a; a.drive = 30; a.bands[0] = makeBand (BandType::LowShelf, 400, 6, 1.0); a.bands[0].tube = true;
+        Params a; a.bands[0] = makeBand (BandType::LowShelf, 400, 6, 1.0); a.bands[0].tube = true; a.bands[0].drive = 30;
         Params b = a; b.bands[0].used = false;
         add ("Delete band with tube", a, b);
     }
     {
-        Params a; a.drive = 30; a.bands[0] = makeBand (BandType::Bell, 300, 6, 1.0); a.bands[0].tube = true;
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 6, 1.0); a.bands[0].tube = true; a.bands[0].drive = 30;
         Params b = a; b.bands[0].type = BandType::LowShelf;
         add ("Tube band shape change", a, b);
     }
     {
-        Params a; a.xfAll = false; a.xfLow = 1; a.xfMid = 1; a.xfHigh = 1; a.bands[0] = makeBand (BandType::LowShelf, 400, 0, 1.0);
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 3, 1.0); a.bands[0].tube = true; a.bands[0].drive = 12;
+        Params b = a; b.bands[0].drive = 36;
+        add ("Band drive 12 -> 36 dB", a, b);
+    }
+    {
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 3, 1.0); a.bands[0].tube = true; a.bands[0].drive = 30; a.bands[0].tubeMix = 0;
+        Params b = a; b.bands[0].tubeMix = 1;
+        add ("Band tube mix 0 -> 100 %", a, b);
+    }
+    {
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0); a.bands[0].tube = true; a.bands[0].focus = -1;
+        a.bands[0].drive = 30; Params b = a; b.bands[0].focus = 1;
+        add ("Band focus odd -> even", a, b);
+    }
+    {
+        Params a; a.bands[0] = makeBand (BandType::LowShelf, 400, 0, 1.0); a.bands[0].xfAmount = 1;
         Params b = a; b.bands[0].xfmr = true;
-        add ("Band transformer on", a, b);
+        add ("Band transformer on (100 %)", a, b);
     }
     for (auto& c : cases)
     {
@@ -736,6 +775,27 @@ static void testEf804sCurve()
     std::printf ("    룩업 오차: 최대 %.2e (절대), 작은 신호 %.2e (상대)\n", worstAbs, worstRel);
     CHECK (worstAbs < 1e-4, "LUT abs error %.2e", worstAbs);
     CHECK (worstRel < 1e-6, "LUT small-signal rel error %.2e", worstRel);
+
+    // 오디오 루프용 홀수·짝수 표 (evalParts) == 원래 조회 (evalPair) — 표 안 · 밖 · 음수 · 아주 작은 값
+    {
+        double worst = 0.0;
+        for (int t = 0; t < 20000; ++t)
+        {
+            const double mag = std::pow (10.0, -6.0 + 9.5 * (double) t / 20000.0);   // 1e-6 .. 3e3 V
+            for (double v : { mag, -mag })
+            {
+                double dp, dn, pp, pn, dO, dE, pO, pE;
+                c.evalPair (v, dp, dn, pp, pn);
+                c.evalParts (v, dO, dE, pO, pE);
+                const double scaleD = 1e-12 * (1.0 + std::abs (dp) + std::abs (dn));
+                const double scaleP = 1e-12 * (1.0 + std::abs (pp) + std::abs (pn));
+                worst = std::max ({ worst, std::abs (dO - 0.5 * (dp - dn)) / scaleD, std::abs (dE - 0.5 * (dp + dn)) / scaleD,
+                                    std::abs (pO - 0.5 * (pp + pn)) / scaleP, std::abs (pE - 0.5 * (pp - pn)) / scaleP });
+            }
+        }
+        std::printf ("    홀수·짝수 표 == 원래 조회: 최대 차이 %.2f (단위 1e-12)\n", worst);
+        CHECK (worst < 1.0, "evalParts must match evalPair (%.2f)", worst);
+    }
 
     // 그리드 진폭별 왜곡 (Python 계산과 같은 수치가 나와야 함)
     auto curveThd = [&] (double amp, double* h2db, double* h3db) {
@@ -866,6 +926,43 @@ static void testTransformer()
     CHECK (hi8k.thd > 1.0 && hi8k.thd < 6.0, "high band THD %.2f", hi8k.thd);
     CHECK (hi1k.thd < hi8k.thd / 5.0, "high band must stay in the highs");
     CHECK (std::abs (low60.dc) < 1e-3 && std::abs (mid1k.dc) < 1e-3, "transformer DC");
+
+    // 곡선 표 (오디오 루프용) == 식: h, H, 그리고 ADAA가 쓰는 (H(b) - H(a)) / (b - a)
+    {
+        const auto& tc = transformerCurves();
+        double worstH = 0.0, worstCapH = 0.0, worstQ = 0.0, worstSmallQ = 0.0;
+        for (int c = 0; c < TransformerCurves::kNumCurves; ++c)
+        {
+            const auto curve = (TransformerCurves::Curve) c;
+            for (int k = 0; k <= 40000; ++k)
+            {
+                const double u = -10.0 + 20.0 * (double) k / 40000.0 + 1.234e-6;   // 표 밖(|u| > 8)도
+                double h, H, he, He;
+                tc.eval (curve, tc.at (u), h, H);
+                TransformerCurves::exact (curve, u, he, He);
+                worstH    = std::max (worstH, std::abs (h - he));
+                worstCapH = std::max (worstCapH, std::abs (H - He));
+
+                const double du = 1.0e-3;   // 기울기(ADAA 몫)도 격자 사이에서 맞아야 함
+                double h2, H2, he2, He2;
+                tc.eval (curve, tc.at (u + du), h2, H2);
+                TransformerCurves::exact (curve, u + du, he2, He2);
+                worstQ = std::max (worstQ, std::abs ((H2 - H) / du - (He2 - He) / du));
+            }
+            // 아주 작은 신호: 가짜 선형 이득이 없어야 함. 몫 / 진폭은 원래 a (짝수) · a^2 (홀수)에 비례해
+            // 0으로 가야 함 (MID 짝수 성분: 1e-5에서 약 3e-7). 3차 보간이면 여기서 약 3e-4가 나옴
+            for (double a : { 1e-6, 1e-5 })
+            {
+                double h, H, h2, H2;
+                tc.eval (curve, tc.at (a), h, H);
+                tc.eval (curve, tc.at (0.5 * a), h2, H2);
+                worstSmallQ = std::max (worstSmallQ, std::abs ((H - H2) / (0.5 * a)) / a);
+            }
+        }
+        std::printf ("    곡선 표 == 식: h %.1e, H %.1e, ADAA 몫 %.1e, 작은 신호 몫/진폭 %.1e\n", worstH, worstCapH, worstQ, worstSmallQ);
+        CHECK (worstH < 5e-8 && worstCapH < 1e-10 && worstQ < 1e-7 && worstSmallQ < 1e-6,
+               "transformer tables must match the formulas");
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -1291,6 +1388,12 @@ static void testRobustness()
         double dp, dn, pp, pn;
         c.evalPair (nan, dp, dn, pp, pn);
         CHECK (std::isnan (c.dev (nan)) && std::isnan (c.psi (nan)) && std::isnan (dp) && std::isnan (pp), "NaN must stay NaN");
+        double dO, dE, pO, pE;
+        c.evalParts (nan, dO, dE, pO, pE);
+        double th, tH;
+        const auto& tc = transformerCurves();
+        tc.eval (TransformerCurves::MidOdd, tc.at (nan), th, tH);
+        CHECK (std::isnan (dO) && std::isnan (pE) && std::isnan (th) && std::isnan (tH), "NaN must stay NaN (fast tables)");
         TubeStage t;
         t.prepare (fs);
         t.setTargets (true, 30.0, 0.0);
@@ -1336,7 +1439,7 @@ static void runEngine (const Params& p, double fs, std::vector<float>& L, std::v
 
 static void testBandTubeRegions()
 {
-    std::printf ("[18] 밴드별 튜브 · 트랜스포머 (그 밴드의 주파수 부분만)\n");
+    std::printf ("[18] 밴드마다의 튜브 · 트랜스포머 (그 밴드 부분만, 밴드마다 드라이브 · 포커스 · 믹스 · 양)\n");
     const double fs = 96000.0;
     const int len = (int) fs, mStart = len / 2, mLen = len / 2;   // 뒤쪽 0.5 s 측정 (2 Hz 단위 정수 주기)
 
@@ -1347,44 +1450,78 @@ static void testBandTubeRegions()
             x[(size_t) i] = (float) (a * std::sin (2.0 * kPi * f1 * i / fs) + a * std::sin (2.0 * kPi * f2 * i / fs));
         return x;
     };
-    // f1, f2 각각의 2·3차 배음 (기본파 대비 dBc, 큰 쪽)
-    auto harm = [&] (const std::vector<float>& y, double f)
+    auto harm = [&] (const std::vector<float>& y, double f)   // 2 · 3차 배음 중 큰 것 (기본파 대비 dBc)
     {
         const double f0 = toneDb (y, fs, f, mStart, mLen);
         return std::max (toneDb (y, fs, 2.0 * f, mStart, mLen), toneDb (y, fs, 3.0 * f, mStart, mLen)) - f0;
     };
+    auto tubeBand = [] (BandType t, double f, double q, float drive, Placement pl = Placement::Stereo)
+    {
+        auto b = makeBand (t, f, 0.0, q, pl);
+        b.tube = true;
+        b.drive = drive;
+        return b;
+    };
 
-    Params base;
-    base.drive = 36.0f;
-    base.focus = 0.3f;
     const auto x = twoTone (100.0, 3000.0, 0.3);
-
     auto run = [&] (const Params& p) { auto L = x, R = x; runEngine (p, fs, L, R); return L; };
 
-    Params all = base;   all.driveOn = true;
-    Params bell = base;  bell.bands[0] = makeBand (BandType::Bell, 3000.0, 0.0, 2.0);  bell.bands[0].tube = true;
-    Params shelf = base; shelf.bands[0] = makeBand (BandType::LowShelf, 150.0, 0.0, 1.0); shelf.bands[0].tube = true;
+    Params all;     all.driveOn = true; all.drive = 36.0f;
+    Params bell;    bell.bands[0]  = tubeBand (BandType::Bell, 3000.0, 2.0, 36.0f);
+    Params shelf;   shelf.bands[0] = tubeBand (BandType::LowShelf, 150.0, 1.0, 36.0f);
+    Params shelf12; shelf12.bands[0] = tubeBand (BandType::LowShelf, 150.0, 1.0, 12.0f);
+    Params both;    both.bands[0] = bell.bands[0]; both.bands[1] = shelf12.bands[0];
 
-    const auto yAll = run (all), yBell = run (bell), yShelf = run (shelf);
-    std::printf ("    100 Hz + 3 kHz, Drive 36: ALL -> 100 Hz 배음 %.1f / 3 kHz 배음 %.1f dBc\n", harm (yAll, 100.0), harm (yAll, 3000.0));
-    std::printf ("      벨 3 kHz만 TUBE -> 100 Hz 배음 %.1f / 3 kHz 배음 %.1f dBc\n", harm (yBell, 100.0), harm (yBell, 3000.0));
-    std::printf ("      로우 셸프 150 Hz만 TUBE -> 100 Hz 배음 %.1f / 3 kHz 배음 %.1f dBc\n", harm (yShelf, 100.0), harm (yShelf, 3000.0));
-    CHECK (harm (yAll, 100.0) > -60.0 && harm (yAll, 3000.0) > -60.0, "ALL saturates both tones");
-    // 영역 밖 성분은 영역 필터(밴드패스 Q 2면 100 Hz에서 -35 dB)로 새어 들어간 만큼만 -> ALL보다 50 dB 이상 깨끗
+    const auto yAll = run (all), yBell = run (bell), yShelf = run (shelf), yShelf12 = run (shelf12), yBoth = run (both);
+    std::printf ("    100 Hz + 3 kHz: ALL(36 dB) -> 100 Hz 배음 %.1f / 3 kHz 배음 %.1f dBc\n", harm (yAll, 100.0), harm (yAll, 3000.0));
+    std::printf ("      벨 3 kHz만 TUBE 36 dB -> 100 Hz %.1f / 3 kHz %.1f dBc\n", harm (yBell, 100.0), harm (yBell, 3000.0));
+    std::printf ("      로우 셸프 150 Hz만 TUBE 36 dB -> 100 Hz %.1f / 3 kHz %.1f dBc\n", harm (yShelf, 100.0), harm (yShelf, 3000.0));
+    std::printf ("      둘 다 (벨 36 dB + 셸프 12 dB) -> 3 kHz %.1f (벨만 %.1f), 100 Hz %.1f (셸프 12 dB만 %.1f) dBc\n",
+                 harm (yBoth, 3000.0), harm (yBell, 3000.0), harm (yBoth, 100.0), harm (yShelf12, 100.0));
     CHECK (harm (yBell, 3000.0) > -60.0 && harm (yBell, 100.0) < harm (yAll, 100.0) - 50.0, "bell region: only 3 kHz saturated");
     CHECK (harm (yShelf, 100.0) > -60.0 && harm (yShelf, 3000.0) < harm (yAll, 3000.0) - 50.0, "shelf region: only 100 Hz saturated");
+    CHECK (std::abs (harm (yBoth, 3000.0) - harm (yBell, 3000.0)) < 1.0 && std::abs (harm (yBoth, 100.0) - harm (yShelf12, 100.0)) < 1.0,
+           "each band keeps its own drive");
+    CHECK (harm (yShelf, 100.0) > harm (yShelf12, 100.0) + 10.0, "band drive changes the amount");
 
-    // ALL이 켜져 있으면 밴드 TUBE를 켜도 두 번 걸리지 않음 (비트 단위로 같음)
-    Params allPlus = all;
-    allPlus.bands[0] = bell.bands[0];
-    CHECK (run (allPlus) == yAll, "ALL + band tube must equal ALL alone");
+    // 밴드 튜브 MIX: 0이면 비트 단위 그대로, 50 %면 배음이 6 dB 작음
+    {
+        Params m0 = bell;  m0.bands[0].tubeMix = 0.0f;
+        Params m5 = bell;  m5.bands[0].tubeMix = 0.5f;
+        CHECK (run (m0) == x, "band tube mix 0 -> bit-exact");
+        const auto y5 = run (m5);
+        const double d = (toneDb (yBell, fs, 9000.0, mStart, mLen) - toneDb (y5, fs, 9000.0, mStart, mLen));
+        std::printf ("      벨 TUBE MIX 50 %% -> 3차 배음 %.2f dB 작아짐\n", d);
+        CHECK (std::abs (d - 6.02) < 0.5, "band tube mix 50%% halves the coloration (%.2f dB)", d);
+    }
+
+    // 밴드 FOCUS: 홀수 쪽(-1)이면 짝수 배음이 거의 없음
+    {
+        Params odd = bell;  odd.bands[0].focus = -1.0f;
+        Params even = bell; even.bands[0].focus = 1.0f;
+        const auto yo = run (odd), ye = run (even);
+        const double h2o = toneDb (yo, fs, 6000.0, mStart, mLen), h2e = toneDb (ye, fs, 6000.0, mStart, mLen);
+        std::printf ("      벨 FOCUS 홀수 -> 2차 %.1f dB, 짝수 -> 2차 %.1f dB\n", h2o, h2e);
+        CHECK (h2e > h2o + 40.0, "band focus controls even harmonics");
+    }
+
+    // ALL과 같이 켜면 밴드 쪽 착색이 더해짐 (v0.7: 밴드마다 따로)
+    {
+        Params a12;  a12.driveOn = true; a12.drive = 12.0f;
+        Params a12b = a12; a12b.bands[0] = bell.bands[0];
+        const double ha = harm (run (a12), 3000.0), hb = harm (run (a12b), 3000.0);
+        std::printf ("      ALL 12 dB -> 3 kHz %.1f dBc, ALL 12 dB + 벨 TUBE 36 dB -> %.1f dBc\n", ha, hb);
+        CHECK (hb > ha + 10.0, "band tube adds to ALL");
+    }
 
     // 아무 데도 안 걸면 (밴드 게인 0) 비트 단위로 그대로
-    Params none = base;
-    none.bands[0] = makeBand (BandType::Bell, 3000.0, 0.0, 2.0);
-    CHECK (run (none) == x, "tube unused -> bit-exact passthrough");
+    {
+        Params none;
+        none.bands[0] = makeBand (BandType::Bell, 3000.0, 0.0, 2.0);
+        CHECK (run (none) == x, "analog unused -> bit-exact passthrough");
+    }
 
-    // Mid 밴드 영역: Side 쪽 성분은 튜브에 들어가지 않음
+    // Mid 밴드: M 신호에서만 (Side 성분은 깨끗)
     {
         std::vector<float> L ((size_t) len), R ((size_t) len);
         for (int i = 0; i < len; ++i)
@@ -1393,9 +1530,8 @@ static void testBandTubeRegions()
             L[(size_t) i] = (float) (m + s);
             R[(size_t) i] = (float) (m - s);
         }
-        Params p = base;
-        p.bands[0] = makeBand (BandType::Bell, 1000.0, 0.0, 1.0, Placement::Mid);
-        p.bands[0].tube = true;
+        Params p;
+        p.bands[0] = tubeBand (BandType::Bell, 1000.0, 1.0, 36.0f, Placement::Mid);
         runEngine (p, fs, L, R);
         std::vector<float> M ((size_t) len), S ((size_t) len);
         for (int i = 0; i < len; ++i) { M[(size_t) i] = 0.5f * (L[(size_t) i] + R[(size_t) i]); S[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]); }
@@ -1403,51 +1539,63 @@ static void testBandTubeRegions()
         const double sideH = std::max ({ toneDb (M, fs, 2600.0, mStart, mLen), toneDb (M, fs, 3900.0, mStart, mLen),
                                          toneDb (S, fs, 2600.0, mStart, mLen), toneDb (S, fs, 3900.0, mStart, mLen) })
                              - toneDb (S, fs, 1300.0, mStart, mLen);
-        std::printf ("      Mid 벨 1 kHz만 TUBE -> Mid 1 kHz 배음 %.1f dBc, Side 1.3 kHz 배음 %.1f dBc\n", midH, sideH);
-        CHECK (midH > -60.0 && sideH < -95.0, "mid region: side content stays clean");
+        const double midInSide = std::max (toneDb (S, fs, 2000.0, mStart, mLen), toneDb (S, fs, 3000.0, mStart, mLen)) - toneDb (M, fs, 1000.0, mStart, mLen);
+        std::printf ("      Mid 벨 1 kHz TUBE -> Mid 배음 %.1f dBc, Side 1.3 kHz 배음 %.1f dBc, Side로 샌 Mid 배음 %.1f dBc\n", midH, sideH, midInSide);
+        CHECK (midH > -60.0 && sideH < -95.0 && midInSide < -95.0, "mid band: tube works on M only");
     }
 
-    // 트랜스포머 영역 (ALL 꺼짐): 하이 셸프 5 kHz만 -> 100 Hz 저역 포화 없음
+    // 밴드 트랜스포머: 그 부분만, 성격은 밴드 주파수로 (저역 = 대칭 3차, 중역 = 2차 + 3차)
     {
         const auto x2 = twoTone (100.0, 8000.0, 0.4);
         auto runX = [&] (const Params& p) { auto L = x2, R = x2; runEngine (p, fs, L, R); return L; };
-        Params xa; xa.xfLow = 1; xa.xfMid = 1; xa.xfHigh = 1;
-        Params xb = xa; xb.xfAll = false; xb.bands[0] = makeBand (BandType::HighShelf, 5000.0, 0.0, 1.0); xb.bands[0].xfmr = true;
-        const auto ya = runX (xa), yb = runX (xb);
-        const double lowA = toneDb (ya, fs, 300.0, mStart, mLen) - toneDb (ya, fs, 100.0, mStart, mLen);
-        const double lowB = toneDb (yb, fs, 300.0, mStart, mLen) - toneDb (yb, fs, 100.0, mStart, mLen);
-        const double hiB  = toneDb (yb, fs, 24000.0, mStart, mLen) - toneDb (yb, fs, 8000.0, mStart, mLen);
-        std::printf ("      트랜스포머 ALL: 100 Hz 3차 %.1f dBc / 하이 셸프 영역만: 100 Hz 3차 %.1f, 8 kHz 3차 %.1f dBc\n", lowA, lowB, hiB);
-        CHECK (lowA > -60.0 && lowB < -95.0 && hiB > -80.0, "transformer region only on its band");
+        Params hs; hs.xfAll = false;
+        hs.bands[0] = makeBand (BandType::HighShelf, 5000.0, 0.0, 1.0); hs.bands[0].xfmr = true; hs.bands[0].xfAmount = 1.0f;
+        const auto yh = runX (hs);
+        const double low3 = toneDb (yh, fs, 300.0, mStart, mLen) - toneDb (yh, fs, 100.0, mStart, mLen);
+        const double hi3  = toneDb (yh, fs, 24000.0, mStart, mLen) - toneDb (yh, fs, 8000.0, mStart, mLen);
+
+        const auto xl = twoTone (60.0, 1000.0, 0.4);
+        auto runL = [&] (const Params& p) { auto L = xl, R = xl; runEngine (p, fs, L, R); return L; };
+        Params ls; ls.xfAll = false;
+        ls.bands[0] = makeBand (BandType::LowShelf, 120.0, 0.0, 1.0); ls.bands[0].xfmr = true; ls.bands[0].xfAmount = 1.0f;
+        Params bm; bm.xfAll = false;
+        bm.bands[0] = makeBand (BandType::Bell, 1000.0, 0.0, 1.0); bm.bands[0].xfmr = true; bm.bands[0].xfAmount = 1.0f;
+        const auto yl = runL (ls), ym = runL (bm);
+        const double lowH2 = toneDb (yl, fs, 120.0, mStart, mLen) - toneDb (yl, fs, 60.0, mStart, mLen);
+        const double lowH3 = toneDb (yl, fs, 180.0, mStart, mLen) - toneDb (yl, fs, 60.0, mStart, mLen);
+        const double midH2 = toneDb (ym, fs, 2000.0, mStart, mLen) - toneDb (ym, fs, 1000.0, mStart, mLen);
+        std::printf ("      XFMR 하이 셸프 5 kHz: 100 Hz 3차 %.1f, 8 kHz 3차 %.1f dBc / 로우 셸프 120 Hz: 60 Hz 2차 %.1f, 3차 %.1f / 벨 1 kHz: 2차 %.1f dBc\n",
+                     low3, hi3, lowH2, lowH3, midH2);
+        CHECK (low3 < -95.0 && hi3 > -80.0, "transformer band only on its range");
+        CHECK (lowH3 > -60.0 && lowH3 > lowH2 + 20.0 && midH2 > -80.0, "transformer character follows band frequency");
     }
 
-    // 모노: Side 밴드의 튜브는 할 일이 없음
+    // 모노: Side 밴드는 할 일이 없음
     {
         auto L = x, R = x;
-        Params p = base;
-        p.bands[0] = makeBand (BandType::Bell, 3000.0, 0.0, 2.0, Placement::Side);
-        p.bands[0].tube = true;
+        Params p;
+        p.bands[0] = tubeBand (BandType::Bell, 3000.0, 2.0, 36.0f, Placement::Side);
         runEngine (p, fs, L, R, 1);
         CHECK (L == x, "mono: side-band tube does nothing");
     }
 
-    // 16개 전부 TUBE + 모양 섞기: 유한, 튜브 한 대
+    // 16개 전부 튜브 + 트랜스포머 (모양 · 채널 섞음): 유한
     {
-        Params p = base;
+        Params p;
         for (int i = 0; i < kMaxBands; ++i)
         {
-            p.bands[(size_t) i] = makeBand ((BandType) (i % kNumBandTypes), 60.0 * std::pow (1.4, i), (i % 2 ? 3.0 : -3.0), 1.5,
+            p.bands[(size_t) i] = tubeBand ((BandType) (i % kNumBandTypes), 60.0 * std::pow (1.4, i), 1.5, 6.0f * (float) (i % 8),
                                             (Placement) (i % kNumPlacements));
-            p.bands[(size_t) i].tube = true;
+            p.bands[(size_t) i].gain = i % 2 ? 3.0f : -3.0f;
             p.bands[(size_t) i].xfmr = i % 3 == 0;
+            p.bands[(size_t) i].xfAmount = 0.7f;
         }
-        p.xfAll = false; p.xfLow = 0.5f; p.xfMid = 0.5f; p.xfHigh = 0.5f;
         auto L = x, R = x;
         runEngine (p, fs, L, R);
         bool finite = true; double peak = 0.0;
         for (float v : L) { finite = finite && std::isfinite (v); peak = std::max (peak, (double) std::abs (v)); }
-        std::printf ("      16밴드 전부 TUBE (모양·채널 섞음): 피크 %.2f\n", peak);
-        CHECK (finite && peak < 4.0, "all 16 tube bands stay finite (%.2f)", peak);
+        std::printf ("      16밴드 전부 튜브 (드라이브 제각각, 모양 · 채널 섞음): 피크 %.2f\n", peak);
+        CHECK (finite && peak < 4.0, "all 16 analog bands stay finite (%.2f)", peak);
     }
 }
 

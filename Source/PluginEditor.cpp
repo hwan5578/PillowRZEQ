@@ -5,7 +5,7 @@ using namespace pillow::ui;
 namespace
 {
     constexpr int kWidth  = 1080;
-    constexpr int kHeight = 700;
+    constexpr int kHeight = 780;
 }
 
 //==============================================================================
@@ -53,9 +53,9 @@ void PillowRZAudioProcessorEditor::resized()
 {
     qualitySwitch.setBounds (kWidth - 16 - 220, 14, 220, 28);
 
-    graph.setBounds     (16,  60, 732, 392);
-    bandPanel.setBounds (16, 464, 732, 224);
-    mainPanel.setBounds (760, 60, 304, 628);
+    graph.setBounds     (16,  60, 732, 372);
+    bandPanel.setBounds (16, 444, 732, 320);
+    mainPanel.setBounds (760, 60, 304, 704);
 }
 
 void PillowRZAudioProcessorEditor::paint (juce::Graphics& g)
