@@ -21,8 +21,9 @@ PillowRZAudioProcessorEditor::PillowRZAudioProcessorEditor (PillowRZAudioProcess
     qualitySwitch.getProperties().set ("rzLeft",  "ZERO LATENCY");
     qualitySwitch.getProperties().set ("rzRight", "HQ");
     qualitySwitch.setButtonText ("Quality");
-    qualitySwitch.setTooltip ("ZERO LATENCY: no delay, analog-matched curves\n"
-                              "HQ: oversampled (a few samples of delay), cleanest drive and air bands");
+    qualitySwitch.setTooltip ("ZERO LATENCY: no delay, analog-matched curves. Spectral bands use a zero-latency filter bank\n"
+                              "HQ: oversampled (a few samples of delay), cleanest drive and air bands.\n"
+                              "In HQ, spectral bands switch to linear phase FFT (adds about 43 ms of latency)");
     qualitySwitch.setWantsKeyboardFocus (false);   // Return / 숫자패드 Enter가 모드를 바꾸지 않게
     addAndMakeVisible (qualitySwitch);
     qualityAttachment = std::make_unique<ButtonAttachment> (processorRef.apvts, pillow::ids::quality, qualitySwitch);
@@ -36,11 +37,23 @@ PillowRZAudioProcessorEditor::PillowRZAudioProcessorEditor (PillowRZAudioProcess
     // 자식 컴포넌트를 다 만든 뒤에 지정해야 노브 값 표시(텍스트 박스)까지 새 색으로 다시 만들어짐
     setLookAndFeel (&lnf);
     setSize (kWidth, kHeight);
+    startTimerHz (4);
 }
 
 PillowRZAudioProcessorEditor::~PillowRZAudioProcessorEditor()
 {
+    stopTimer();
     setLookAndFeel (nullptr);
+}
+
+void PillowRZAudioProcessorEditor::timerCallback()
+{
+    const int latency = processorRef.getLatencySamples();
+    if (latency != shownLatency)
+    {
+        shownLatency = latency;
+        repaint (kWidth - 16 - 220 - 200, 10, 196, 36);
+    }
 }
 
 bool PillowRZAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
@@ -72,5 +85,19 @@ void PillowRZAudioProcessorEditor::paint (juce::Graphics& g)
     g.drawText ("RZ EQ", 20, 23, 110, 30, juce::Justification::centredLeft, false);
     g.setColour (palette::dim);
     g.setFont (uiFont (11.5f));
-    g.drawText ("free bands  /  RZ062 curves  /  EF804S", 106, 32, 300, 16, juce::Justification::centredLeft, false);
+    g.drawText ("free bands  /  RZ062 curves  /  EF804S  /  dynamic EQ", 106, 32, 380, 16, juce::Justification::centredLeft, false);
+
+    // 지금 레이턴시 (호스트에 알린 값). HQ + 스펙트럴이면 선형 위상 FFT 때문에 길어짐
+    const int latency = juce::jmax (0, shownLatency);
+    const double rate = processorRef.getSampleRate() > 0.0 ? processorRef.getSampleRate() : 48000.0;
+    const auto r = juce::Rectangle<int> (kWidth - 16 - 220 - 200, 14, 190, 28);
+    g.setColour (palette::dim);
+    g.setFont (uiFont (10.0f, true, 0.12f));
+    g.drawText ("LATENCY", r.withHeight (12), juce::Justification::centredRight, false);
+    g.setColour (latency > 0 ? palette::text : palette::accent2);
+    g.setFont (uiFont (12.0f, true, 0.04f));
+    const auto ms = 1000.0 * (double) latency / rate;
+    const juce::String text = latency == 0 ? juce::String ("0 samples")
+                            : juce::String (latency) + " samples  /  " + juce::String (ms, ms < 10.0 ? 2 : 1) + " ms";
+    g.drawText (text, r.withTrimmedTop (13), juce::Justification::centredRight, false);
 }

@@ -22,8 +22,11 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <atomic>
 #include <cstdint>
 #include <vector>
+
+#include "Fft.h"
 
 namespace pillow::rz
 {
@@ -141,6 +144,47 @@ inline constexpr bool typeHasSlope (BandType t) noexcept { return t == BandType:
 inline constexpr bool typeHasQ (BandType t) noexcept { return t != BandType::Tilt; }
 inline constexpr bool isMsPlacement (Placement p) noexcept { return p == Placement::Mid || p == Placement::Side; }
 
+// 다이내믹 EQ (v0.8)
+inline constexpr bool typeHasDynamics (BandType t) noexcept
+{
+    return t == BandType::Bell || t == BandType::LowShelf || t == BandType::HighShelf || t == BandType::Tilt;
+}
+inline constexpr bool typeHasSpectral (BandType t) noexcept
+{
+    return t == BandType::Bell || t == BandType::LowShelf || t == BandType::HighShelf;
+}
+inline constexpr float  kDynRangeMax = 24.0f;
+inline constexpr float  kThreshMin = -60.0f, kThreshMax = 0.0f;
+inline constexpr double kDynKneeDb = 6.0;          // 소프트 니 폭
+inline constexpr double kDynSlope = 0.5;           // 문턱 넘는 1 dB마다 0.5 dB (2:1)에서 시작해 RANGE에 부드럽게 닿음
+inline constexpr double kDynAutoMarginDb = 3.0;    // 자동 문턱 = 평소 레벨 + 3 dB
+
+// 다이내믹 게인 (dB). over = 레벨 - 문턱. 니 아래는 0, 위로 갈수록 rangeDb에 다가감 (넘지 않음)
+inline double dynamicGainDb (double over, double rangeDb) noexcept
+{
+    const double r = std::abs (rangeDb);
+    if (r < 1.0e-6 || ! (over > -0.5 * kDynKneeDb))   // NaN도 여기서 0
+        return 0.0;
+    double o = over;
+    if (over < 0.5 * kDynKneeDb)
+    {
+        const double t = over + 0.5 * kDynKneeDb;
+        o = t * t / (2.0 * kDynKneeDb);
+    }
+    return rangeDb * std::tanh (kDynSlope * o / r);
+}
+
+// ATTACK / RELEASE: 0.5 = 자동 (밴드 주파수의 몇 주기), 0 / 1 = 8배 빠르게 / 느리게
+inline double dynTimeScale (double amount01) noexcept { return std::exp2 ((std::clamp (amount01, 0.0, 1.0) - 0.5) * 6.0); }
+inline double dynAttackSeconds (double hz, double amount01) noexcept
+{
+    return std::clamp (3.0 / std::max (hz, 1.0), 0.001, 0.030) * dynTimeScale (amount01);
+}
+inline double dynReleaseSeconds (double hz, double amount01) noexcept
+{
+    return std::clamp (30.0 / std::max (hz, 1.0), 0.030, 0.400) * dynTimeScale (amount01);
+}
+
 struct BandParams
 {
     bool      used  = false;            // 밴드가 있음 (그래프에 점이 보임)
@@ -158,16 +202,26 @@ struct BandParams
     float     tubeMix  = 1.0f;          //   0..1 (그 부분에서 원음과 섞기)
     bool      xfmr     = false;         // 출력 트랜스포머
     float     xfAmount = 0.5f;          //   0..1 (성격은 밴드 주파수로 자동)
+    // 다이내믹 EQ (v0.8, Bell · 셸프 · 틸트). 그 밴드 주파수 부분의 레벨(들어온 소리)로 게인이 움직임
+    bool      dyn      = false;         // 다이내믹 켜기
+    float     dynRange = -6.0f;         //   dB (-24..24): 문턱을 넘으면 이만큼까지 (음수 = 깎기, 양수 = 올리기)
+    bool      autoTh   = true;          //   문턱 자동 (그 밴드의 평소 레벨 + 3 dB)
+    float     thresh   = -24.0f;        //   수동 문턱 dBFS (사인 기준)
+    float     attack   = 0.5f;          //   0..1 (0.5 = 자동: 밴드 주파수에 맞춤, 0 = 8배 빠르게, 1 = 8배 느리게)
+    float     release  = 0.5f;          //   0..1
+    bool      spectral = false;         //   스펙트럴: 밴드 전체 대신 문턱을 넘는 주파수만 (Bell · 셸프)
+    float     density  = 0.5f;          //   0..1 (스펙트럴 선택성: 0 = 넓게, 1 = 좁게)
 
     bool isActive() const noexcept { return used && on; }
 
     bool operator== (const BandParams& o) const noexcept
     {
         return used == o.used && on == o.on && type == o.type && slope == o.slope && place == o.place
-            && tube == o.tube && xfmr == o.xfmr
+            && tube == o.tube && xfmr == o.xfmr && dyn == o.dyn && autoTh == o.autoTh && spectral == o.spectral
             && sameValue (freq, o.freq) && sameValue (gain, o.gain) && sameValue (q, o.q)
             && sameValue (drive, o.drive) && sameValue (focus, o.focus) && sameValue (tubeMix, o.tubeMix)
-            && sameValue (xfAmount, o.xfAmount);
+            && sameValue (xfAmount, o.xfAmount) && sameValue (dynRange, o.dynRange) && sameValue (thresh, o.thresh)
+            && sameValue (attack, o.attack) && sameValue (release, o.release) && sameValue (density, o.density);
     }
     bool operator!= (const BandParams& o) const noexcept { return ! (*this == o); }
 };
@@ -519,7 +573,7 @@ inline TiltCoeffs makeTilt (double pivotHz, double tiltDb, double fs) noexcept
     c.lfMinus1 = std::sqrt (M0 / MN) - 1.0;       // DC = outGain * (1 + lfMinus1)
 
     // 극점: 세 번째 점(축)의 크기로 정함. 틸트 0 근처에서도 이어지도록 아주 작은 틸트는 작은 값으로 계산
-    const double tg = std::abs (tiltDb) < 1.0e-3 ? std::copysign (1.0e-3, tiltDb == 0.0 ? 1.0 : tiltDb) : tiltDb;
+    const double tg = std::abs (tiltDb) < 1.0e-3 ? std::copysign (1.0e-3, tiltDb) : tiltDb;
     const double fm = std::min (std::max (pivotHz, 1.0), 0.25 * fs);
     const double a0 = tiltAnalogMag2 (pivotHz, tg, 0.0), aN = tiltAnalogMag2 (pivotHz, tg, 0.5 * fs);
     const double am = tiltAnalogMag2 (pivotHz, tg, fm);
@@ -1695,6 +1749,7 @@ public:
         fs = sampleRate > 0.0 ? sampleRate : 48000.0;
         subBlock = kSubBlockBase * std::max (1, (int) std::lround (fs / 48000.0));
         fadeStep = 1.0 / std::max (1.0, kFadeSeconds * fs);
+        dynAvgCoeff = 1.0 - std::exp (-(double) subBlock / (kDynAutoSeconds * fs));
         for (auto& t : analog.tube) t.prepare (fs);
         for (auto& x : analog.xf)   x.prepare (fs);
         applySmoothing();
@@ -1737,6 +1792,7 @@ public:
         analog.valid = false;
         analog.live  = false;
         clearState();
+        resetDynamics();
         cur = designNow();
         ramping = false;
         subLeft = 0;
@@ -1776,7 +1832,8 @@ public:
     Placement placement() const noexcept { return cfg.place; }
 
     // a, b: L/R 그룹이면 L·R, M/S 그룹이면 M·S. nc = 1(모노)이면 a만 (Side 밴드는 모노에서 할 일 없음)
-    void process (float* a, float* b, int nc, int n) noexcept
+    // inA, inB: 같은 그룹의 EQ 전 입력 (다이내믹 감지용, 없으면 nullptr)
+    void process (float* a, float* b, int nc, int n, const float* inA = nullptr, const float* inB = nullptr) noexcept
     {
         bool doA, doB;
         channelsFor (nc, doA, doB);
@@ -1787,6 +1844,23 @@ public:
             if (subLeft <= 0)
                 beginSubBlock();
             const int len = std::min (subLeft, n - i);
+
+            if (dyn.live && inA != nullptr)            // 다이내믹 감지: 이 밴드 영역의 평균 제곱 (서브블록 처음에 게인 계산)
+            {
+                for (int k = 0; k < len; ++k)
+                {
+                    if (doA)
+                    {
+                        const double r = svfTick (dyn.region, dyn.st[0], (double) inA[i + k]);
+                        dyn.ms[0] += dyn.aRms * (r * r - dyn.ms[0]);
+                    }
+                    if (doB && inB != nullptr)
+                    {
+                        const double r = svfTick (dyn.region, dyn.st[1], (double) inB[i + k]);
+                        dyn.ms[1] += dyn.aRms * (r * r - dyn.ms[1]);
+                    }
+                }
+            }
 
             for (int k = 0; k < len; ++k)
             {
@@ -1957,6 +2031,7 @@ private:
         for (auto& t : analog.tube) t.clearState();
         for (auto& x : analog.xf)   x.clearState();
         clearState();
+        resetDynamics();
         cur = designNow();
         ramping = false;
         subLeft = 0;
@@ -1966,7 +2041,88 @@ private:
 
     BandDesign designNow() const noexcept
     {
-        return designBand (cfg.type, std::exp (sF.current), sG.current, std::exp (sQ.current), cfg.slope, fs);
+        return designBand (cfg.type, std::exp (sF.current), sG.current + dyn.gainDb, std::exp (sQ.current), cfg.slope, fs);
+    }
+
+    //--------------------------------------------------------------------------
+    //  다이내믹 EQ (스펙트럴이 아닌 밴드): 서브블록마다 게인 계산 -> 바뀌었으면 계수 다시 (기존 보간 그대로)
+    //   감지 = EQ 전 입력을 이 밴드 영역(벨 = 밴드패스, 셸프 = 그쪽 절반, 틸트 = 전체)으로 걸러 평균 제곱
+    //   (RMS 창 = 밴드 주파수 1주기, 0.5~20 ms), 사인 기준 dB. 스테레오 밴드는 두 채널 중 큰 쪽
+    //   자동 문턱 = 느린 평균(1.5 s) + 3 dB. ATTACK/RELEASE는 게인(dB)에 거는 1차 스무딩
+    //--------------------------------------------------------------------------
+    static constexpr double kDynAutoSeconds = 1.5;
+
+    bool dynamicWanted() const noexcept
+    {
+        return mode != Mode::Off && targetActive && target.dyn && typeHasDynamics (cfg.type)
+            && ! (target.spectral && typeHasSpectral (cfg.type)) && std::abs (target.dynRange) > 1.0e-3f;
+    }
+
+    void resetDynamics() noexcept
+    {
+        dyn = Dyn {};
+        dynDisplay.store (0.0f, std::memory_order_relaxed);
+    }
+
+    void updateDynamics() noexcept
+    {
+        const bool want = dynamicWanted();
+        if (! want && ! dyn.live)
+            return;
+        if (! dyn.live)
+        {
+            const double keepGain = dyn.gainDb, keepDesigned = dyn.designedDb;
+            dyn = Dyn {};                               // 새로 시작: 감지 상태 비움
+            dyn.gainDb = keepGain;
+            dyn.designedDb = keepDesigned;
+            dyn.live = true;
+        }
+
+        const double hz = std::exp (sF.current), q = std::exp (sQ.current);
+        if (! dyn.regionValid || ! sameValue (hz, dyn.regionHz) || ! sameValue (q, dyn.regionQ))
+        {
+            dyn.region = makeRegion (cfg.type, hz, q, fs);
+            dyn.aRms   = 1.0 - std::exp (-1.0 / (std::clamp (1.0 / hz, 0.0005, 0.02) * fs));
+            dyn.regionHz = hz;
+            dyn.regionQ  = q;
+            dyn.regionValid = true;
+        }
+        if (! sameValue (hz, dyn.timeHz) || ! sameValue ((double) target.attack, dyn.timeAtt)
+            || ! sameValue ((double) target.release, dyn.timeRel))
+        {
+            const double sb = (double) subBlock;
+            dyn.aAtt = 1.0 - std::exp (-sb / (dynAttackSeconds (hz, target.attack) * fs));
+            dyn.aRel = 1.0 - std::exp (-sb / (dynReleaseSeconds (hz, target.release) * fs));
+            dyn.timeHz  = hz;
+            dyn.timeAtt = target.attack;
+            dyn.timeRel = target.release;
+        }
+
+        const double msv = std::max (dyn.ms[0], dyn.ms[1]);
+        const double level = 10.0 * std::log10 (2.0 * msv + 1.0e-30);
+        if (msv > 1.0e-10)                          // 평소 레벨(dB 평균, 1.5 s). 무음(-97 dB 아래)에서는 그대로 둠
+        {
+            if (! dyn.avgValid) { dyn.avgDb = level; dyn.avgValid = true; }
+            else                dyn.avgDb += dynAvgCoeff * (level - dyn.avgDb);
+        }
+
+        double tgt = 0.0;
+        if (want)
+        {
+            const double th = target.autoTh ? (dyn.avgValid ? dyn.avgDb : level) + kDynAutoMarginDb
+                                            : (double) std::clamp (target.thresh, kThreshMin, kThreshMax);
+            tgt = dynamicGainDb (level - th, std::clamp ((double) target.dynRange, -(double) kDynRangeMax, (double) kDynRangeMax));
+        }
+        const double a = std::abs (tgt) > std::abs (dyn.gainDb) ? dyn.aAtt : dyn.aRel;
+        dyn.gainDb += a * (tgt - dyn.gainDb);
+        if (! (std::abs (dyn.gainDb) <= 2.0 * kDynRangeMax))   // NaN 등: 원래대로
+            dyn.gainDb = 0.0;
+        if (! want && std::abs (dyn.gainDb) < 1.0e-4)
+        {
+            dyn.gainDb = 0.0;
+            dyn.live = false;
+        }
+        dynDisplay.store ((float) dyn.gainDb, std::memory_order_relaxed);
     }
 
     void beginSubBlock() noexcept
@@ -1974,9 +2130,12 @@ private:
         if (ramping)
             cur = next;                 // 직전 서브블록의 끝 = 목표 계수
         ramping = false;
-        if (! (sF.isSettled() && sG.isSettled() && sQ.isSettled()))
+        updateDynamics();
+        const bool dynMoved = std::abs (dyn.gainDb - dyn.designedDb) > 0.005 || (! dyn.live && ! sameValue (dyn.designedDb, 0.0));
+        if (! (sF.isSettled() && sG.isSettled() && sQ.isSettled()) || dynMoved)
         {
             sF.step(); sG.step(); sQ.step();
+            dyn.designedDb = dyn.gainDb;
             next = designNow();
             base = cur;
             diffInto (step, next, base, (double) subBlock);
@@ -2039,6 +2198,791 @@ private:
     Analog analog;
     std::array<double, kMaxChunk> fadeTrace {};
     int traceIdx = 0;
+
+    struct Dyn
+    {
+        SvfCoeffs region;
+        std::array<SvfState, 2> st {};
+        std::array<double, 2> ms {};
+        double avgDb = 0.0, gainDb = 0.0, designedDb = 0.0;
+        double aRms = 0.0, aAtt = 0.0, aRel = 0.0;
+        double regionHz = 0.0, regionQ = 0.0, timeHz = 0.0, timeAtt = -1.0, timeRel = -1.0;
+        bool live = false, regionValid = false, avgValid = false;
+    };
+    Dyn dyn;
+    double dynAvgCoeff = 0.0;
+    std::atomic<float> dynDisplay { 0.0f };
+
+public:
+    // 지금 다이내믹 게인 (dB): 오디오 스레드 값 / 화면용 (어느 스레드에서든)
+    double currentDynamicGainDb() const noexcept { return dyn.gainDb; }
+    float dynamicGainDisplay() const noexcept { return dynDisplay.load (std::memory_order_relaxed); }
+};
+
+
+//==============================================================================
+//  스펙트럴 다이내믹스 (v0.8) — 밴드 전체 대신 "문턱을 넘는 주파수만" (Pro-Q 4의 Spectral)
+//   분석: 마지막 N 샘플 FFT (홉 N/4). 밴드마다 그 모양(+6 dB 기준 dB 모양을 0..1로)으로 가중하고
+//         칸마다 레벨(20 ms 평균) vs 문턱 (자동 = 주변 1/2옥타브의 로그 평균 + 6 dB, 수동 = dBFS 사인 기준)
+//         -> 게인(1:1에서 RANGE로), ATTACK / RELEASE, DENSITY(낮을수록 둘레로 퍼짐) -> 도메인(L · R · M · S)별 게인 지도
+//   합성:
+//    - 필터 뱅크 (ZERO LATENCY): 1/12옥타브 간격 최소 위상 피킹 필터들이 게인 지도를 따라감 -> 레이턴시 0
+//      (분석 창 때문에 약 10 ms 늦게 반응. 겹침은 이웃 영향을 빼는 반복 계산으로 보정)
+//    - 선형 위상 (HQ): 게인 지도를 FFT 칸에 바로 곱하고 겹쳐 더하기 -> 정확, 레이턴시 = N (약 43 ms)
+//   밴드의 고정 게인(EQ 곡선)은 원래 필터 그대로, 여기서는 움직이는 부분만
+//==============================================================================
+class SpectralStage
+{
+public:
+    static constexpr int kDisplayPoints = 128;
+    enum Domain { DomL = 0, DomR, DomM, DomS, kNumDomains };
+    enum Detect { DetLink = 0, DetL, DetR, DetM, DetS, kNumDetect };
+
+    static constexpr double kAutoMarginDb  = 6.0;
+    static constexpr double kSlope         = 1.0;     // 문턱 넘는 1 dB마다 1 dB에서 시작
+    static constexpr double kLevelSeconds  = 0.020;   // 칸 레벨 평균
+    static constexpr double kRefSeconds    = 0.400;   // 자동 문턱 기준 스펙트럼
+    static constexpr double kAttackBase    = 0.010, kReleaseBase = 0.150;
+    static constexpr double kBankQ         = 8.65;    // 1/6옥타브 폭 (격자는 1/12옥타브)
+    static constexpr double kSpecKneeDb    = 4.0;
+    static constexpr double kMinWeight     = 0.02;    // 밴드 모양 가중이 이보다 작은 칸은 건드리지 않음
+    static constexpr double kBankDeadDb    = 0.15;    // 필터 뱅크: 이보다 작은 변화는 0 (들리지 않음, 필터를 켜지 않음)
+
+    SpectralStage() { prepare (48000.0, 2); }
+
+    void prepare (double sampleRate, int numChannels)
+    {
+        fs  = sampleRate > 0.0 ? sampleRate : 48000.0;
+        nch = std::clamp (numChannels, 1, 2);
+        subBlock = 16 * std::max (1, (int) std::lround (fs / 48000.0));
+        nBank = std::clamp (nextPow2 ((int) std::lround (1024.0 * fs / 48000.0)), 512, 8192);
+        nLin  = linearLatencyFor (fs);
+        const int maxN = std::max (nBank, nLin), maxBins = maxN / 2 + 1;
+        ringMask = 2 * maxN - 1;
+
+        fftBank.prepare (nBank);
+        fftLin.prepare (nLin);
+        for (int c = 0; c < 2; ++c)
+        {
+            inRing[(size_t) c].assign ((size_t) (2 * maxN), 0.0);
+            outAcc[(size_t) c].assign ((size_t) (2 * maxN), 0.0);
+            xr[(size_t) c].assign ((size_t) maxBins, 0.0);
+            xi[(size_t) c].assign ((size_t) maxBins, 0.0);
+        }
+        frameBuf.assign ((size_t) maxN, 0.0);
+        tmpA.assign ((size_t) maxBins + 1, 0.0);
+        tmpB.assign ((size_t) maxBins, 0.0);
+        winBank.resize ((size_t) nBank);
+        for (int i = 0; i < nBank; ++i) winBank[(size_t) i] = 0.5 - 0.5 * std::cos (2.0 * kPi * i / nBank);   // Hann
+        winLin.resize ((size_t) nLin);
+        for (int i = 0; i < nLin; ++i) winLin[(size_t) i] = std::sin (kPi * i / nLin);                       // sqrt-Hann
+        for (auto& v : power)   v.assign ((size_t) maxBins, 0.0);
+        for (auto& v : levelDb) v.assign ((size_t) maxBins, 0.0);
+        for (auto& v : levelPw) v.assign ((size_t) maxBins, 0.0);
+        for (auto& v : refDb)   v.assign ((size_t) maxBins, 0.0);
+        for (auto& v : field)   v.assign ((size_t) maxBins, 0.0);
+        for (auto& b : bands)
+        {
+            b.w.assign ((size_t) maxBins, 0.0);
+            b.decay.assign ((size_t) maxBins, 0.0);
+            b.delta.assign ((size_t) maxBins, 0.0);
+        }
+
+        // 필터 뱅크 격자: 20 Hz부터 1/12옥타브, 20 kHz와 0.45 fs 중 낮은 쪽까지
+        bankHz.clear();
+        for (int j = 0;; ++j)
+        {
+            const double f = 20.0 * std::exp2 ((double) j / 12.0);
+            if (f > std::min (20000.0, 0.45 * fs)) break;
+            bankHz.push_back (f);
+        }
+        const size_t ng = bankHz.size();
+        bankG.resize (ng);
+        for (size_t j = 0; j < ng; ++j) bankG[j] = std::tan (kPi * bankHz[j] / fs);
+        for (auto& d : bank)
+        {
+            d.cur.assign (ng, 0.0);  d.step.assign (ng, 0.0);  d.tgt.assign (ng, 0.0);  d.want.assign (ng, 0.0);  d.goal.assign (ng, 0.0);
+            d.coef.assign (ng, SvfCoeffs {});  d.tcoef.assign (ng, SvfCoeffs {});  d.dcoef.assign (ng, SvfCoeffs {});
+            d.moving.assign (ng, 0);  d.on.assign (ng, 0);
+            d.st.assign (ng, SvfState {});
+            d.list.clear();  d.list.reserve (ng);
+        }
+        // 이웃 필터가 격자점에 주는 영향 (작은 게인에서 dB 모양, 가운데 = 1)
+        for (int m = 0; m <= kNeighbours; ++m)
+            neighbour[(size_t) m] = bellShapeAt (std::exp2 ((double) m / 12.0), kBankQ, -6.0) / -6.0;
+
+        setLinearPhase (false);
+    }
+
+    // HQ: 선형 위상(레이턴시 N) / 아니면 필터 뱅크(레이턴시 0). 바꾸면 상태를 비움 (플러그인이 무음 순간에 부름)
+    void setLinearPhase (bool on) noexcept
+    {
+        linear = on;
+        curN = linear ? nLin : nBank;
+        hop  = curN / 4;
+        bankStride = std::max (subBlock, hop / 4);       // 필터 뱅크 계수는 홉마다 4번 (게인을 직선으로)
+        binHz = fs / (double) curN;
+        // 사인 기준 레벨 보정: 진폭 1 사인 = 0 dB (창 합 S1 -> 4 / S1^2)
+        double s1 = 0.0;
+        const auto& w = linear ? winLin : winBank;
+        for (int i = 0; i < curN; ++i) s1 += w[(size_t) i];
+        cal = 4.0 / (s1 * s1);
+        const double frameRate = fs / (double) hop;
+        aLevel = 1.0 - std::exp (-1.0 / (kLevelSeconds * frameRate));
+        aRef   = 1.0 - std::exp (-1.0 / (kRefSeconds * frameRate));
+        for (auto& b : bands) { b.wN = 0; b.dN = 0; b.cN = 0; }
+        reset();
+    }
+
+    bool isLinearPhase() const noexcept { return linear; }
+    int  latencySamples() const noexcept { return linear ? curN : 0; }
+
+    // 선형 위상일 때의 FFT 크기 = 레이턴시 (처리 레이트 샘플): 48k 기준 2048 (약 43 ms, 칸 23 Hz)
+    static int linearLatencyFor (double processingRate) noexcept
+    {
+        return std::clamp (nextPow2 ((int) std::lround (2048.0 * processingRate / 48000.0)), 1024, 16384);
+    }
+
+    void reset() noexcept
+    {
+        for (int c = 0; c < 2; ++c)
+        {
+            std::fill (inRing[(size_t) c].begin(), inRing[(size_t) c].end(), 0.0);
+            std::fill (outAcc[(size_t) c].begin(), outAcc[(size_t) c].end(), 0.0);
+        }
+        for (auto& v : levelPw) std::fill (v.begin(), v.end(), 0.0);
+        refValid.fill (false);
+        for (auto& b : bands)
+        {
+            std::fill (b.delta.begin(), b.delta.end(), 0.0);
+            b.live = false;
+            b.display.store (0.0f, std::memory_order_relaxed);
+        }
+        for (auto& d : bank)
+        {
+            std::fill (d.cur.begin(), d.cur.end(), 0.0);
+            std::fill (d.step.begin(), d.step.end(), 0.0);
+            std::fill (d.tgt.begin(), d.tgt.end(), 0.0);
+            std::fill (d.goal.begin(), d.goal.end(), 0.0);
+            std::fill (d.moving.begin(), d.moving.end(), (char) 0);
+            std::fill (d.on.begin(), d.on.end(), (char) 0);
+            std::fill (d.st.begin(), d.st.end(), SvfState {});
+            d.list.clear();
+            d.any = false;
+        }
+        for (auto& dom : display) for (auto& v : dom) v.store (0.0f, std::memory_order_relaxed);
+        t = 0;
+        anyLive = false;
+    }
+
+    // 쉬고 있다가 다시 쓰기 시작할 때: 오래된 입력 · 레벨 없이 (무음에서 시작한 것처럼)
+    void restart() noexcept
+    {
+        for (int c = 0; c < 2; ++c)
+            std::fill (inRing[(size_t) c].begin(), inRing[(size_t) c].end(), 0.0);
+        for (auto& v : levelPw) std::fill (v.begin(), v.end(), 0.0);
+        refValid.fill (false);
+    }
+
+    // 블록마다 (오디오 스레드)
+    void setParams (const Params& p) noexcept
+    {
+        for (size_t i = 0; i < bands.size(); ++i)
+        {
+            const auto& s = p.bands[i];
+            auto& b = bands[i];
+            b.want = p.eqOn && s.isActive() && s.dyn && s.spectral && typeHasSpectral (s.type) && std::abs (s.dynRange) > 1.0e-3f;
+            if (! b.want)
+                continue;                       // 꺼지는 동안은 마지막 설정으로 풀려남
+            b.type = s.type;  b.place = s.place;
+            b.freq = std::clamp ((double) s.freq, (double) kFreqMin, (double) kFreqMax);
+            b.q    = std::clamp ((double) s.q, (double) kQMin, (double) kQMax);
+            b.range   = std::clamp ((double) s.dynRange, -(double) kDynRangeMax, (double) kDynRangeMax);
+            b.autoTh  = s.autoTh;
+            b.thresh  = std::clamp ((double) s.thresh, (double) kThreshMin, (double) kThreshMax);
+            b.attack  = s.attack;  b.release = s.release;
+            b.density = std::clamp ((double) s.density, 0.0, 1.0);
+        }
+    }
+
+    // 스펙트럴 밴드가 하나라도 있거나 아직 풀리는 중 (또는 선형 위상이라 늘 지나가야 함)
+    bool isActive() const noexcept
+    {
+        if (linear || anyLive) return true;
+        for (auto& b : bands) if (b.want) return true;
+        return false;
+    }
+
+    // 화면용 (어느 스레드에서든): 밴드 안의 지금 가장 큰 변화, 도메인별 게인 곡선
+    float bandDisplay (int band) const noexcept { return bands[(size_t) std::clamp (band, 0, kMaxBands - 1)].display.load (std::memory_order_relaxed); }
+    float curveDisplay (int domain, int point) const noexcept
+    {
+        return display[(size_t) std::clamp (domain, 0, kNumDomains - 1)][(size_t) std::clamp (point, 0, kDisplayPoints - 1)].load (std::memory_order_relaxed);
+    }
+    static double displayHz (int point) noexcept { return 20.0 * std::pow (1000.0, (double) point / (double) (kDisplayPoints - 1)); }
+
+    // 테스트용
+    int activeBankFilters() const noexcept { int n = 0; for (auto& d : bank) n += (int) d.list.size(); return n; }
+    void debugBank (int dom, std::vector<double>& hz, std::vector<double>& cur, std::vector<double>& want) const
+    {
+        hz = bankHz;  cur = bank[(size_t) dom].cur;  want = bank[(size_t) dom].want;
+    }
+    double bandGainAtHz (int band, double hz) const noexcept
+    {
+        const auto& b = bands[(size_t) band];
+        const int k = std::clamp ((int) std::lround (hz / binHz), 0, curN / 2);
+        return b.delta[(size_t) k] * b.w[(size_t) k];
+    }
+
+    // L, R (모노면 R = nullptr): 그 자리에서
+    void process (float* L, float* R, int nc, int n) noexcept
+    {
+        const bool two = nc > 1 && R != nullptr;
+        for (int i = 0; i < n; ++i)
+        {
+            const size_t slot = (size_t) (t & (std::uint64_t) ringMask);
+            inRing[0][slot] = L[i];
+            if (two) inRing[1][slot] = R[i];
+
+            if (linear)
+            {
+                const size_t o = (size_t) ((t - (std::uint64_t) curN) & (std::uint64_t) ringMask);
+                L[i] = (float) outAcc[0][o];  outAcc[0][o] = 0.0;
+                if (two) { R[i] = (float) outAcc[1][o];  outAcc[1][o] = 0.0; }
+            }
+            else if (anyBank)
+            {
+                double l = L[i], r = two ? (double) R[i] : 0.0;
+                if (bank[DomL].any) l = runBank (bank[DomL], l);
+                if (two && bank[DomR].any) r = runBank (bank[DomR], r);
+                if (two && (bank[DomM].any || bank[DomS].any))
+                {
+                    double m = 0.5 * (l + r), s = 0.5 * (l - r);
+                    if (bank[DomM].any) m = runBank (bank[DomM], m);
+                    if (bank[DomS].any) s = runBank (bank[DomS], s);
+                    l = m + s;
+                    r = m - s;
+                }
+                L[i] = (float) l;
+                if (two) R[i] = (float) r;
+            }
+
+            ++t;
+            if (! linear && (t % (std::uint64_t) bankStride) == 0)
+                bankSubBlock();
+            if ((t % (std::uint64_t) hop) == 0)
+                frame (two);
+        }
+    }
+
+private:
+    static constexpr int kNeighbours = 4;
+
+    struct Band
+    {
+        bool want = false, live = false, autoTh = true;
+        BandType type = BandType::Bell;
+        Placement place = Placement::Stereo;
+        double freq = 1000.0, q = 1.0, range = 0.0, thresh = -24.0, attack = 0.5, release = 0.5, density = 0.5;
+        std::vector<double> w, decay, delta;
+        int k0 = 1, k1 = 0;
+        BandType wType = BandType::Bell;
+        double wFreq = -1.0, wQ = -1.0, dDensity = -1.0, cAtt = -1.0, cRel = -1.0, aAtt = 0.0, aRel = 0.0;
+        int wN = 0, dN = 0, cN = 0;
+        std::atomic<float> display { 0.0f };
+    };
+
+    struct BankDomain
+    {
+        std::vector<double> cur, step, tgt, want, goal;
+        std::vector<SvfCoeffs> coef, tcoef, dcoef;
+        std::vector<char> moving, on;
+        std::vector<SvfState> st;
+        std::vector<int> list;     // 지금 쓰는 필터
+        bool any = false;
+    };
+
+    static int nextPow2 (int v) noexcept { int p = 1; while (p < v) p <<= 1; return p; }
+
+    // 아날로그 벨(우리 벨과 같은 비례 Q)의 dB, x = f / f0
+    static double bellShapeAt (double x, double q, double gainDb) noexcept
+    {
+        const double A = std::pow (10.0, gainDb / 40.0);
+        const double a = 1.0 - x * x, bn = x * A / q, bd = x / (A * q);
+        return 10.0 * std::log10 ((a * a + bn * bn) / (a * a + bd * bd));
+    }
+
+    static double shelfShapeAt (bool low, double x, double q, double gainDb) noexcept
+    {
+        const double A = std::pow (10.0, gainDb / 40.0), x2 = x * x, s = A / (q * q) * x2;
+        const double p = (A - x2) * (A - x2) + s, r = (1.0 - A * x2) * (1.0 - A * x2) + s;
+        return 10.0 * std::log10 (A * A * (low ? p / r : r / p));
+    }
+
+    void updateWeights (Band& b) noexcept
+    {
+        if (b.wN == curN && b.wType == b.type && sameValue (b.wFreq, b.freq) && sameValue (b.wQ, b.q))
+            return;
+        const int bins = curN / 2 + 1;
+        b.k0 = bins;  b.k1 = 0;
+        for (int k = 1; k < bins; ++k)
+        {
+            const double x = (double) k * binHz / b.freq;
+            double w = 0.0;
+            if (b.type == BandType::Bell)          w = bellShapeAt (x, b.q, 6.0) / 6.0;
+            else if (b.type == BandType::LowShelf) w = shelfShapeAt (true,  x, b.q * kButterworthQ, 6.0) / 6.0;
+            else                                   w = shelfShapeAt (false, x, b.q * kButterworthQ, 6.0) / 6.0;
+            w = std::clamp (w, 0.0, 1.0);
+            if (w < kMinWeight) w = 0.0;
+            b.w[(size_t) k] = w;
+            if (w > 0.0) { b.k0 = std::min (b.k0, k); b.k1 = std::max (b.k1, k); }
+        }
+        b.w[0] = 0.0;
+        b.wN = curN;  b.wType = b.type;  b.wFreq = b.freq;  b.wQ = b.q;
+    }
+
+    void updateDecay (Band& b) noexcept
+    {
+        if (b.dN == curN && sameValue (b.dDensity, b.density))
+            return;
+        const double spreadOct = (1.0 - b.density) * 0.5;          // 0 = 1/2옥타브까지 퍼짐, 1 = 안 퍼짐
+        const int bins = curN / 2 + 1;
+        for (int k = 1; k < bins; ++k)
+            b.decay[(size_t) k] = spreadOct < 1.0e-4 ? 0.0
+                                : std::exp (-std::log2 ((double) (k + 1) / (double) k) * 2.302585 / spreadOct);   // spreadOct 옥타브에서 1/10
+        b.dN = curN;  b.dDensity = b.density;
+    }
+
+    void updateTimes (Band& b) noexcept
+    {
+        if (b.cN == curN && sameValue (b.cAtt, b.attack) && sameValue (b.cRel, b.release))
+            return;
+        const double frameRate = fs / (double) hop;
+        b.aAtt = 1.0 - std::exp (-1.0 / (kAttackBase  * dynTimeScale (b.attack)  * frameRate));
+        b.aRel = 1.0 - std::exp (-1.0 / (kReleaseBase * dynTimeScale (b.release) * frameRate));
+        b.cN = curN;  b.cAtt = b.attack;  b.cRel = b.release;
+    }
+
+    // 샘플마다: 움직이는 필터는 계수를 직선으로 (지퍼 소리 없이), 그다음 SVF
+    static double runBank (BankDomain& d, double x) noexcept
+    {
+        for (int j : d.list)
+        {
+            auto& c = d.coef[(size_t) j];
+            if (d.moving[(size_t) j] != 0)
+            {
+                const auto& dc = d.dcoef[(size_t) j];
+                c.a1 += dc.a1;  c.a2 += dc.a2;  c.a3 += dc.a3;  c.m1 += dc.m1;
+            }
+            x = svfTick (c, d.st[(size_t) j], x);
+        }
+        return x;
+    }
+
+    SvfCoeffs bankCoeffs (size_t j, double gainDb) const noexcept
+    {
+        const double A = std::exp (gainDb * 0.05756462732485115);   // 10^(dB/40)
+        SvfCoeffs c;
+        c.g  = bankG[j];
+        c.k  = 1.0 / (kBankQ * A);
+        c.m0 = 1.0;
+        c.m1 = c.k * (A * A - 1.0);
+        c.m2 = 0.0;
+        return finishSvf (c);
+    }
+
+    // 몇 서브블록마다(bankStride): 게인을 한 걸음 -> 그 끝의 계수를 목표로, 이번 구간 동안 샘플마다 직선 보간
+    void bankSubBlock() noexcept
+    {
+        anyBank = false;
+        const double inv = 1.0 / (double) bankStride;
+        for (auto& d : bank)
+        {
+            if (! d.any) continue;
+            d.list.clear();
+            for (size_t j = 0; j < d.cur.size(); ++j)
+            {
+                if (d.moving[j] != 0)                     // 지난 구간 끝: 목표 계수 그대로 (쌓인 반올림 없이)
+                {
+                    d.coef[j] = d.tcoef[j];
+                    d.moving[j] = 0;
+                }
+                if (! sameValue (d.step[j], 0.0))
+                {
+                    d.cur[j] += d.step[j];
+                    if ((d.step[j] > 0.0 && d.cur[j] >= d.goal[j] - 1.0e-9) || (d.step[j] < 0.0 && d.cur[j] <= d.goal[j] + 1.0e-9))
+                    {
+                        d.cur[j] = d.goal[j];             // 목표 도착: 다음 프레임까지 그대로
+                        d.step[j] = 0.0;
+                    }
+                    if (d.on[j] == 0)                      // 새로 켜짐: 0 dB 계수 · 빈 상태에서 시작
+                    {
+                        d.st[j] = SvfState {};
+                        d.coef[j] = bankCoeffs (j, 0.0);
+                        d.on[j] = 1;
+                    }
+                    d.tcoef[j] = bankCoeffs (j, d.cur[j]);
+                    auto& dc = d.dcoef[j];
+                    dc.a1 = (d.tcoef[j].a1 - d.coef[j].a1) * inv;
+                    dc.a2 = (d.tcoef[j].a2 - d.coef[j].a2) * inv;
+                    dc.a3 = (d.tcoef[j].a3 - d.coef[j].a3) * inv;
+                    dc.m1 = (d.tcoef[j].m1 - d.coef[j].m1) * inv;
+                    d.moving[j] = 1;
+                }
+                if (d.moving[j] != 0 || ! sameValue (d.cur[j], 0.0))
+                    d.list.push_back ((int) j);
+                else
+                    d.on[j] = 0;
+            }
+            d.any = ! d.list.empty() || hasPendingSteps (d);
+            anyBank = anyBank || d.any;
+        }
+    }
+
+    static bool hasPendingSteps (const BankDomain& d) noexcept
+    {
+        for (size_t j = 0; j < d.step.size(); ++j)
+            if (! sameValue (d.step[j], 0.0)) return true;
+        return false;
+    }
+
+    // 프레임: 분석 -> 밴드별 감지 -> 도메인별 게인 지도 -> 합성
+    void frame (bool two) noexcept
+    {
+        bool anyWant = false;
+        for (auto& b : bands) anyWant = anyWant || b.want || b.live;
+        if (! anyWant && ! linear)
+        {
+            if (anyLive || anyBank)                  // 남은 필터를 0 dB로 돌려놓기 (몇 홉)
+            {
+                clearFields();
+                const std::array<bool, kNumDomains> none {};
+                planBank (none);
+                publishDisplay (none);
+            }
+            anyLive = false;
+            return;
+        }
+
+        const int N = curN, bins = N / 2 + 1;
+        RealFft& fft = linear ? fftLin : fftBank;
+        const auto& win = linear ? winLin : winBank;
+        const std::uint64_t start = t - (std::uint64_t) N;
+        for (int c = 0; c < (two ? 2 : 1); ++c)
+        {
+            for (int i = 0; i < N; ++i)
+                frameBuf[(size_t) i] = inRing[(size_t) c][(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)] * win[(size_t) i];
+            fft.forward (frameBuf.data(), xr[(size_t) c].data(), xi[(size_t) c].data());
+        }
+
+        // 필요한 감지 도메인과 칸 범위 (밴드 영역 + 자동 문턱 창)
+        std::array<bool, kNumDetect> needDet {};
+        std::array<int, kNumDetect> detLo {}, detHi {};
+        detLo.fill (bins);  detHi.fill (-1);
+        std::array<bool, kNumDomains> touched {};
+        for (auto& b : bands)
+            if (b.want || b.live)
+            {
+                const int d = detectDomain (b.place, two);
+                if (d < 0) continue;
+                updateWeights (b);
+                needDet[(size_t) d] = true;
+                detLo[(size_t) d] = std::min (detLo[(size_t) d], b.k0);
+                detHi[(size_t) d] = std::max (detHi[(size_t) d], b.k1);
+            }
+        for (int d = 0; d < kNumDetect; ++d)
+            if (needDet[(size_t) d] && detHi[(size_t) d] >= detLo[(size_t) d])
+                analyse (d, bins, two, detLo[(size_t) d], detHi[(size_t) d]);
+
+        clearFields();
+        anyLive = false;
+        fieldLo = bins;  fieldHi = -1;
+        for (size_t bi = 0; bi < bands.size(); ++bi)
+        {
+            auto& b = bands[bi];
+            if (! (b.want || b.live)) continue;
+            const int det = detectDomain (b.place, two);
+            if (det < 0) { b.live = false; b.display.store (0.0f, std::memory_order_relaxed); continue; }
+            updateWeights (b);
+            updateDecay (b);
+            updateTimes (b);
+            fieldLo = std::min (fieldLo, b.k0);
+            fieldHi = std::max (fieldHi, b.k1);
+
+            double maxAbs = 0.0;
+            const auto& lev = levelDb[(size_t) det];
+            const auto& ref = refDb[(size_t) det];
+            for (int k = b.k0; k <= b.k1; ++k)
+            {
+                double tgt = 0.0;
+                if (b.want)
+                {
+                    const double th = b.autoTh ? ref[(size_t) k] + kAutoMarginDb : b.thresh;
+                    tgt = spectralGainDb (lev[(size_t) k] - th, b.range);
+                }
+                double& dl = b.delta[(size_t) k];
+                dl += (std::abs (tgt) > std::abs (dl) ? b.aAtt : b.aRel) * (tgt - dl);
+                maxAbs = std::max (maxAbs, std::abs (dl));
+            }
+            b.live = b.want || maxAbs > 1.0e-4;
+            if (! b.live)
+            {
+                std::fill (b.delta.begin(), b.delta.end(), 0.0);
+                b.display.store (0.0f, std::memory_order_relaxed);
+                continue;
+            }
+            anyLive = true;
+
+            // DENSITY: 둘레로 퍼뜨리기 (크기 기준 팽창, 상수 Q 감쇠)
+            auto& e = tmpB;
+            for (int k = b.k0; k <= b.k1; ++k) e[(size_t) k] = std::abs (b.delta[(size_t) k]);
+            for (int k = b.k0 + 1; k <= b.k1; ++k)
+                e[(size_t) k] = std::max (e[(size_t) k], e[(size_t) (k - 1)] * b.decay[(size_t) (k - 1)]);
+            for (int k = b.k1 - 1; k >= b.k0; --k)
+                e[(size_t) k] = std::max (e[(size_t) k], e[(size_t) (k + 1)] * b.decay[(size_t) k]);
+
+            const double sign = b.range < 0.0 ? -1.0 : 1.0;
+            double shown = 0.0;
+            for (int k = b.k0; k <= b.k1; ++k)
+            {
+                const double v = sign * e[(size_t) k] * b.w[(size_t) k];
+                if (std::abs (v) > std::abs (shown)) shown = v;
+                forEachTarget (b.place, two, [&] (int dom) { field[(size_t) dom][(size_t) k] += v; touched[(size_t) dom] = true; });
+            }
+            b.display.store ((float) shown, std::memory_order_relaxed);
+        }
+
+        if (linear)
+            synthesise (bins, two, touched);
+        else
+            planBank (touched);
+        publishDisplay (touched);
+    }
+
+    // 문턱부터 4 dB에 걸친 니 (문턱 아래는 0: 잡음의 작은 출렁임으로 칸들이 움직이지 않게)
+    static double spectralGainDb (double over, double rangeDb) noexcept
+    {
+        const double r = std::abs (rangeDb);
+        if (r < 1.0e-6 || ! (over > 0.0))
+            return 0.0;
+        const double o = over < kSpecKneeDb ? over * over / (2.0 * kSpecKneeDb) : over - 0.5 * kSpecKneeDb;
+        return rangeDb * std::tanh (kSlope * o / r);
+    }
+
+    // 감지 도메인: 스테레오 = 두 채널 중 큰 쪽(같이 움직임), 모노는 전부 그 채널 (Side 없음)
+    static int detectDomain (Placement p, bool two) noexcept
+    {
+        if (! two) return p == Placement::Side ? -1 : DetL;
+        switch (p)
+        {
+            case Placement::Stereo: return DetLink;
+            case Placement::Left:   return DetL;
+            case Placement::Right:  return DetR;
+            case Placement::Mid:    return DetM;
+            case Placement::Side:   return DetS;
+        }
+        return DetLink;
+    }
+
+    template <typename Fn>
+    static void forEachTarget (Placement p, bool two, Fn&& fn)
+    {
+        if (! two) { if (p != Placement::Side) fn (DomL); return; }
+        switch (p)
+        {
+            case Placement::Stereo: fn (DomL); fn (DomR); break;
+            case Placement::Left:   fn (DomL); break;
+            case Placement::Right:  fn (DomR); break;
+            case Placement::Mid:    fn (DomM); break;
+            case Placement::Side:   fn (DomS); break;
+        }
+    }
+
+    void analyse (int d, int bins, bool two, int kLo, int kHi) noexcept
+    {
+        // 자동 문턱 창(+-1/4옥타브)까지 넓혀서 그 범위만
+        const int lo0 = std::max (1, (int) std::floor ((double) kLo * 0.8409) - 1);
+        const int hi0 = std::min (bins - 1, (int) std::ceil ((double) kHi * 1.1892) + 1);
+        auto& P = power[(size_t) d];
+        const auto& lr = xr[0];  const auto& li = xi[0];
+        const auto& rr = xr[1];  const auto& ri = xi[1];
+        for (int k = lo0; k <= hi0; ++k)
+        {
+            const size_t z = (size_t) k;
+            const double pl = lr[z] * lr[z] + li[z] * li[z];
+            double v = pl;
+            if (two)
+            {
+                const double pr = rr[z] * rr[z] + ri[z] * ri[z];
+                if (d == DetLink)  v = std::max (pl, pr);
+                else if (d == DetR) v = pr;
+                else if (d == DetM || d == DetS)
+                {
+                    const double sg = d == DetM ? 1.0 : -1.0;
+                    const double a = 0.5 * (lr[z] + sg * rr[z]), b = 0.5 * (li[z] + sg * ri[z]);
+                    v = a * a + b * b;
+                }
+            }
+            P[z] = v;
+        }
+        // 칸 레벨: 20 ms 평균(파워) -> 사인 기준 dB
+        auto& pw = levelPw[(size_t) d];
+        auto& lev = levelDb[(size_t) d];
+        for (int k = lo0; k <= hi0; ++k)
+        {
+            pw[(size_t) k] += aLevel * (P[(size_t) k] - pw[(size_t) k]);
+            lev[(size_t) k] = 10.0 * std::log10 (cal * pw[(size_t) k] + 1.0e-30);
+        }
+        // 자동 문턱 기준: 주변 1/2옥타브(+-1/4)의 로그 평균, 400 ms 평균 (누적 합으로 칸마다 O(1))
+        auto& cs = tmpA;
+        cs[(size_t) lo0] = 0.0;
+        for (int k = lo0; k <= hi0; ++k) cs[(size_t) k + 1] = cs[(size_t) k] + lev[(size_t) k];
+        auto& ref = refDb[(size_t) d];
+        const bool init = ! refValid[(size_t) d];
+        for (int k = std::max (1, kLo); k <= std::min (bins - 1, kHi); ++k)
+        {
+            const int lo = std::max (lo0, (int) std::floor ((double) k * 0.8409));
+            const int hi = std::min (hi0, (int) std::ceil ((double) k * 1.1892));
+            const double avg = (cs[(size_t) hi + 1] - cs[(size_t) lo]) / (double) (hi - lo + 1);
+            ref[(size_t) k] = init ? avg : ref[(size_t) k] + aRef * (avg - ref[(size_t) k]);
+        }
+        refValid[(size_t) d] = true;
+    }
+
+    void clearFields() noexcept
+    {
+        const int bins = curN / 2 + 1;
+        for (auto& f : field) std::fill (f.begin(), f.begin() + bins, 0.0);
+    }
+
+    // 선형 위상: X * 10^(G/20), M/S 지도는 M/S로 바꿔 곱하고 되돌림 -> 역FFT -> sqrt-Hann -> 겹쳐 더하기
+    void synthesise (int bins, bool two, const std::array<bool, kNumDomains>& touched) noexcept
+    {
+        auto gainOf = [this] (int dom, int k) { return std::exp (field[(size_t) dom][(size_t) k] * 0.11512925464970229); };   // 10^(dB/20)
+        for (int k = std::max (0, fieldLo); k <= std::min (bins - 1, fieldHi); ++k)
+        {
+            const size_t z = (size_t) k;
+            if (touched[DomL]) { const double g = gainOf (DomL, k); xr[0][z] *= g; xi[0][z] *= g; }
+            if (two && touched[DomR]) { const double g = gainOf (DomR, k); xr[1][z] *= g; xi[1][z] *= g; }
+            if (two && (touched[DomM] || touched[DomS]))
+            {
+                const double gm = touched[DomM] ? gainOf (DomM, k) : 1.0, gs = touched[DomS] ? gainOf (DomS, k) : 1.0;
+                const double mr = 0.5 * (xr[0][z] + xr[1][z]) * gm, mi = 0.5 * (xi[0][z] + xi[1][z]) * gm;
+                const double sr = 0.5 * (xr[0][z] - xr[1][z]) * gs, si = 0.5 * (xi[0][z] - xi[1][z]) * gs;
+                xr[0][z] = mr + sr;  xi[0][z] = mi + si;
+                xr[1][z] = mr - sr;  xi[1][z] = mi - si;
+            }
+        }
+        const std::uint64_t start = t - (std::uint64_t) curN;
+        for (int c = 0; c < (two ? 2 : 1); ++c)
+        {
+            fftLin.inverse (xr[(size_t) c].data(), xi[(size_t) c].data(), frameBuf.data());
+            auto& acc = outAcc[(size_t) c];
+            for (int i = 0; i < curN; ++i)
+                acc[(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)] += 0.5 * frameBuf[(size_t) i] * winLin[(size_t) i];
+        }
+    }
+
+    // 필터 뱅크: 격자점마다 원하는 dB (그 둘레 칸 중 변화가 가장 큰 값) -> 이웃 겹침을 빼는 반복 -> 다음 홉 동안 직선 이동
+    void planBank (const std::array<bool, kNumDomains>& touched) noexcept
+    {
+        const int bins = curN / 2 + 1;
+        const size_t ng = bankHz.size();
+        const double steps = (double) std::max (1, hop / bankStride);
+        anyBank = false;
+        for (int dom = 0; dom < kNumDomains; ++dom)
+        {
+            auto& d = bank[(size_t) dom];
+            const auto& f = field[(size_t) dom];
+            if (! touched[(size_t) dom])
+                std::fill (d.want.begin(), d.want.end(), 0.0);
+            else
+                for (size_t j = 0; j < ng; ++j)
+                {
+                    const double kc = bankHz[j] / binHz;
+                    const int lo = std::max (1, (int) std::floor (kc * 0.9715)), hi = std::min (bins - 1, (int) std::ceil (kc * 1.0293));
+                    double v = 0.0;
+                    if (hi < lo || hi - lo < 1)
+                    {
+                        const int k = std::clamp ((int) kc, 1, bins - 2);
+                        const double u = std::clamp (kc - (double) k, 0.0, 1.0);
+                        v = f[(size_t) k] + u * (f[(size_t) k + 1] - f[(size_t) k]);
+                    }
+                    else
+                        for (int k = lo; k <= hi; ++k)
+                            if (std::abs (f[(size_t) k]) > std::abs (v)) v = f[(size_t) k];
+                    d.want[j] = v;
+                }
+
+            // 반복 (이전 목표에서 시작): g += 0.6 (want - S g)
+            for (int it = 0; it < 3; ++it)
+            {
+                for (size_t j = 0; j < ng; ++j)
+                {
+                    double sg = 0.0;
+                    for (int m = -kNeighbours; m <= kNeighbours; ++m)
+                    {
+                        const long jj = (long) j + m;
+                        if (jj < 0 || jj >= (long) ng) continue;
+                        sg += neighbour[(size_t) std::abs (m)] * d.tgt[(size_t) jj];
+                    }
+                    tmpB[j] = d.tgt[j] + 0.6 * (d.want[j] - sg);
+                }
+                for (size_t j = 0; j < ng; ++j)
+                    d.tgt[j] = std::clamp (tmpB[j], -30.0, 30.0);
+            }
+
+            bool any = false;
+            for (size_t j = 0; j < ng; ++j)
+            {
+                if (std::abs (d.tgt[j]) < 1.0e-4) d.tgt[j] = 0.0;
+                // 아주 작은 변화는 0으로: 잡음 때문에 필터들이 계속 켜져 있지 않게
+                double g = std::abs (d.tgt[j]) < kBankDeadDb && std::abs (d.want[j]) < kBankDeadDb ? 0.0 : d.tgt[j];
+                if (! sameValue (g, 0.0) && std::abs (g - d.cur[j]) < 0.003)
+                    g = d.cur[j];                                    // 계수를 다시 만들 만큼 바뀌지 않음
+                d.goal[j] = g;
+                d.step[j] = sameValue (g, d.cur[j]) ? 0.0 : (g - d.cur[j]) / steps;
+                any = any || ! sameValue (d.step[j], 0.0) || ! sameValue (d.cur[j], 0.0);
+            }
+            d.any = any;
+            anyBank = anyBank || any;
+        }
+    }
+
+    void publishDisplay (const std::array<bool, kNumDomains>& touched) noexcept
+    {
+        const int bins = curN / 2 + 1;
+        for (int dom = 0; dom < kNumDomains; ++dom)
+            for (int p = 0; p < kDisplayPoints; ++p)
+            {
+                float v = 0.0f;
+                if (touched[(size_t) dom])
+                {
+                    const double kc = displayHz (p) / binHz;
+                    const int k = std::clamp ((int) kc, 0, bins - 2);
+                    const double u = std::clamp (kc - (double) k, 0.0, 1.0);
+                    v = (float) (field[(size_t) dom][(size_t) k] + u * (field[(size_t) dom][(size_t) k + 1] - field[(size_t) dom][(size_t) k]));
+                }
+                display[(size_t) dom][(size_t) p].store (v, std::memory_order_relaxed);
+            }
+    }
+
+    double fs = 48000.0, binHz = 46.875, cal = 1.0, aLevel = 0.5, aRef = 0.05;
+    int nch = 2, subBlock = 16, bankStride = 64, nBank = 1024, nLin = 2048, curN = 1024, hop = 256, ringMask = 4095;
+    bool linear = false, anyLive = false, anyBank = false;
+    int fieldLo = 0, fieldHi = -1;                       // 게인 지도가 0이 아닐 수 있는 칸 범위
+    std::uint64_t t = 0;
+    RealFft fftBank, fftLin;
+    std::array<std::vector<double>, 2> inRing, outAcc, xr, xi;
+    std::vector<double> frameBuf, tmpA, tmpB, winBank, winLin;
+    std::array<std::vector<double>, kNumDetect> power, levelDb, levelPw, refDb;
+    std::array<bool, kNumDetect> refValid {};
+    std::array<std::vector<double>, kNumDomains> field;
+    std::array<Band, kMaxBands> bands;
+    std::vector<double> bankHz, bankG;
+    std::array<BankDomain, kNumDomains> bank;
+    std::array<double, kNeighbours + 1> neighbour {};
+    std::array<std::array<std::atomic<float>, kDisplayPoints>, kNumDomains> display {};
 };
 
 //==============================================================================
@@ -2078,11 +3022,37 @@ public:
         for (auto& b : bands) b.prepare (fs);
         for (auto& t : tube)  t.prepare (fs);
         for (auto& x : xf)    x.prepare (fs);
+        spectral.prepare (fs, numCh);
+        const int maxLatency = 2 * std::max (spectral.latencySamples(), 16384);
+        for (auto& d : dryDelay) d.assign ((size_t) maxLatency, 0.0f);
         applySmoothing();
         reset();
     }
 
     double getProcessingRate() const noexcept { return fs; }
+
+    // 스펙트럴 밴드를 선형 위상으로 (HQ). 레이턴시가 바뀌므로 플러그인이 무음 순간에만 부름 (상태도 비움)
+    void setSpectralLinearPhase (bool on) noexcept
+    {
+        if (on == spectral.isLinearPhase())
+            return;
+        spectral.setLinearPhase (on);
+        for (auto& d : dryDelay) std::fill (d.begin(), d.end(), 0.0f);
+        dryPos = 0;
+    }
+    bool isSpectralLinearPhase() const noexcept { return spectral.isLinearPhase(); }
+    int getLatencySamples() const noexcept { return spectral.latencySamples(); }
+
+    // 화면용 (어느 스레드에서든)
+    float getDynamicGainDb (int band) const noexcept
+    {
+        const int b = std::clamp (band, 0, kMaxBands - 1);
+        return bands[(size_t) b].dynamicGainDisplay() + spectral.bandDisplay (b);
+    }
+    const SpectralStage& getSpectral() const noexcept { return spectral; }
+
+    // 밴드 듣기 (-1 = 끔): 그 밴드가 보는 부분(감지 신호 = EQ 전 입력을 그 밴드 영역으로 거른 것)만 내보냄. 5 ms 크로스페이드
+    void setAudition (int band) noexcept { auditionBand = std::clamp (band, -1, kMaxBands - 1); }
 
     void setSmoothingMs (double ms)
     {
@@ -2097,6 +3067,8 @@ public:
     {
         for (size_t i = 0; i < bands.size(); ++i)
             bands[i].setTarget (p.bands[i], p.eqOn);
+        spectral.setParams (p);
+        auditionCfg = p.bands;
         for (auto& t : tube) t.setTargets (p.driveOn, p.drive, p.focus);
         const double xa = p.xfAll ? 1.0 : 0.0;
         for (auto& x : xf)   x.setAmounts (xa * p.xfLow, xa * p.xfMid, xa * p.xfHigh);
@@ -2109,6 +3081,13 @@ public:
         for (auto& b : bands) b.reset();
         for (auto& t : tube)  t.reset();
         for (auto& x : xf)    x.reset();
+        spectral.reset();
+        spectralWasActive = false;
+        audMix = 0.0;
+        audSt = {};
+        audKey = -1.0;
+        for (auto& d : dryDelay) std::fill (d.begin(), d.end(), 0.0f);
+        dryPos = 0;
         stageOn = { false, false };
         mix.snap();
         outGain.snap();
@@ -2156,11 +3135,30 @@ private:
     void processChunk (float* L, float* R, int nc, int n, int pos) noexcept
     {
         const bool useMix = ! (mix.isSettled() && sameValue (mix.current, 1.0));
-        if (useMix)
+        const int lat = spectral.latencySamples();
+        if (lat > 0)                                   // 선형 위상 스펙트럴: 원음도 같은 만큼 늦춰서 섞음
+        {
+            const int sz = (int) dryDelay[0].size();
+            for (int k = 0; k < n; ++k)
+            {
+                const int w = (dryPos + k) % sz, r = (dryPos + k - lat + sz) % sz;
+                dryDelay[0][(size_t) w] = L[k];
+                if (R != nullptr) dryDelay[1][(size_t) w] = R[k];
+                dry[0][(size_t) k] = dryDelay[0][(size_t) r];
+                if (R != nullptr) dry[1][(size_t) k] = dryDelay[1][(size_t) r];
+            }
+            dryPos = (dryPos + n) % sz;
+        }
+        else if (useMix)
         {
             std::copy (L, L + n, dry[0].begin());
             if (R != nullptr) std::copy (R, R + n, dry[1].begin());
         }
+
+        // EQ 전 입력 (다이내믹 감지용)
+        std::copy (L, L + n, pre[0].begin());
+        if (R != nullptr) std::copy (R, R + n, pre[1].begin());
+        const float* preR = R != nullptr ? pre[1].data() : nullptr;
 
         // EQ: L/R 그룹(스테레오 · L · R) 다음 M/S 그룹(Mid · Side). 모노면 Side 말고 전부 그 채널에
         bool anyMs = false;
@@ -2168,7 +3166,7 @@ private:
         {
             if (! b.isRunning()) continue;
             if (nc == 2 && isMsPlacement (b.placement())) { anyMs = true; continue; }
-            b.process (L, R, nc, n);
+            b.process (L, R, nc, n, pre[0].data(), preR);
         }
         if (anyMs)
         {
@@ -2177,10 +3175,13 @@ private:
                 const double l = L[k], r = R[k];
                 L[k] = (float) (0.5 * (l + r));
                 R[k] = (float) (0.5 * (l - r));
+                const double pl = pre[0][(size_t) k], pr = pre[1][(size_t) k];
+                preMs[0][(size_t) k] = (float) (0.5 * (pl + pr));
+                preMs[1][(size_t) k] = (float) (0.5 * (pl - pr));
             }
             for (auto& b : bands)
                 if (b.isRunning() && isMsPlacement (b.placement()))
-                    b.process (L, R, nc, n);
+                    b.process (L, R, nc, n, preMs[0].data(), preMs[1].data());
             for (int k = 0; k < n; ++k)
             {
                 const double m = L[k], s = R[k];
@@ -2189,6 +3190,13 @@ private:
             }
         }
 
+        const bool specActive = spectral.isActive();              // 스펙트럴 다이내믹스 (EQ 뒤, 아날로그 앞)
+        if (specActive)
+        {
+            if (! spectralWasActive) spectral.restart();
+            spectral.process (L, R, nc, n);
+        }
+        spectralWasActive = specActive;
         applyBandAnalog (L, R, nc, n, pos);                       // 밴드마다의 튜브 · 트랜스포머
         if (stageOn[0]) { tube[0].process (L, n); if (R != nullptr) tube[1].process (R, n); }   // EF804S (ALL)
         if (stageOn[1]) { xf[0].process (L, n);   if (R != nullptr) xf[1].process (R, n); }     // 트랜스포머 (ALL)
@@ -2209,6 +3217,43 @@ private:
                 L[k] = (float) ((double) L[k] * g);
                 if (R != nullptr) R[k] = (float) ((double) R[k] * g);
             }
+
+        applyAudition (L, R, nc, n);
+    }
+
+    void applyAudition (float* L, float* R, int nc, int n) noexcept
+    {
+        const int ab = auditionBand;
+        const bool want = ab >= 0 && auditionCfg[(size_t) ab].used;
+        if (! want && audMix <= 0.0)
+            return;
+        const auto& b = auditionCfg[(size_t) (want ? ab : std::max (0, audLast))];
+        if (want) audLast = ab;
+        const double key = (double) ab * 1.0e7 + (double) (int) b.type * 1.0e6 + (double) b.place * 1.0e5 + b.freq + b.q * 1.0e-3;
+        if (! sameValue (key, audKey))
+        {
+            audC = makeRegion (b.type, b.freq, b.q, fs);
+            audKey = key;
+        }
+        const double step = 1.0 / (0.005 * fs);
+        for (int k = 0; k < n; ++k)
+        {
+            audMix = want ? std::min (1.0, audMix + step) : std::max (0.0, audMix - step);
+            const double pl = pre[0][(size_t) k], pr = nc > 1 && R != nullptr ? (double) pre[1][(size_t) k] : pl;
+            double a = pl, c = pr;
+            switch (b.place)
+            {
+                case Placement::Stereo: break;
+                case Placement::Left:   c = pl; break;
+                case Placement::Right:  a = pr; break;
+                case Placement::Mid:    a = c = 0.5 * (pl + pr); break;
+                case Placement::Side:   a = c = nc > 1 ? 0.5 * (pl - pr) : 0.0; break;
+            }
+            const double ya = svfTick (audC, audSt[0], a);
+            const double yc = svfTick (audC, audSt[1], c);
+            L[k] = (float) ((double) L[k] + audMix * (ya - (double) L[k]));
+            if (R != nullptr) R[k] = (float) ((double) R[k] + audMix * (yc - (double) R[k]));
+        }
     }
 
     // 밴드 아날로그: 모두 EQ를 다 건 같은 신호에서 영역을 떼어(병렬) 바뀐 만큼을 모아 더함
@@ -2268,7 +3313,7 @@ private:
 
     double fs = 48000.0, smoothingSeconds = 0.015;
     std::array<bool, 2> stageOn { false, false };
-    std::array<std::array<float, kChunk>, 2> dBuf {}, msBuf {}, msDelta {};
+    std::array<std::array<float, kChunk>, 2> dBuf {}, msBuf {}, msDelta {}, pre {}, preMs {};
     int numCh = 2;
     std::uint64_t sampleCounter = 0;
     std::array<BandProcessor, kMaxBands> bands;
@@ -2276,6 +3321,15 @@ private:
     std::array<TransformerStage, 2> xf;
     Smoother mix, outGain;
     std::array<std::array<float, kChunk>, 2> dry {};
+    SpectralStage spectral;
+    bool spectralWasActive = false;
+    std::array<BandParams, kMaxBands> auditionCfg {};
+    int auditionBand = -1, audLast = 0;
+    double audMix = 0.0, audKey = -1.0;
+    SvfCoeffs audC;
+    std::array<SvfState, 2> audSt {};
+    std::array<std::vector<float>, 2> dryDelay;
+    int dryPos = 0;
 };
 
 //==============================================================================
@@ -2288,7 +3342,8 @@ private:
 class ResponseModel
 {
 public:
-    ResponseModel (const Params& p, double sampleRate) noexcept
+    // gainOffsets: 밴드마다 고정 게인에 더할 dB (다이내믹 EQ의 지금 값 · RANGE 끝 표시용, 없으면 nullptr)
+    ResponseModel (const Params& p, double sampleRate, const std::array<float, kMaxBands>* gainOffsets = nullptr) noexcept
         : fs (sampleRate > 0.0 ? sampleRate : 48000.0)
     {
         for (size_t i = 0; i < p.bands.size(); ++i)
@@ -2296,8 +3351,9 @@ public:
             const auto& b = p.bands[i];
             active[i] = b.isActive() && p.eqOn;
             place[i]  = b.place;
+            const double extra = (gainOffsets != nullptr && typeHasDynamics (b.type)) ? (double) (*gainOffsets)[i] : 0.0;
             if (active[i])
-                designs[i] = designBand (b.type, b.freq, b.gain, b.q, b.slope, fs);
+                designs[i] = designBand (b.type, b.freq, b.gain + extra, b.q, b.slope, fs);
         }
         shelf = makeHighShelfMatched (TransformerStage::kShelfHz, TransformerStage::kShelfQ,
                                       -TransformerStage::kShelfMaxCutDb * (p.xfAll ? clamp01 (p.xfHigh) : 0.0), fs);

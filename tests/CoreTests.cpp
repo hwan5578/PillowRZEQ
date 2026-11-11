@@ -163,6 +163,14 @@ static Params randomParams (std::mt19937& rng)
             b.tubeMix  = u (rng) < 0.3f ? u (rng) : 1.0f;
             b.xfmr     = u (rng) < 0.3f;
             b.xfAmount = u (rng);
+            b.dyn      = u (rng) < 0.35f;
+            b.dynRange = -24.0f + 48.0f * u (rng);
+            b.autoTh   = u (rng) < 0.5f;
+            b.thresh   = -60.0f * u (rng);
+            b.attack   = u (rng);
+            b.release  = u (rng);
+            b.spectral = u (rng) < 0.3f;
+            b.density  = u (rng);
         }
     return p;
 }
@@ -655,6 +663,30 @@ static void testClicks()
         Params b = a; b.bands[0].xfmr = true;
         add ("Band transformer on (100 %)", a, b);
     }
+    {
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0);
+        a.bands[0].dynRange = -12; a.bands[0].autoTh = false; a.bands[0].thresh = -30;
+        Params b = a; b.bands[0].dyn = true;
+        add ("Dynamic on (300 Hz, -12 dB)", a, b);
+    }
+    {
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0);
+        a.bands[0].dyn = true; a.bands[0].dynRange = -3; a.bands[0].autoTh = false; a.bands[0].thresh = -30;
+        Params b = a; b.bands[0].dynRange = -18;
+        add ("Dynamic range -3 -> -18 dB", a, b);
+    }
+    {
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0);
+        a.bands[0].dyn = true; a.bands[0].dynRange = -12; a.bands[0].autoTh = false; a.bands[0].thresh = -30;
+        Params b = a; b.bands[0].spectral = true;
+        add ("Dynamic -> spectral (300 Hz)", a, b);
+    }
+    {
+        Params a; a.bands[0] = makeBand (BandType::Bell, 300, 0, 1.0);
+        a.bands[0].dyn = true; a.bands[0].spectral = true; a.bands[0].dynRange = -12; a.bands[0].autoTh = false; a.bands[0].thresh = -30;
+        Params b = a; b.bands[0].dyn = false;
+        add ("Spectral off (releases)", a, b);
+    }
     for (auto& c : cases)
     {
         const auto on  = measureClick (c.a, c.b, 15.0);
@@ -701,7 +733,7 @@ static void testStress()
 //------------------------------------------------------------------------------
 static void testBlockSizeIndependence()
 {
-    std::printf ("[9] 블록 크기와 무관하게 같은 결과 (밴드 전환·튜브·트랜스포머 포함)\n");
+    std::printf ("[9] 블록 크기와 무관하게 같은 결과 (밴드 전환·튜브·트랜스포머·다이내믹·스펙트럴 포함)\n");
     const double fs = 96000.0;
     const int total = 2048 * 24;
     std::mt19937 rng (3);
@@ -711,18 +743,22 @@ static void testBlockSizeIndependence()
     std::vector<Params> plist;
     for (int i = 0; i < total / 2048; ++i) plist.push_back (randomParams (rng));
 
+    bool linear = false;
     auto run = [&] (int block)
     {
         Engine e;
         e.prepare (fs, 2, 600);
+        e.setSpectralLinearPhase (linear);
         e.setParams (plist[0]);
         e.reset();
         auto L = inL, R = inR;
-        for (int start = 0; start < total; start += block)
+        for (int start = 0; start < total;)
         {
             if (start % 2048 == 0) e.setParams (plist[(size_t) (start / 2048)]);
+            const int len = std::min ({ block, total - start, 2048 - start % 2048 });   // 설정은 늘 2048 경계에서
             float* ptr[2] = { L.data() + start, R.data() + start };
-            e.process (ptr, 2, block);
+            e.process (ptr, 2, len);
+            start += len;
         }
         L.insert (L.end(), R.begin(), R.end());
         return L;
@@ -730,6 +766,10 @@ static void testBlockSizeIndependence()
     const auto ref = run (2048);
     for (int b : { 1, 16, 64, 512 })
         CHECK (run (b) == ref, "block size %d differs from 2048", b);
+    linear = true;                                      // 스펙트럴 선형 위상(HQ)도
+    const auto refLin = run (2048);
+    for (int b : { 1, 37, 512 })
+        CHECK (run (b) == refLin, "linear-phase spectral: block size %d differs from 2048", b);
 }
 
 //------------------------------------------------------------------------------
@@ -1600,6 +1640,305 @@ static void testBandTubeRegions()
 }
 
 //------------------------------------------------------------------------------
+// 다이내믹 EQ (v0.8): 정적 곡선, 대역 밖, 시간, 자동 문턱, 셸프 · 틸트, M/S, 꺼져 있으면 그대로
+static void testDynamicEq()
+{
+    std::printf ("[19] 다이내믹 EQ (밴드 게인이 그 부분의 레벨로 움직임)\n");
+    const double fs = 48000.0;
+    auto runTone = [&] (const Params& p, double f, double levelDb, int nch = 1, double secs = 1.0)
+    {
+        const int n = (int) (fs * secs);
+        auto L = sine (fs, f, std::pow (10.0, levelDb / 20.0), n), R = L;
+        runEngine (p, fs, L, R, nch);
+        return toneDb (L, fs, f, n / 2, n / 2) - levelDb;
+    };
+    auto dynBell = [] (double f, double range, double thresh, double q = 1.0)
+    {
+        auto b = makeBand (BandType::Bell, f, 0.0, q);
+        b.dyn = true; b.dynRange = (float) range; b.autoTh = false; b.thresh = (float) thresh;
+        return b;
+    };
+
+    // 1) 정적 곡선: 출력 변화 = dynamicGainDb(레벨 - 문턱, RANGE)
+    double worst = 0.0;
+    for (double range : { -12.0, 6.0, -24.0 })
+        for (double lvl : { -40.0, -24.0, -10.0, 0.0 })
+        {
+            Params p; p.xfAll = false; p.bands[0] = dynBell (1000.0, range, -30.0);
+            const double got = runTone (p, 1000.0, lvl), want = dynamicGainDb (lvl + 30.0, range);
+            worst = std::max (worst, std::abs (got - want));
+        }
+    {
+        Params p; p.xfAll = false; p.bands[0] = dynBell (1000.0, -12.0, -30.0);
+        std::printf ("    벨 1 kHz, 문턱 -30, RANGE -12: -10 dBFS 사인 -> %+.2f dB (계산 %+.2f), 계산과의 차이 최대 %.2f dB (RANGE -12 / +6 / -24)\n",
+                     runTone (p, 1000.0, -10.0), dynamicGainDb (20.0, -12.0), worst);
+    }
+    CHECK (worst < 0.3, "dynamic static curve off by %.2f dB", worst);
+
+    // 2) 대역 밖 소리는 움직이지 않음 (100 Hz -10 dBFS, 1 kHz 벨 Q 2)
+    {
+        Params p; p.xfAll = false; p.bands[0] = dynBell (1000.0, -12.0, -30.0, 2.0);
+        const double d = runTone (p, 100.0, -10.0);
+        std::printf ("    대역 밖 100 Hz -10 dBFS: %+.3f dB\n", d);
+        CHECK (std::abs (d) < 0.05, "out-of-band tone moved %.3f dB", d);
+    }
+
+    // 3) 꺼져 있거나 RANGE 0이거나 문턱 아래면 비트 단위로 고정 EQ와 같음
+    {
+        const int n = 48000;
+        auto x = sine (fs, 1000.0, 0.01, n);
+        for (int i = 0; i < n; ++i) x[(size_t) i] += (float) (0.005 * std::sin (2.0 * kPi * 3100.0 * i / fs));
+        Params st; st.xfAll = false; st.bands[0] = makeBand (BandType::Bell, 1000.0, 4.0, 1.0);
+        auto ref = x, refR = x;
+        runEngine (st, fs, ref, refR);
+        bool same = true;
+        for (int c = 0; c < 3; ++c)
+        {
+            Params p = st;
+            p.bands[0].dyn = c != 0;  p.bands[0].dynRange = c == 1 ? 0.0f : -12.0f;  p.bands[0].autoTh = false;
+            p.bands[0].thresh = c == 2 ? -6.0f : -30.0f;      // c == 2: -40 dBFS 신호는 문턱 -6 한참 아래
+            auto L = x, R = x;
+            runEngine (p, fs, L, R);
+            same = same && L == ref;
+        }
+        CHECK (same, "dynamic off / range 0 / below threshold must be bit-exact static");
+    }
+
+    // 4) 시간: -40 -> -10 dBFS 계단에서 63 % 도달 (자동 = 3주기, ATTACK 0 = 8배 빠르게, 1 = 8배 느리게)
+    {
+        for (double att : { 0.0, 0.5, 1.0 })
+        {
+            Params p; p.xfAll = false; p.bands[0] = dynBell (1000.0, -12.0, -30.0);
+            p.bands[0].attack = (float) att;
+            Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+            const int n = 48000;
+            std::vector<float> x ((size_t) n);
+            for (int i = 0; i < n; ++i) x[(size_t) i] = (float) ((i < n / 2 ? 0.01 : 0.316) * std::sin (2.0 * kPi * 1000.0 * i / fs));
+            std::vector<double> g;
+            for (int i = 0; i < n; i += 16) { float* c[1] = { x.data() + i }; e.process (c, 1, 16); g.push_back (e.getBand (0).currentDynamicGainDb()); }
+            const double fin = g.back();
+            double t63 = -1.0;
+            for (size_t k = (size_t) (n / 2 / 16); k < g.size(); ++k) if (g[k] < 0.632 * fin) { t63 = (double) ((int) k * 16 - n / 2) / fs; break; }
+            const double want = dynAttackSeconds (1000.0, att);
+            std::printf ("    ATTACK %3.0f %%: 63 %% 도달 %.2f ms (설정 %.2f ms)\n", att * 100.0, t63 * 1000.0, want * 1000.0);
+            CHECK (t63 > 0.5 * want && t63 < 2.5 * want + 0.0008, "attack %.2f ms vs %.2f ms", t63 * 1000.0, want * 1000.0);
+        }
+    }
+
+    // 5) 자동 문턱: 일정한 사인은 거의 안 움직이고, 평소보다 12 dB 큰 부분은 눌림
+    {
+        Params p; p.xfAll = false; p.bands[0] = dynBell (1000.0, -12.0, -30.0);
+        p.bands[0].autoTh = true;
+        Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+        const int n = (int) (fs * 4.0);
+        std::vector<float> x ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double a = (i > (int) (3.0 * fs) && i < (int) (3.3 * fs)) ? 0.4 : 0.1;
+            x[(size_t) i] = (float) (a * std::sin (2.0 * kPi * 1000.0 * i / fs));
+        }
+        double steady = 0.0, burst = 0.0;
+        for (int i = 0; i < n; i += 64)
+        {
+            float* c[1] = { x.data() + i };
+            e.process (c, 1, 64);
+            const double g = e.getBand (0).currentDynamicGainDb();
+            if (i > (int) (2.0 * fs) && i < (int) (3.0 * fs)) steady = std::min (steady, g);
+            if (i > (int) (3.1 * fs) && i < (int) (3.3 * fs)) burst = std::min (burst, g);
+        }
+        std::printf ("    자동 문턱: 일정한 사인 %+.2f dB, 12 dB 큰 부분 %+.2f dB\n", steady, burst);
+        CHECK (steady > -0.5 && burst < -3.0, "auto threshold steady %.2f burst %.2f", steady, burst);
+    }
+
+    // 6) 셸프 · 틸트: 로우 셸프 200 Hz는 60 Hz만, 하이 셸프 4 kHz는 8 kHz만
+    {
+        Params ls; ls.xfAll = false; ls.bands[0] = makeBand (BandType::LowShelf, 200.0, 0.0, 1.0);
+        ls.bands[0].dyn = true; ls.bands[0].dynRange = -9; ls.bands[0].autoTh = false; ls.bands[0].thresh = -30;
+        Params hs = ls; hs.bands[0].type = BandType::HighShelf; hs.bands[0].freq = 4000.0f;
+        Params tl = ls; tl.bands[0].type = BandType::Tilt; tl.bands[0].freq = 650.0f;
+        const double l60 = runTone (ls, 60.0, -10.0), l2k = runTone (ls, 2000.0, -10.0);
+        const double h8k = runTone (hs, 8000.0, -10.0), h300 = runTone (hs, 300.0, -10.0);
+        const double t8k = runTone (tl, 8000.0, -10.0);
+        std::printf ("    로우 셸프 200 Hz: 60 Hz %+.2f / 2 kHz %+.2f dB, 하이 셸프 4 kHz: 8 kHz %+.2f / 300 Hz %+.2f dB, 틸트(-9): 8 kHz %+.2f dB\n",
+                     l60, l2k, h8k, h300, t8k);
+        CHECK (l60 < -5.0 && std::abs (l2k) < 0.1 && h8k < -5.0 && std::abs (h300) < 0.1 && t8k < -2.5, "shelf / tilt dynamics regions");
+    }
+
+    // 7) Mid 밴드는 M 신호로 감지하고 M만: 같은 1 kHz라도 Side 성분은 그대로
+    {
+        const int n = 48000;
+        std::vector<float> L ((size_t) n), R ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double m = 0.3 * std::sin (2.0 * kPi * 1000.0 * i / fs), s = 0.05 * std::sin (2.0 * kPi * 1000.0 * i / fs + 1.0);
+            L[(size_t) i] = (float) (m + s);  R[(size_t) i] = (float) (m - s);
+        }
+        auto L0 = L, R0 = R;
+        Params p; p.xfAll = false; p.bands[0] = dynBell (1000.0, -12.0, -30.0);
+        p.bands[0].place = Placement::Mid;
+        runEngine (p, fs, L, R);
+        std::vector<float> M ((size_t) n), S ((size_t) n), M0 ((size_t) n), S0 ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            M[(size_t) i] = 0.5f * (L[(size_t) i] + R[(size_t) i]);   S[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]);
+            M0[(size_t) i] = 0.5f * (L0[(size_t) i] + R0[(size_t) i]); S0[(size_t) i] = 0.5f * (L0[(size_t) i] - R0[(size_t) i]);
+        }
+        const double dm = toneDb (M, fs, 1000.0, n / 2, n / 2) - toneDb (M0, fs, 1000.0, n / 2, n / 2);
+        const double ds = toneDb (S, fs, 1000.0, n / 2, n / 2) - toneDb (S0, fs, 1000.0, n / 2, n / 2);
+        std::printf ("    Mid 밴드: Mid %+.2f dB, Side %+.3f dB\n", dm, ds);
+        CHECK (dm < -5.0 && std::abs (ds) < 0.01, "mid dynamic band on M only (%.2f / %.3f)", dm, ds);
+    }
+
+    // 8) 밴드 듣기: 그 밴드가 보는 부분만 (1 kHz 벨 Q 2 -> 1 kHz는 그대로, 100 Hz는 크게 줄어듦), 끄면 원래대로
+    {
+        const int n = 48000;
+        std::vector<float> x ((size_t) n);
+        for (int i = 0; i < n; ++i) x[(size_t) i] = (float) (0.2 * std::sin (2.0 * kPi * 1000.0 * i / fs) + 0.2 * std::sin (2.0 * kPi * 100.0 * i / fs));
+        Params p; p.xfAll = false; p.bands[0] = makeBand (BandType::Bell, 1000.0, 6.0, 2.0);
+        Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+        e.setAudition (0);
+        auto y = x;
+        for (int i = 0; i < n; i += 512) { float* c[1] = { y.data() + i }; e.process (c, 1, std::min (512, n - i)); }
+        const double a1k = toneDb (y, fs, 1000.0, n / 2, n / 2) - toneDb (x, fs, 1000.0, n / 2, n / 2);
+        const double a100 = toneDb (y, fs, 100.0, n / 2, n / 2) - toneDb (x, fs, 100.0, n / 2, n / 2);
+        e.setAudition (-1);
+        auto z = x;
+        for (int i = 0; i < n; i += 512) { float* c[1] = { z.data() + i }; e.process (c, 1, std::min (512, n - i)); }
+        const double b1k = toneDb (z, fs, 1000.0, n / 2, n / 2) - toneDb (x, fs, 1000.0, n / 2, n / 2);
+        std::printf ("    밴드 듣기: 1 kHz %+.2f dB, 100 Hz %+.1f dB / 끄면 1 kHz %+.2f dB (벨 +6)\n", a1k, a100, b1k);
+        CHECK (std::abs (a1k) < 0.1 && a100 < -20.0 && std::abs (b1k - 6.0) < 0.1, "band audition");
+    }
+}
+
+//------------------------------------------------------------------------------
+// 스펙트럴 다이내믹스 (v0.8): ZERO LATENCY(필터 뱅크) / HQ(선형 위상)
+static void testSpectral()
+{
+    std::printf ("[20] 스펙트럴 다이내믹스 (밴드 안에서 넘치는 주파수만)\n");
+    const double fs = 48000.0;
+    const int n = (int) (fs * 3.0);
+    std::mt19937 rng (3);
+    std::normal_distribution<float> nd (0.0f, 1.0f);
+    std::vector<float> noise ((size_t) n), res ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        noise[(size_t) i] = 0.03f * nd (rng);
+        res[(size_t) i] = noise[(size_t) i] + 0.3f * (float) std::sin (2.0 * kPi * 2500.0 * i / fs);
+    }
+    // 대역 레벨: Hann 창 DFT를 7 Hz 간격으로 (센 사인의 새는 성분이 잡음 측정을 흔들지 않게), 뒤 8192 샘플은 빼고
+    const int mA = n / 2, mLen = n / 2 - 8192;
+    auto hannDb = [&] (const std::vector<float>& x, double f)
+    {
+        std::complex<double> acc (0.0, 0.0);
+        const double w = 2.0 * kPi * f / fs;
+        for (int i = 0; i < mLen; ++i)
+        {
+            const double h = 0.5 - 0.5 * std::cos (2.0 * kPi * i / mLen);
+            acc += (double) x[(size_t) (mA + i)] * h * std::complex<double> (std::cos (w * (mA + i)), -std::sin (w * (mA + i)));
+        }
+        return 20.0 * std::log10 (std::max (4.0 * std::abs (acc) / mLen, 1.0e-15));
+    };
+    auto bandLevel = [&] (const std::vector<float>& x, double f1, double f2, int)
+    {
+        double s = 0.0; int c = 0;
+        for (double f = f1; f <= f2; f += 7.0) { s += std::pow (10.0, hannDb (x, f) / 10.0); ++c; }
+        return 10.0 * std::log10 (s / c);
+    };
+    auto runMode = [&] (const Params& p, bool linear, const std::vector<float>& in, int& lat)
+    {
+        Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (linear); e.setParams (p); e.reset();
+        auto x = in;
+        for (int i = 0; i < n; i += 512) { float* c[1] = { x.data() + i }; e.process (c, 1, std::min (512, n - i)); }
+        lat = e.getLatencySamples();
+        std::vector<float> y ((size_t) n, 0.0f);
+        for (int i = 0; i + lat < n; ++i) y[(size_t) i] = x[(size_t) (i + lat)];   // 레이턴시만큼 당겨서 비교
+        return y;
+    };
+    Params p; p.xfAll = false;
+    p.bands[0] = makeBand (BandType::Bell, 2500.0, 0.0, 0.7);
+    p.bands[0].dyn = true; p.bands[0].spectral = true; p.bands[0].dynRange = -12;
+
+    for (int lin = 0; lin < 2; ++lin)
+    {
+        int lat = 0;
+        const auto y = runMode (p, lin == 1, res, lat);
+        const double sine = hannDb (y, 2500.0) - hannDb (res, 2500.0);
+        const double near1 = bandLevel (y, 1300, 1800, 0) - bandLevel (res, 1300, 1800, 0);
+        const double near2 = bandLevel (y, 3500, 4500, 0) - bandLevel (res, 3500, 4500, 0);
+        const double farBand = bandLevel (y, 300, 500, 0) - bandLevel (res, 300, 500, 0);
+        int latN = 0;
+        const auto yn = runMode (p, lin == 1, noise, latN);
+        const double noiseOnly = bandLevel (yn, 1800, 3500, 0) - bandLevel (noise, 1800, 3500, 0);
+        std::printf ("    %s: 레이턴시 %d, 2.5 kHz 공진 %+.2f dB, 둘레 잡음 %+.2f / %+.2f dB, 먼 곳 %+.3f dB, 잡음만 %+.2f dB\n",
+                     lin ? "HQ 선형 위상  " : "ZERO LATENCY", lat, sine, near1, near2, farBand, noiseOnly);
+        CHECK (lin ? lat > 0 : lat == 0, "spectral latency %d", lat);
+        CHECK (sine < -9.0, "resonance reduced (%.2f dB)", sine);
+        CHECK (std::abs (near1) < 0.6 && std::abs (near2) < 0.6 && std::abs (farBand) < 0.05, "neighbours stay (%.2f %.2f %.3f)", near1, near2, farBand);
+        CHECK (std::abs (noiseOnly) < 0.3, "plain noise not pumped (%.2f dB)", noiseOnly);
+    }
+
+    // HQ: 아무것도 넘지 않으면 정확히 레이턴시만큼 늦춘 입력, 레이턴시 = 임펄스 위치
+    {
+        Params q = p;
+        q.bands[0].autoTh = false; q.bands[0].thresh = 0.0f;
+        Engine e; e.prepare (fs, 2, 512); e.setSpectralLinearPhase (true); e.setParams (q); e.reset();
+        std::vector<float> L ((size_t) n), R ((size_t) n);
+        for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.05f * nd (rng); R[(size_t) i] = 0.05f * nd (rng); }
+        L[1000] = 0.9f;
+        auto L0 = L, R0 = R;
+        for (int i = 0; i < n; i += 333) { float* c[2] = { L.data() + i, R.data() + i }; e.process (c, 2, std::min (333, n - i)); }
+        const int lat = e.getLatencySamples();
+        double err = 0.0;
+        for (int i = lat; i < n; ++i) err = std::max (err, (double) std::abs (L[(size_t) i] - L0[(size_t) (i - lat)]) + std::abs (R[(size_t) i] - R0[(size_t) (i - lat)]));
+        std::printf ("    HQ 투명성: 레이턴시 %d 샘플 (%.1f ms), 늦춘 입력과의 차이 최대 %.1e\n", lat, lat / fs * 1000.0, err);
+        CHECK (err < 1.0e-6 && lat == 2048, "linear-phase spectral transparency %.2e, latency %d", err, lat);
+    }
+
+    // Side 밴드: Side의 공진만, Mid는 그대로
+    for (int lin = 0; lin < 2; ++lin)
+    {
+        std::vector<float> L ((size_t) n), R ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double m = 0.3 * std::sin (2.0 * kPi * 2500.0 * i / fs) + 0.02 * nd (rng);
+            const double s = 0.3 * std::sin (2.0 * kPi * 2700.0 * i / fs) + 0.02 * nd (rng);
+            L[(size_t) i] = (float) (m + s);  R[(size_t) i] = (float) (m - s);
+        }
+        auto L0 = L, R0 = R;
+        Params q; q.xfAll = false;
+        q.bands[0] = makeBand (BandType::Bell, 2600.0, 0.0, 0.7, Placement::Side);
+        q.bands[0].dyn = true; q.bands[0].spectral = true; q.bands[0].dynRange = -12;
+        Engine e; e.prepare (fs, 2, 512); e.setSpectralLinearPhase (lin == 1); e.setParams (q); e.reset();
+        for (int i = 0; i < n; i += 512) { float* c[2] = { L.data() + i, R.data() + i }; e.process (c, 2, std::min (512, n - i)); }
+        const int lat = e.getLatencySamples();
+        std::vector<float> M ((size_t) n), S ((size_t) n), M0 ((size_t) n), S0 ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const int j = std::max (0, i - lat);
+            M[(size_t) i] = 0.5f * (L[(size_t) i] + R[(size_t) i]);  S[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]);
+            M0[(size_t) i] = 0.5f * (L0[(size_t) j] + R0[(size_t) j]); S0[(size_t) i] = 0.5f * (L0[(size_t) j] - R0[(size_t) j]);
+        }
+        const double dm = toneDb (M, fs, 2500.0, n / 2, n / 2) - toneDb (M0, fs, 2500.0, n / 2, n / 2);
+        const double ds = toneDb (S, fs, 2700.0, n / 2, n / 2) - toneDb (S0, fs, 2700.0, n / 2, n / 2);
+        std::printf ("    %s Side 밴드: Side 2.7 kHz %+.2f dB, Mid 2.5 kHz %+.3f dB\n", lin ? "HQ" : "ZL", ds, dm);
+        CHECK (ds < -6.0 && std::abs (dm) < 0.05, "side spectral band on S only (%.2f / %.3f)", ds, dm);
+    }
+
+    // 스펙트럴 꺼짐 = 비트 단위로 고정 EQ, 모노 Side 밴드는 아무것도 안 함
+    {
+        Params q = p; q.bands[0].spectral = false; q.bands[0].dyn = false;
+        auto a = res, aR = res, b = res, bR = res;
+        runEngine (q, fs, a, aR);
+        Params off = p; off.bands[0].dyn = false;
+        runEngine (off, fs, b, bR);
+        Params side = p; side.bands[0].place = Placement::Side;
+        auto c = res, cR = res;
+        runEngine (side, fs, c, cR, 1);
+        CHECK (a == b && c == res, "spectral off -> bit-exact, mono side spectral band does nothing");
+    }
+}
+
+//------------------------------------------------------------------------------
 static void testMigration()
 {
     std::printf ("[17] v0.4 이하 세션 변환 (모듈 -> 밴드, 같은 곡선)\n");
@@ -1809,6 +2148,8 @@ int main (int argc, char** argv)
     testRobustness();
     testMigration();
     testBandTubeRegions();
+    testDynamicEq();
+    testSpectral();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -125,9 +125,11 @@ int addBand (PillowRZAudioProcessor& proc, rz::BandType type, float freq, float 
         setParameter (bandParam (proc, i, pillow::ids::q),     1.0f);
         setParameter (bandParam (proc, i, pillow::ids::slope), (float) rz::kDefaultSlope);
         setParameter (bandParam (proc, i, pillow::ids::place), (float) (int) place);
-        setParameter (bandParam (proc, i, pillow::ids::tube),  0.0f);   // 예전에 쓰던 칸의 설정이 남지 않게
-        setParameter (bandParam (proc, i, pillow::ids::xfmr),  0.0f);
-        for (auto* field : { pillow::ids::drive, pillow::ids::focus, pillow::ids::mix, pillow::ids::xfAmt })
+        // 예전에 쓰던 칸의 설정(아날로그 · 다이내믹)이 남지 않게 기본값으로
+        for (auto* field : { pillow::ids::tube, pillow::ids::xfmr, pillow::ids::drive, pillow::ids::focus,
+                             pillow::ids::mix, pillow::ids::xfAmt, pillow::ids::dyn, pillow::ids::range,
+                             pillow::ids::autoTh, pillow::ids::thresh, pillow::ids::attack, pillow::ids::release,
+                             pillow::ids::spec, pillow::ids::density })
             if (auto* prm = bandParam (proc, i, field))
                 setParameter (prm, prm->convertFrom0to1 (prm->getDefaultValue()));
         setParameter (used, 1.0f);

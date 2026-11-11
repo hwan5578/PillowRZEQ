@@ -59,6 +59,27 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
             });
     };
 
+    // 0..100, 50 = 자동 (밴드 주파수에 맞춘 시간), 0 = 8배 빠르게, 100 = 8배 느리게
+    auto timeAttr = []
+    {
+        return FloatAttr()
+            .withLabel ("%")
+            .withStringFromValueFunction ([] (float v, int)
+            {
+                if (std::abs (v - 50.0f) < 0.5f) return juce::String ("Auto");
+                const float f = std::exp2 ((v - 50.0f) / 50.0f * 3.0f);
+                return juce::String ("x") + juce::String (f, f < 0.2f ? 3 : (f < 1.0f ? 2 : 1));
+            })
+            .withValueFromStringFunction ([] (const juce::String& s)
+            {
+                if (s.containsIgnoreCase ("auto")) return 50.0f;
+                const float f = s.retainCharacters ("0123456789.").getFloatValue();
+                if (s.containsChar ('x') && f > 0.0f)
+                    return juce::jlimit (0.0f, 100.0f, 50.0f + 50.0f / 3.0f * std::log2 (f));
+                return juce::jlimit (0.0f, 100.0f, f);
+            });
+    };
+
     auto hzAttr = []
     {
         return FloatAttr()
@@ -190,6 +211,38 @@ juce::AudioProcessorValueTreeState::ParameterLayout PillowRZAudioProcessor::crea
         layout.add (std::make_unique<FloatParam> (
             juce::ParameterID { band (i, pillow::ids::xfAmt), 7 }, n + "Transformer Amount",
             Range (0.0f, 100.0f, 0.1f), 50.0f, percentAttr()));
+
+        // v0.8: 다이내믹 EQ
+        layout.add (std::make_unique<juce::AudioParameterBool> (
+            juce::ParameterID { band (i, pillow::ids::dyn), 8 }, n + "Dynamic", false));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::range), 8 }, n + "Dynamic Range",
+            Range (-rz::kDynRangeMax, rz::kDynRangeMax, 0.01f), -6.0f, dbAttr()));
+
+        layout.add (std::make_unique<juce::AudioParameterBool> (
+            juce::ParameterID { band (i, pillow::ids::autoTh), 8 }, n + "Auto Threshold", true));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::thresh), 8 }, n + "Threshold",
+            Range (rz::kThreshMin, rz::kThreshMax, 0.01f), -24.0f, dbAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::attack), 8 }, n + "Attack",
+            Range (0.0f, 100.0f, 0.1f), 50.0f, timeAttr()));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::release), 8 }, n + "Release",
+            Range (0.0f, 100.0f, 0.1f), 50.0f, timeAttr()));
+
+        // HQ에서 켜고 끄면 레이턴시가 바뀌므로 자동화는 막아 둠 (Quality와 같은 이유)
+        layout.add (std::make_unique<juce::AudioParameterBool> (
+            juce::ParameterID { band (i, pillow::ids::spec), 8 }, n + "Spectral", false,
+            juce::AudioParameterBoolAttributes().withAutomatable (false)));
+
+        layout.add (std::make_unique<FloatParam> (
+            juce::ParameterID { band (i, pillow::ids::density), 8 }, n + "Spectral Density",
+            Range (0.0f, 100.0f, 0.1f), 50.0f, percentAttr()));
     }
 
     return layout;
@@ -234,10 +287,20 @@ PillowRZAudioProcessor::PillowRZAudioProcessor()
         b.focus = get (pillow::ids::focus);
         b.mix   = get (pillow::ids::mix);
         b.xfAmt = get (pillow::ids::xfAmt);
+        b.dyn     = get (pillow::ids::dyn);
+        b.range   = get (pillow::ids::range);
+        b.autoTh  = get (pillow::ids::autoTh);
+        b.thresh  = get (pillow::ids::thresh);
+        b.attack  = get (pillow::ids::attack);
+        b.release = get (pillow::ids::release);
+        b.spec    = get (pillow::ids::spec);
+        b.density = get (pillow::ids::density);
         jassert (b.used != nullptr && b.on != nullptr && b.type != nullptr && b.freq != nullptr
                  && b.gain != nullptr && b.q != nullptr && b.slope != nullptr && b.place != nullptr
                  && b.tube != nullptr && b.xfmr != nullptr && b.drive != nullptr && b.focus != nullptr
-                 && b.mix != nullptr && b.xfAmt != nullptr);
+                 && b.mix != nullptr && b.xfAmt != nullptr && b.dyn != nullptr && b.range != nullptr
+                 && b.autoTh != nullptr && b.thresh != nullptr && b.attack != nullptr && b.release != nullptr
+                 && b.spec != nullptr && b.density != nullptr);
     }
 
     // 모드를 바꾸면 오디오 스레드는 플래그만 세우고, 호스트 알림(setLatencySamples)은 여기 타이머에서
@@ -285,6 +348,14 @@ rz::Params PillowRZAudioProcessor::readParams() const noexcept
         b.focus    = ptr.focus->load() * 0.01f;
         b.tubeMix  = ptr.mix->load() * 0.01f;
         b.xfAmount = ptr.xfAmt->load() * 0.01f;
+        b.dyn      = ptr.dyn->load() >= 0.5f;
+        b.dynRange = ptr.range->load();
+        b.autoTh   = ptr.autoTh->load() >= 0.5f;
+        b.thresh   = ptr.thresh->load();
+        b.attack   = ptr.attack->load() * 0.01f;
+        b.release  = ptr.release->load() * 0.01f;
+        b.spectral = ptr.spec->load() >= 0.5f;
+        b.density  = ptr.density->load() * 0.01f;
     }
     return p;
 }
@@ -320,34 +391,57 @@ void PillowRZAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     const auto params = readParams();
     engineZero.prepare (baseRate, numProcessChannels, maxBlockSize);
     engineHq.prepare (baseRate * (double) (1 << hqOrder), numProcessChannels, maxBlockSize << hqOrder);
+
+    hasOversampler.store (oversampler != nullptr);
+    hqLatency.store (oversampler != nullptr ? (int) std::lround (oversampler->getLatencyInSamples()) : 0);
+    spectralLatency.store (rz::SpectralStage::linearLatencyFor (baseRate * (double) (1 << hqOrder)) >> hqOrder);
+    for (auto& d : bypassDelay) d.assign ((size_t) (spectralLatency.load() + maxBlockSize + 1), 0.0f);
+    bypassPos = 0;
+
+    const bool spec = anySpectral (params);
+    hq = wantsHq (spec);
+    hqLinear = hq && spec;
+    engineHq.setSpectralLinearPhase (hqLinear);
     for (auto* e : { &engineZero, &engineHq })
     {
         e->setParams (params);
         e->reset();
     }
+    activeHq.store (hq);
+    activeLinear.store (hqLinear);
 
-    hq = wantsHq();
     fade = Fade::None;
     fadeGain = 1.0f;
     fadeStep = (float) (1.0 / (0.005 * baseRate));   // 5 ms
     processingRate.store (hq ? baseRate * (double) (1 << hqOrder) : baseRate);
 
-    hqLatency.store (latencyFor (true));
-    const int latency = latencyFor (hq);
+    const int latency = latencyFor (hq, hqLinear);
     pendingLatency.store (latency);
     latencyDirty.store (false);
     setLatencySamples (latency);
     prepared = true;
 }
 
-int PillowRZAudioProcessor::latencyFor (bool useHq) const noexcept
+// (세션 레이트 샘플) 오버샘플링 필터 + HQ 스펙트럴(선형 위상)
+int PillowRZAudioProcessor::latencyFor (bool useHq, bool linear) const noexcept
 {
-    return (useHq && oversampler != nullptr) ? (int) std::lround (oversampler->getLatencyInSamples()) : 0;
+    return (useHq ? hqLatency.load() : 0) + (useHq && linear ? spectralLatency.load() : 0);
 }
 
-bool PillowRZAudioProcessor::wantsHq() const noexcept
+// HQ에서 선형 위상(레이턴시)을 쓸지: SPECTRAL 스위치를 켠 밴드가 있으면.
+// 자동화되는 항목(EQ · 밴드 켜기 · DYN · RANGE)은 보지 않음 -> 자동화로 레이턴시가 바뀌거나 경로가 끊기지 않음
+// (스펙트럴 단계는 선형 위상인 동안 움직일 밴드가 없어도 같은 만큼 늦춰서 지나감)
+bool PillowRZAudioProcessor::anySpectral (const rz::Params& p) noexcept
 {
-    return paramQuality->load() >= 0.5f && oversampler != nullptr;
+    for (const auto& b : p.bands)
+        if (b.used && b.spectral && rz::typeHasSpectral (b.type))
+            return true;
+    return false;
+}
+
+bool PillowRZAudioProcessor::wantsHq (bool spec) const noexcept
+{
+    return paramQuality->load() >= 0.5f && (hasOversampler.load() || spec);
 }
 
 void PillowRZAudioProcessor::timerCallback()
@@ -359,7 +453,9 @@ void PillowRZAudioProcessor::timerCallback()
     // 호스트가 이걸 보고 재시작하면 prepareToPlay에서 경로도 맞춰지고, 재생 중이면 오디오 스레드 전환과 같은 값이 됨
     if (prepared.load())
     {
-        const int want = paramQuality->load() >= 0.5f ? hqLatency.load() : 0;
+        const bool spec = anySpectral (readParams());
+        const bool h = wantsHq (spec);
+        const int want = latencyFor (h, h && spec);
         if (want != getLatencySamples())
             setLatencySamples (want);
     }
@@ -373,15 +469,32 @@ void PillowRZAudioProcessor::resetActivePath() noexcept
 }
 
 // 경로 교체 (오디오 스레드, 소리가 0인 순간에만 호출). 메모리 할당·락 없음
-void PillowRZAudioProcessor::switchPath (bool toHq) noexcept
+void PillowRZAudioProcessor::switchPath (bool toHq, bool toLinear) noexcept
 {
     hq = toHq;
+    hqLinear = toHq && toLinear;
+    if (hq)
+        engineHq.setSpectralLinearPhase (hqLinear);
     (hq ? engineHq : engineZero).setParams (readParams());
     resetActivePath();
+    for (auto& d : bypassDelay) std::fill (d.begin(), d.end(), 0.0f);
+    bypassPos = 0;
+    activeHq.store (hq);
+    activeLinear.store (hqLinear);
 
     processingRate.store (hq ? baseRate * (double) (1 << hqOrder) : baseRate);
-    pendingLatency.store (latencyFor (hq));
+    pendingLatency.store (latencyFor (hq, hqLinear));
     latencyDirty.store (true);
+}
+
+float PillowRZAudioProcessor::getDynamicGainDb (int band) const noexcept
+{
+    return (activeHq.load() ? engineHq : engineZero).getDynamicGainDb (band);
+}
+
+float PillowRZAudioProcessor::getSpectralCurve (int domain, int point) const noexcept
+{
+    return (activeHq.load() ? engineHq : engineZero).getSpectral().curveDisplay (domain, point);
 }
 
 bool PillowRZAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -456,14 +569,20 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     pushAnalyzer (0, buffer, numCh);
 
-    // 모드 전환 요청
-    const bool wantHq = wantsHq();
-    if (wantHq != hq)
+    // 모드 전환 요청 (ZERO LATENCY / HQ, HQ에서 스펙트럴 선형 위상 켜기 · 끄기 = 레이턴시가 바뀜)
+    const auto params = readParams();
+    const bool spec   = anySpectral (params);
+    const bool wantHq = wantsHq (spec);
+    const bool wantLinear = wantHq && spec;
+    const bool pathDiffers = wantHq != hq || (hq && wantLinear != hqLinear);
+    if (pathDiffers)
         fade = Fade::Out;                    // 페이드인 도중이면 지금 크기에서 다시 내려감
     else if (fade == Fade::Out)
         fade = Fade::In;                     // 페이드아웃 도중에 원래대로 돌려놓으면 바로 복귀
 
-    (hq ? engineHq : engineZero).setParams (readParams());
+    auto& active = hq ? engineHq : engineZero;
+    active.setParams (params);
+    active.setAudition (auditionBand.load());
 
     juce::dsp::AudioBlock<float> fullBlock (buffer.getArrayOfWritePointers(),
                                             (size_t) numCh, (size_t) numSamples);
@@ -484,8 +603,11 @@ void PillowRZAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
         if (fade == Fade::Out && fadeGain <= 0.0f)
         {
-            if (wantHq != hq)
-                switchPath (wantHq);
+            if (pathDiffers)
+            {
+                switchPath (wantHq, wantLinear);
+                (hq ? engineHq : engineZero).setAudition (auditionBand.load());
+            }
             fade = Fade::In;
         }
     }
@@ -519,9 +641,11 @@ void PillowRZAudioProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
         return;
 
     // 바이패스 중에 모드를 바꾸면 바로 적용 (레이턴시도 바로 맞춤)
-    const bool wantHq = wantsHq();
-    if (wantHq != hq)
-        switchPath (wantHq);
+    const bool spec   = anySpectral (readParams());
+    const bool wantHq = wantsHq (spec);
+    const bool wantLinear = wantHq && spec;
+    if (wantHq != hq || (hq && wantLinear != hqLinear))
+        switchPath (wantHq, wantLinear);
     fade = Fade::None;
     fadeGain = 1.0f;
 
@@ -544,6 +668,25 @@ void PillowRZAudioProcessor::processBlockBypassed (juce::AudioBuffer<float>& buf
             oversampler->processSamplesUp (block);
             oversampler->processSamplesDown (block);
         }
+    }
+
+    // HQ 스펙트럴(선형 위상): 그 레이턴시만큼도 늦춤
+    const int lat = hq && hqLinear ? spectralLatency.load() : 0;
+    if (lat > 0 && ! bypassDelay[0].empty())
+    {
+        const int sz = (int) bypassDelay[0].size();
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const int w = (bypassPos + i) % sz, r = (bypassPos + i - lat + sz) % sz;
+            for (int c = 0; c < numCh; ++c)
+            {
+                auto& d = bypassDelay[(size_t) c];
+                float* x = buffer.getWritePointer (c);
+                d[(size_t) w] = x[i];
+                x[i] = d[(size_t) r];
+            }
+        }
+        bypassPos = (bypassPos + numSamples) % sz;
     }
 
     pushAnalyzer (1, buffer, numCh);   // ZERO LATENCY: 원신호 그대로

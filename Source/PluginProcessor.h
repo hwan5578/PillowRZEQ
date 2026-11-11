@@ -37,6 +37,15 @@ namespace pillow::ids
     inline constexpr const char* xfmr  = "xfmr";        // v0.6: 이 밴드 부분을 트랜스포머로
     // v0.7: 밴드마다의 튜브 설정은 전역과 같은 이름 (b1_drive, b1_focus, b1_mix), 트랜스포머 양은 b1_xfamt
     inline constexpr const char* xfAmt = "xfamt";
+    // v0.8: 다이내믹 EQ
+    inline constexpr const char* dyn     = "dyn";
+    inline constexpr const char* range   = "range";
+    inline constexpr const char* autoTh  = "autoTh";
+    inline constexpr const char* thresh  = "thresh";
+    inline constexpr const char* attack  = "attack";
+    inline constexpr const char* release = "release";
+    inline constexpr const char* spec    = "spec";      // 스펙트럴 (HQ에서는 레이턴시가 바뀌므로 자동화 안 됨)
+    inline constexpr const char* density = "density";
 
     inline juce::String band (int index, const char* field)
     {
@@ -46,6 +55,7 @@ namespace pillow::ids
     // 화면 설정 (파라미터가 아니라 상태 트리의 속성으로 저장)
     inline constexpr const char* uiRange    = "uiRange";      // 그래프 범위 6 / 12 / 24 dB
     inline constexpr const char* uiAnalyzer = "uiAnalyzer";   // 0 = 끔, 1 = POST, 2 = PRE + POST
+    inline constexpr const char* uiBandTab  = "uiBandTab";    // 밴드 패널 아랫줄: 0 = ANALOG, 1 = DYNAMICS
 }
 
 namespace pillow
@@ -137,6 +147,15 @@ public:
     double getProcessingRate() const noexcept { return processingRate.load(); }
     double getSessionRate() const noexcept    { return sessionRate.load(); }
 
+    // 다이내믹 EQ 표시 (어느 스레드에서든): 밴드의 지금 게인 변화 dB, 스펙트럴 게인 곡선 (도메인 L · R · M · S, 점 0..127)
+    float getDynamicGainDb (int band) const noexcept;
+    float getSpectralCurve (int domain, int point) const noexcept;
+    bool isSpectralLinearPhase() const noexcept { return activeLinear.load(); }
+
+    // 밴드 듣기 (-1 = 끔): 그 밴드가 보는 부분만 들림. 저장되지 않는 화면 상태
+    void setAudition (int band) noexcept { auditionBand.store (band); }
+    int  getAudition() const noexcept    { return auditionBand.load(); }
+
     // 분석기: 0 = 처리 전(PRE), 1 = 처리 후(POST). 에디터가 열려 있을 때만 채움
     pillow::AnalyzerTap& getAnalyzerTap (int which) noexcept { return taps[(size_t) juce::jlimit (0, 1, which)]; }
     void setAnalyzerActive (bool shouldBeActive) noexcept { analyzerActive.store (shouldBeActive); }
@@ -155,9 +174,11 @@ private:
     enum class Fade { None, Out, In };
 
     void timerCallback() override;                // 레이턴시 보고 (메시지 스레드, 오디오 스레드는 플래그만)
-    int latencyFor (bool hq) const noexcept;
-    bool wantsHq() const noexcept;                // 실제로 다른 경로가 되는 경우만 true (176.4k 이상은 늘 false)
-    void switchPath (bool toHq) noexcept;         // 오디오 스레드
+    int latencyFor (bool hq, bool linear) const noexcept;
+    // HQ 경로를 쓸지: 오버샘플링이 있거나(176.4k 미만) 스펙트럴 밴드가 있을 때 (스펙트럴은 HQ에서 선형 위상)
+    bool wantsHq (bool anySpectral) const noexcept;
+    static bool anySpectral (const pillow::rz::Params&) noexcept;
+    void switchPath (bool toHq, bool toLinear) noexcept;   // 오디오 스레드
     void resetActivePath() noexcept;
     void runActivePath (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
     void applyFade (juce::dsp::AudioBlock<float>& block, int numCh) noexcept;
@@ -180,6 +201,14 @@ private:
         std::atomic<float>* focus = nullptr;
         std::atomic<float>* mix   = nullptr;
         std::atomic<float>* xfAmt = nullptr;
+        std::atomic<float>* dyn = nullptr;
+        std::atomic<float>* range = nullptr;
+        std::atomic<float>* autoTh = nullptr;
+        std::atomic<float>* thresh = nullptr;
+        std::atomic<float>* attack = nullptr;
+        std::atomic<float>* release = nullptr;
+        std::atomic<float>* spec = nullptr;
+        std::atomic<float>* density = nullptr;
     };
 
     std::atomic<float>* paramQuality = nullptr;
@@ -202,9 +231,16 @@ private:
     int maxBlockSize = 0;
     int numProcessChannels = 0;
     std::atomic<bool> prepared { false };
-    std::atomic<int>  hqLatency { 0 };   // HQ로 처리할 때의 레이턴시 (이 세션 레이트에서)
+    std::atomic<int>  hqLatency { 0 };          // 오버샘플링 레이턴시 (이 세션 레이트에서)
+    std::atomic<int>  spectralLatency { 0 };    // HQ 스펙트럴(선형 위상) 레이턴시 (세션 레이트 샘플)
+    std::atomic<bool> hasOversampler { false };
 
     bool  hq = false;                 // 오디오 스레드 전용: 지금 쓰는 경로
+    bool  hqLinear = false;           //   HQ 경로의 스펙트럴이 선형 위상인지 (레이턴시 포함)
+    std::atomic<bool> activeHq { false }, activeLinear { false };   // 화면용 사본
+    std::atomic<int>  auditionBand { -1 };
+    std::array<std::vector<float>, 2> bypassDelay;   // 바이패스 중에도 HQ 스펙트럴 레이턴시만큼 늦춤
+    int bypassPos = 0;
     Fade  fade = Fade::None;
     float fadeGain = 1.0f, fadeStep = 0.0f;
 

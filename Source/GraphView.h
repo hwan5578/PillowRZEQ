@@ -9,7 +9,10 @@ namespace pillow::ui
     // Pro-Q 방식 그래프
     //  - 실제 DSP와 같은 계수로 계산한 전체 곡선 (L/R · M/S 밴드가 있으면 채널별 곡선)
     //  - 밴드마다 점 하나: 드래그 = 주파수 · 게인 (컷 · 노치는 위아래 = Q), Shift = 미세 조정
-    //  - 휠 = Q, 빈 곳 더블클릭 = 밴드 추가, 오른쪽 클릭 = 메뉴, Alt + 클릭 = 켜기/끄기, Delete = 삭제
+    //  - 휠 = Q, Alt + 휠 = 다이내믹 RANGE, 빈 곳 더블클릭 = 밴드 추가, 오른쪽 클릭 = 메뉴,
+    //    Alt + 클릭 = 켜기/끄기, Delete = 삭제
+    //  - 다이내믹 밴드: RANGE 끝까지의 면, 점 둘레의 고리 (RANGE · 지금 값),
+    //    움직이는 동안은 지금 실제 곡선을 굵게 (설정한 곡선은 가늘고 옅게)
     //  - 뒤에 실시간 스펙트럼 (처리 전 선 + 처리 후 면)
     //==========================================================================
     class GraphView : public juce::Component, private juce::Timer
@@ -50,6 +53,9 @@ namespace pillow::ui
         void timerCallback() override;
         bool refreshParams();
         void rebuildCurves();
+        bool updateDynamics();                       // 다이내믹 EQ의 지금 게인 · 스펙트럴 지도 (바뀌면 true)
+        void rebuildLiveCurves();
+        double spectralDbAt (pillow::rz::Placement view, double hz) const noexcept;
 
         void ensureFft (double sessionRate);
         void updateAnalyzer();
@@ -82,6 +88,21 @@ namespace pillow::ui
         std::vector<Curve> totals;
         std::array<juce::Path, pillow::rz::kMaxBands> bandCurves;
         juce::Path selectedFill;
+
+        // 곡선 계산에 쓴 것 (움직이는 곡선을 같은 점 · 같은 뷰로)
+        pillow::rz::Params shown;
+        std::vector<double> curveFreqs;
+        std::vector<float> curveXs;
+        std::vector<pillow::rz::Placement> views;
+
+        // 다이내믹 EQ 표시
+        static constexpr int kSpecPoints = pillow::rz::SpectralStage::kDisplayPoints;
+        static constexpr int kSpecDomains = pillow::rz::SpectralStage::kNumDomains;
+        std::array<float, pillow::rz::kMaxBands> dynNow {};              // 밴드마다 지금 게인 변화 (dB)
+        std::array<std::array<float, kSpecPoints>, kSpecDomains> specNow {};
+        bool liveMoving = false;
+        std::vector<Curve> liveTotals;                                   // 지금 움직인 전체 곡선
+        std::array<juce::Path, pillow::rz::kMaxBands> rangeFills;        // 고정 곡선 ~ RANGE 끝
 
         int selected = -1, hovered = -1, dragging = -1;
         int dragSource = -1;                  // 드래그 중인 포인터 (다른 손가락 · 펜은 무시)

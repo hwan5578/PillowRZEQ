@@ -34,6 +34,22 @@ namespace
     {
         return (p == rz::Placement::Right || p == rz::Placement::Side) ? juce::Colour (0xffa9b8c9) : palette::text;
     }
+
+
+    bool isClassicDynamic (const rz::BandParams& b) noexcept
+    {
+        return b.used && b.dyn && rz::typeHasDynamics (b.type) && ! (b.spectral && rz::typeHasSpectral (b.type));
+    }
+
+    bool isSpectralDynamic (const rz::BandParams& b) noexcept
+    {
+        return b.used && b.dyn && b.spectral && rz::typeHasSpectral (b.type);
+    }
+
+    bool hasDynamics (const rz::BandParams& b) noexcept
+    {
+        return b.used && b.dyn && rz::typeHasDynamics (b.type) && std::abs (b.dynRange) > 1.0e-3f;
+    }
 }
 
 //==============================================================================
@@ -129,6 +145,8 @@ void GraphView::timerCallback()
                      (int) st.getProperty (pillow::ids::uiAnalyzer, analyzerMode));
 
     bool dirty = refreshParams();
+    if (updateDynamics())
+        dirty = true;
     if (analyzerMode > 0)
     {
         updateAnalyzer();
@@ -173,13 +191,18 @@ bool GraphView::refreshParams()
 void GraphView::rebuildCurves()
 {
     totals.clear();
+    views.clear();
     for (auto& c : bandCurves) c.clear();
+    for (auto& c : rangeFills) c.clear();
     selectedFill.clear();
     if (! hasParams || plot.isEmpty())
+    {
+        liveTotals.clear();
         return;
+    }
 
     // 모노 트랙: Side 밴드는 할 일이 없고 나머지는 그 채널에 -> 곡선 하나
-    auto shown = params;
+    shown = params;
     if (channels < 2)
         for (auto& b : shown.bands)
         {
@@ -189,13 +212,15 @@ void GraphView::rebuildCurves()
     const rz::ResponseModel model (shown, rate);
 
     const int n = juce::jmax (2, (int) (plot.getWidth() / (float) kPointStep) + 1);
-    std::vector<double> freqs ((size_t) n);
-    std::vector<float> xs ((size_t) n);
+    curveFreqs.resize ((size_t) n);
+    curveXs.resize ((size_t) n);
     for (int i = 0; i < n; ++i)
     {
-        xs[(size_t) i]    = plot.getX() + plot.getWidth() * (float) i / (float) (n - 1);
-        freqs[(size_t) i] = freqForX (xs[(size_t) i]);
+        curveXs[(size_t) i]    = plot.getX() + plot.getWidth() * (float) i / (float) (n - 1);
+        curveFreqs[(size_t) i] = freqForX (curveXs[(size_t) i]);
     }
+    const auto& freqs = curveFreqs;
+    const auto& xs = curveXs;
 
     const float yMin = plot.getY() - 4.0f, yMax = plot.getBottom() + 4.0f;
     auto makePath = [&] (auto&& dbAt)
@@ -209,13 +234,45 @@ void GraphView::rebuildCurves()
         }
         return path;
     };
+    auto bandDb = [] (const rz::ResponseModel& m, int b, double f)
+    {
+        return 20.0 * std::log10 (std::max (std::abs (m.bandResponse (b, f)), 1.0e-9));
+    };
 
     for (int b = 0; b < rz::kMaxBands; ++b)
         if (model.isActive (b))
-            bandCurves[(size_t) b] = makePath ([&model, b] (double f)
+            bandCurves[(size_t) b] = makePath ([&model, &bandDb, b] (double f) { return bandDb (model, b, f); });
+
+    // 다이내믹 밴드: 고정 곡선에서 RANGE 끝(게인 + RANGE)까지를 면으로
+    {
+        std::array<float, rz::kMaxBands> ranges {};
+        bool any = false;
+        for (int b = 0; b < rz::kMaxBands; ++b)
+            if (model.isActive (b) && hasDynamics (shown.bands[(size_t) b]))
             {
-                return 20.0 * std::log10 (std::max (std::abs (model.bandResponse (b, f)), 1.0e-9));
-            });
+                ranges[(size_t) b] = shown.bands[(size_t) b].dynRange;
+                any = true;
+            }
+        if (any)
+        {
+            const rz::ResponseModel rangeModel (shown, rate, &ranges);
+            for (int b = 0; b < rz::kMaxBands; ++b)
+            {
+                if (std::abs (ranges[(size_t) b]) <= 0.0f)
+                    continue;
+                auto& fill = rangeFills[(size_t) b];
+                for (int i = 0; i < n; ++i)
+                {
+                    const float y = juce::jlimit (yMin, yMax, yForDb (bandDb (model, b, freqs[(size_t) i])));
+                    if (i == 0) fill.startNewSubPath (xs[(size_t) i], y);
+                    else        fill.lineTo (xs[(size_t) i], y);
+                }
+                for (int i = n - 1; i >= 0; --i)
+                    fill.lineTo (xs[(size_t) i], juce::jlimit (yMin, yMax, yForDb (bandDb (rangeModel, b, freqs[(size_t) i]))));
+                fill.closeSubPath();
+            }
+        }
+    }
 
     if (selected >= 0 && model.isActive (selected))
     {
@@ -229,17 +286,115 @@ void GraphView::rebuildCurves()
     // 전체 곡선: 스테레오 밴드만 있으면 하나, L/R · M/S 밴드가 있으면 채널마다
     const bool lr = model.usesPlacement (rz::Placement::Left) || model.usesPlacement (rz::Placement::Right);
     const bool ms = model.usesPlacement (rz::Placement::Mid)  || model.usesPlacement (rz::Placement::Side);
-    std::vector<std::pair<rz::Placement, juce::String>> views;
-    if (! lr && ! ms) views.push_back ({ rz::Placement::Stereo, {} });
-    if (lr) { views.push_back ({ rz::Placement::Left, "LEFT" }); views.push_back ({ rz::Placement::Right, "RIGHT" }); }
-    if (ms) { views.push_back ({ rz::Placement::Mid, "MID" });   views.push_back ({ rz::Placement::Side, "SIDE" }); }
+    if (! lr && ! ms) views.push_back (rz::Placement::Stereo);
+    if (lr) { views.push_back (rz::Placement::Left); views.push_back (rz::Placement::Right); }
+    if (ms) { views.push_back (rz::Placement::Mid);  views.push_back (rz::Placement::Side); }
 
-    for (const auto& v : views)
+    for (const auto view : views)
     {
-        const auto view = v.first;
         const bool dashed = lr && ms && rz::isMsPlacement (view);   // L/R와 M/S가 같이 있으면 M/S는 점선
+        const juce::String name = view == rz::Placement::Stereo ? juce::String() : pillow::placementNames()[(int) view].toUpperCase();
         totals.push_back ({ makePath ([&model, view] (double f) { return model.magnitudeDb (f, view); }),
-                            viewColour (view), v.second, dashed });
+                            viewColour (view), name, dashed });
+    }
+
+    rebuildLiveCurves();
+}
+
+//==============================================================================
+//  다이내믹 EQ 표시
+//==============================================================================
+bool GraphView::updateDynamics()
+{
+    bool changed = false, moving = false, anySpectral = false;
+    for (int b = 0; b < rz::kMaxBands; ++b)
+    {
+        const auto& bp = params.bands[(size_t) b];
+        anySpectral = anySpectral || isSpectralDynamic (bp);
+        float v = (params.eqOn && bp.on && hasDynamics (bp)) ? proc.getDynamicGainDb (b) : 0.0f;
+        if (! std::isfinite (v) || std::abs (v) < 0.02f)
+            v = 0.0f;
+        auto& now = dynNow[(size_t) b];
+        if (std::abs (v - now) > 0.02f || (std::abs (v) <= 0.0f && std::abs (now) > 0.0f))
+        {
+            now = v;
+            changed = true;
+        }
+        moving = moving || std::abs (now) > 0.05f;
+    }
+
+    for (int d = 0; d < kSpecDomains; ++d)
+        for (int p = 0; p < kSpecPoints; ++p)
+        {
+            float v = anySpectral && params.eqOn ? proc.getSpectralCurve (d, p) : 0.0f;
+            if (! std::isfinite (v) || std::abs (v) < 0.02f)
+                v = 0.0f;
+            auto& now = specNow[(size_t) d][(size_t) p];
+            if (std::abs (v - now) > 0.02f || (std::abs (v) <= 0.0f && std::abs (now) > 0.0f))
+            {
+                now = v;
+                changed = true;
+            }
+            moving = moving || std::abs (now) > 0.05f;
+        }
+
+    if (! changed && moving == liveMoving)
+        return false;
+    liveMoving = moving;
+    rebuildLiveCurves();
+    return true;
+}
+
+double GraphView::spectralDbAt (rz::Placement view, double hz) const noexcept
+{
+    // 표시 점: 20 Hz ~ 20 kHz 로그 간격
+    const double u = std::log (juce::jlimit (20.0, 20000.0, hz) / 20.0) / std::log (1000.0) * (double) (kSpecPoints - 1);
+    const int k = juce::jlimit (0, kSpecPoints - 2, (int) u);
+    const auto t = (float) juce::jlimit (0.0, 1.0, u - (double) k);
+    auto at = [&] (int dom)
+    {
+        const auto& c = specNow[(size_t) dom];
+        return (double) (c[(size_t) k] + t * (c[(size_t) k + 1] - c[(size_t) k]));
+    };
+    using SS = rz::SpectralStage;
+    switch (view)
+    {
+        case rz::Placement::Right: return at (SS::DomR);
+        case rz::Placement::Mid:   return 0.5 * (at (SS::DomL) + at (SS::DomR)) + at (SS::DomM);
+        case rz::Placement::Side:  return 0.5 * (at (SS::DomL) + at (SS::DomR)) + at (SS::DomS);
+        case rz::Placement::Stereo:
+        case rz::Placement::Left:  break;
+    }
+    return at (SS::DomL);
+}
+
+void GraphView::rebuildLiveCurves()
+{
+    liveTotals.clear();
+    if (! liveMoving || ! hasParams || curveFreqs.size() < 2 || views.empty())
+        return;
+
+    // 보통 다이내믹 밴드는 지금 게인 변화를 고정 게인에 더하고, 스펙트럴은 그 지도(dB)를 곡선에 더함
+    std::array<float, rz::kMaxBands> offsets {};
+    for (int b = 0; b < rz::kMaxBands; ++b)
+        if (isClassicDynamic (shown.bands[(size_t) b]))
+            offsets[(size_t) b] = dynNow[(size_t) b];
+    const rz::ResponseModel model (shown, rate, &offsets);
+
+    const int n = (int) curveFreqs.size();
+    const float yMin = plot.getY() - 4.0f, yMax = plot.getBottom() + 4.0f;
+    const bool lr = std::find (views.begin(), views.end(), rz::Placement::Left) != views.end();
+    for (const auto view : views)
+    {
+        juce::Path path;
+        for (int i = 0; i < n; ++i)
+        {
+            const double f = curveFreqs[(size_t) i];
+            const float y = juce::jlimit (yMin, yMax, yForDb (model.magnitudeDb (f, view) + spectralDbAt (view, f)));
+            if (i == 0) path.startNewSubPath (curveXs[(size_t) i], y);
+            else        path.lineTo (curveXs[(size_t) i], y);
+        }
+        liveTotals.push_back ({ std::move (path), viewColour (view), {}, lr && rz::isMsPlacement (view) });
     }
 }
 
@@ -460,6 +615,23 @@ void GraphView::paint (juce::Graphics& g)
             g.fillPath (selectedFill);
         }
 
+        // 다이내믹 밴드: RANGE 끝까지 움직일 수 있는 곳
+        for (int b = 0; b < pillow::rz::kMaxBands; ++b)
+            if (! rangeFills[(size_t) b].isEmpty())
+            {
+                const bool sel = b == selected;
+                g.setColour (bandColour (b).withAlpha (sel ? 0.26f : 0.12f));
+                g.fillPath (rangeFills[(size_t) b]);
+                if (sel)
+                {
+                    const float dash[] = { 3.0f, 3.0f };
+                    juce::Path d;
+                    juce::PathStrokeType (1.0f).createDashedStroke (d, rangeFills[(size_t) b], dash, 2);
+                    g.setColour (bandColour (b).withAlpha (0.55f));
+                    g.fillPath (d);
+                }
+            }
+
         // 밴드별 곡선 (얇게)
         for (int b = 0; b < pillow::rz::kMaxBands; ++b)
             if (! bandCurves[(size_t) b].isEmpty())
@@ -469,22 +641,34 @@ void GraphView::paint (juce::Graphics& g)
                 g.strokePath (bandCurves[(size_t) b], juce::PathStrokeType (sel ? 1.5f : 1.1f));
             }
 
-        // 전체 곡선
+        // 전체 곡선. 다이내믹이 움직이고 있으면 지금 실제 곡선을 굵게, 설정한(고정) 곡선은 가늘고 옅게
         const float dashes[] = { 7.0f, 4.0f };
-        for (auto it = totals.rbegin(); it != totals.rend(); ++it)
+        auto drawCurves = [&] (const std::vector<Curve>& curves, float width, float alpha)
         {
-            g.setColour (it->colour.withAlpha (params.eqOn ? 1.0f : 0.5f));
-            const juce::PathStrokeType stroke (2.3f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
-            if (it->dashed)
+            const juce::PathStrokeType stroke (width, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+            for (auto it = curves.rbegin(); it != curves.rend(); ++it)
             {
-                juce::Path d;
-                stroke.createDashedStroke (d, it->path, dashes, 2);
-                g.fillPath (d);
+                g.setColour (it->colour.withAlpha (alpha * (params.eqOn ? 1.0f : 0.5f)));
+                if (it->dashed)
+                {
+                    juce::Path d;
+                    stroke.createDashedStroke (d, it->path, dashes, 2);
+                    g.fillPath (d);
+                }
+                else
+                {
+                    g.strokePath (it->path, stroke);
+                }
             }
-            else
-            {
-                g.strokePath (it->path, stroke);
-            }
+        };
+        if (liveTotals.empty())
+        {
+            drawCurves (totals, 2.3f, 1.0f);
+        }
+        else
+        {
+            drawCurves (totals, 1.2f, 0.45f);
+            drawCurves (liveTotals, 2.3f, 1.0f);
         }
 
         // 범례 (채널별 곡선일 때)
@@ -528,6 +712,28 @@ void GraphView::paint (juce::Graphics& g)
                 g.setColour (col.withAlpha (sel ? 0.28f : 0.18f));
                 g.fillEllipse (circle.expanded (5.0f));
             }
+            // 다이내믹: 점 둘레 고리 (위에서 시작, 시계 방향 = 올림 / 반시계 = 내림, 반 바퀴 = 24 dB)
+            //  밴드 색 = RANGE, 밝은 색 굵게 = 지금 움직인 양
+            if (hasDynamics (b))
+            {
+                const float ringR = r + 4.5f;
+                g.setColour (col.withAlpha (inert ? 0.25f : 0.35f));
+                g.drawEllipse (juce::Rectangle<float> (2.0f * ringR, 2.0f * ringR).withCentre (c), 1.0f);
+                auto arc = [&] (float db, juce::Colour ac, float thick)
+                {
+                    const float sweep = juce::jlimit (-1.0f, 1.0f, db / rz::kDynRangeMax) * juce::MathConstants<float>::pi;
+                    if (std::abs (sweep) < 0.03f)
+                        return;
+                    juce::Path a;
+                    a.addCentredArc (c.x, c.y, ringR, ringR, 0.0f, 0.0f, sweep, true);
+                    g.setColour (ac);
+                    g.strokePath (a, juce::PathStrokeType (thick, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                };
+                arc (b.dynRange, col.withAlpha (inert ? 0.45f : 0.9f), 2.0f);
+                if (! inert)
+                    arc (dynNow[(size_t) i], palette::text, 3.0f);
+            }
+
             g.setColour (col);
             g.fillEllipse (circle);
             g.setColour (sel ? palette::text : palette::graphBg);
@@ -605,6 +811,7 @@ void GraphView::paint (juce::Graphics& g)
             if (rz::typeHasSlope (b.type)) text += "   " + pillow::slopeNames()[b.slope];
             if (rz::typeHasQ (b.type))     text += "   Q " + pillow::formatQ (b.q);
             if (b.place != rz::Placement::Stereo) text += "   " + pillow::placementNames()[(int) b.place].toUpperCase();
+            if (hasDynamics (b)) text += (isSpectralDynamic (b) ? "   SPEC " : "   DYN ") + pillow::formatDb (b.dynRange);
             if (b.tube) text += "   TUBE " + juce::String (juce::roundToInt (b.drive)) + " dB";
             if (b.xfmr) text += "   XFMR " + juce::String (juce::roundToInt (b.xfAmount * 100.0f)) + " %";
             if (! b.on) text += "   OFF";
@@ -802,15 +1009,30 @@ void GraphView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWhee
         return;   // 드래그 중 (Ctrl 드래그로 Q를 잡고 있을 수도 있음)
 
     const int b = hovered >= 0 ? hovered : selected;
+    float d = std::abs (w.deltaY) >= std::abs (w.deltaX) ? w.deltaY : w.deltaX;
+    if (w.isReversed)
+        d = -d;
+
+    // Alt + 휠: 다이내믹 RANGE (다이내믹이 꺼져 있으면 켬)
+    if (b >= 0 && e.mods.isAltDown() && params.bands[(size_t) b].used && rz::typeHasDynamics (params.bands[(size_t) b].type))
+    {
+        const auto& bp = params.bands[(size_t) b];
+        const float step = e.mods.isShiftDown() ? 1.6f : 16.0f;
+        const float range = juce::jlimit (-rz::kDynRangeMax, rz::kDynRangeMax,
+                                          std::round ((bp.dynRange + d * step) * 10.0f) / 10.0f);
+        setParameter (bandParam (proc, b, pillow::ids::range), range);
+        if (! bp.dyn)
+            setParameter (bandParam (proc, b, pillow::ids::dyn), 1.0f);
+        refreshNow();
+        return;
+    }
+
     if (b < 0 || ! params.bands[(size_t) b].used || ! rz::typeHasQ (params.bands[(size_t) b].type))
     {
         juce::Component::mouseWheelMove (e, w);
         return;
     }
 
-    float d = std::abs (w.deltaY) >= std::abs (w.deltaX) ? w.deltaY : w.deltaX;
-    if (w.isReversed)
-        d = -d;
     const float sens = e.mods.isShiftDown() ? 0.12f : 1.2f;
     const float q = juce::jlimit (pillow::rz::kQMin, pillow::rz::kQMax, params.bands[(size_t) b].q * std::pow (2.0f, d * sens));
     setParameter (bandParam (proc, b, pillow::ids::q), q);
@@ -865,6 +1087,8 @@ void GraphView::showBandMenu (int band)
     menu.addItem (1, "Band On", true, bp.on);
     menu.addItem (4, "Tube (EF804S) on this band", true, bp.tube);
     menu.addItem (5, "Transformer on this band", true, bp.xfmr);
+    menu.addItem (6, "Dynamic EQ", rz::typeHasDynamics (bp.type), bp.dyn && rz::typeHasDynamics (bp.type));
+    menu.addItem (7, "Spectral dynamics", rz::typeHasSpectral (bp.type), bp.dyn && bp.spectral && rz::typeHasSpectral (bp.type));
     if (rz::typeHasGain (bp.type))
         menu.addItem (2, "Reset Gain");
     menu.addItem (3, "Delete Band");
@@ -889,6 +1113,16 @@ void GraphView::handleBandMenu (int band, int r)
     else if (r == 2) setParameter (bandParam (proc, band, pillow::ids::gain), 0.0f);
     else if (r == 4) setParameter (bandParam (proc, band, pillow::ids::tube), params.bands[(size_t) band].tube ? 0.0f : 1.0f);
     else if (r == 5) setParameter (bandParam (proc, band, pillow::ids::xfmr), params.bands[(size_t) band].xfmr ? 0.0f : 1.0f);
+    else if (r == 6) setParameter (bandParam (proc, band, pillow::ids::dyn),  params.bands[(size_t) band].dyn ? 0.0f : 1.0f);
+    else if (r == 7)
+    {
+        // 스펙트럴은 다이내믹 안의 방식: 켜면 다이내믹도 켬, 다이내믹이 켜진 스펙트럴을 고르면 스펙트럴만 끔
+        const auto& bp = params.bands[(size_t) band];
+        const bool on = bp.dyn && bp.spectral;
+        setParameter (bandParam (proc, band, pillow::ids::spec), on ? 0.0f : 1.0f);
+        if (! on && ! bp.dyn)
+            setParameter (bandParam (proc, band, pillow::ids::dyn), 1.0f);
+    }
     else if (r == 3)
     {
         if (selected == band)
