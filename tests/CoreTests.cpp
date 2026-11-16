@@ -2119,6 +2119,153 @@ static void dumpCsv (const std::string& dir)
 }
 
 //------------------------------------------------------------------------------
+// v0.8.1: 감지 · 스펙트럴 정확도 (다시 확인하면서 고친 것들)
+static void testDynamicAccuracy()
+{
+    std::printf ("[21] 다이내믹 정확도 (힐베르트 감지, 스펙트럴 칸 레벨 · 필터 뱅크 고역, 듣기 시간 맞춤)\n");
+
+    auto toneAmp = [] (const std::vector<float>& y, double fs, double f, size_t start, size_t len)
+    {
+        std::complex<double> acc (0.0, 0.0);
+        double ws = 0.0;
+        for (size_t i = 0; i < len; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos (2.0 * kPi * (double) i / (double) len);
+            const double ph = 2.0 * kPi * f * (double) (start + i) / fs;
+            acc += w * (double) y[start + i] * std::complex<double> (std::cos (ph), -std::sin (ph));
+            ws += w;
+        }
+        return 2.0 * std::abs (acc) / ws;
+    };
+    auto runMono = [] (Engine& e, std::vector<float>& x)
+    {
+        for (size_t s = 0; s < x.size(); s += 256)
+        {
+            float* c[1] = { x.data() + s };
+            e.process (c, 1, (int) std::min<size_t> (256, x.size() - s));
+        }
+    };
+
+    // 1) 낮은 음이 감지 구간에 있어도 게인이 떨리지 않음: 틸트 1 kHz · 로우 셸프 800 Hz 다이내믹에 50 / 60 Hz 사인
+    {
+        const double fs = 48000.0;
+        double worst = -300.0, worstGainErr = 0.0;
+        struct C { BandType t; double f, tone; };
+        for (const C c : { C { BandType::Tilt, 1000.0, 50.0 }, C { BandType::LowShelf, 800.0, 60.0 }, C { BandType::Bell, 1000.0, 200.0 } })
+        {
+            Params p; p.xfAll = false;
+            p.bands[0] = makeBand (c.t, c.f, 0.0, c.t == BandType::Bell ? 0.3 : 1.0);
+            p.bands[0].dyn = true; p.bands[0].dynRange = -9.0f; p.bands[0].autoTh = false; p.bands[0].thresh = -30.0f;
+            Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+            const size_t n = (size_t) (fs * 3.0);
+            auto x = sine (fs, c.tone, 0.25, (int) n);
+            runMono (e, x);
+            const size_t len = (size_t) fs, st = n - len;
+            const double a1 = toneAmp (x, fs, c.tone, st, len);
+            for (int h = 2; h <= 5; ++h)
+                worst = std::max (worst, 20.0 * std::log10 (toneAmp (x, fs, c.tone * h, st, len) / a1 + 1.0e-15));
+            // 게인 = 그 게인으로 설계한 밴드의 응답 (감지 레벨 = 감지 필터를 지난 사인)
+            const auto region = makeRegion (c.t, c.f, c.t == BandType::Bell ? 0.3 : 1.0, fs);
+            const double det = 20.0 * std::log10 (0.25 * std::abs (svfResponse (region, c.tone, fs)));
+            const double g = dynamicGainDb (det + 30.0, -9.0);
+            const double want = 20.0 * std::log10 (std::abs (designResponse (designBand (c.t, c.f, g, c.t == BandType::Bell ? 0.3 : 1.0,
+                                                                                         kDefaultSlope, fs), c.tone, fs)));
+            worstGainErr = std::max (worstGainErr, std::abs (20.0 * std::log10 (a1 / 0.25) - want));
+        }
+        std::printf ("    틸트 / 로우 셸프 / 넓은 벨 다이내믹 + 낮은 음: 배음 최대 %.1f dBc (v0.8.0: -43 dBc), 게인 오차 %.3f dB\n", worst, worstGainErr);
+        CHECK (worst < -100.0, "dynamic gain ripple distortion %.1f dBc", worst);
+        CHECK (worstGainErr < 0.05, "dynamic gain error with low tones %.3f dB", worstGainErr);
+    }
+
+    // 2) 정적 곡선: 여러 주파수 · 샘플레이트에서 계산값과 0.03 dB 이내
+    {
+        double worst = 0.0;
+        for (double fs : { 44100.0, 96000.0 })
+            for (double f : { 60.0, 1000.0, 12000.0 })
+                for (double lvl : { -36.0, -27.0, -12.0 })
+                {
+                    Params p; p.xfAll = false;
+                    p.bands[0] = makeBand (BandType::Bell, f, 0.0, 1.0);
+                    p.bands[0].dyn = true; p.bands[0].dynRange = -12.0f; p.bands[0].autoTh = false; p.bands[0].thresh = -30.0f;
+                    Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+                    const size_t n = (size_t) (fs * (f < 100.0 ? 3.0 : 1.5));
+                    const double a = std::pow (10.0, lvl / 20.0);
+                    auto x = sine (fs, f, a, (int) n);
+                    runMono (e, x);
+                    const size_t len = (size_t) (0.25 * fs);
+                    const double got = 20.0 * std::log10 (toneAmp (x, fs, f, n - len, len) / a);
+                    worst = std::max (worst, std::abs (got - dynamicGainDb (lvl + 30.0, -12.0)));
+                }
+        std::printf ("    정적 곡선 (44.1 / 96 kHz, 60 Hz ~ 12 kHz, 니 안팎): 계산과 최대 %.4f dB (v0.8.0: 0.11 dB)\n", worst);
+        CHECK (worst < 0.03, "dynamic static curve %.4f dB", worst);
+    }
+
+    // 3) 스펙트럴: 사인이 칸 가운데에 있든 칸 사이에 있든 같은 레벨로 봄 (문턱 근처 = 니 안에서 비교)
+    //    + 필터 뱅크가 고역(44.1k의 12 / 16 kHz)에서도 목표만큼 내림
+    {
+        auto specGain = [&] (bool linear, double fs, double f, double lvl)
+        {
+            Params p; p.xfAll = false;
+            p.bands[0] = makeBand (BandType::Bell, f, 0.0, 1.0);
+            p.bands[0].dyn = true; p.bands[0].spectral = true; p.bands[0].dynRange = -12.0f;
+            p.bands[0].autoTh = false; p.bands[0].thresh = -40.0f;
+            Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (linear); e.setParams (p); e.reset();
+            const size_t n = (size_t) (fs * 1.5);
+            const double a = std::pow (10.0, lvl / 20.0);
+            auto x = sine (fs, f, a, (int) n);
+            auto y = x;
+            runMono (e, y);
+            const size_t len = (size_t) (0.25 * fs), lat = (size_t) e.getLatencySamples();
+            return 20.0 * std::log10 (toneAmp (y, fs, f, n - len, len) / toneAmp (x, fs, f, n - len - lat, len));
+        };
+        auto theory = [] (double over)
+        {
+            const double knee = SpectralStage::kSpecKneeDb;
+            if (over <= 0.0) return 0.0;
+            const double o = over < knee ? over * over / (2.0 * knee) : over - 0.5 * knee;
+            return -12.0 * std::tanh (o / 12.0);
+        };
+        double worstScallop = 0.0;
+        for (int lin = 0; lin < 2; ++lin)
+        {
+            const double fs = 48000.0;
+            const double binHz = fs / (lin ? 2048.0 : 1024.0);
+            for (double off : { 0.0, 0.5 })
+            {
+                const double f = (std::round (1000.0 / binHz) + off) * binHz;
+                worstScallop = std::max (worstScallop, std::abs (specGain (lin != 0, fs, f, -34.0) - theory (6.0)));
+            }
+        }
+        double worstHigh = 0.0;
+        for (double f : { 12016.0, 16021.0 })
+            worstHigh = std::max (worstHigh, std::abs (specGain (false, 44100.0, f, -10.0) - theory (30.0)));
+        std::printf ("    스펙트럴 문턱 근처 (칸 가운데 / 칸 사이, ZL · HQ): 계산과 최대 %.2f dB (v0.8.0: 2.0 dB), ZL 44.1k 12 / 16 kHz: %.2f dB (v0.8.0: 5.5 dB)\n",
+                     worstScallop, worstHigh);
+        CHECK (worstScallop < 0.3, "spectral level depends on bin position %.2f dB", worstScallop);
+        CHECK (worstHigh < 0.6, "zero-latency bank short at high frequencies %.2f dB", worstHigh);
+    }
+
+    // 4) 듣기 (HQ 선형 위상): 늦은 출력과 같은 만큼 늦춰서 -> 켜는 동안에도 시간이 맞음 (사인 위상이 같음)
+    {
+        const double fs = 48000.0, f = 1000.0;
+        Params p; p.xfAll = false;
+        p.bands[0] = makeBand (BandType::Bell, f, 0.0, 1.0);
+        p.bands[1] = makeBand (BandType::Bell, 3000.0, 0.0, 1.0);
+        p.bands[1].dyn = true; p.bands[1].spectral = true; p.bands[1].autoTh = false; p.bands[1].thresh = 0.0f;
+        Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (true); e.setParams (p); e.reset();
+        const size_t n = (size_t) fs;
+        auto x = sine (fs, f, 0.3, (int) n);
+        auto y = x;
+        e.setAudition (0);
+        runMono (e, y);
+        const size_t lat = (size_t) e.getLatencySamples(), st = n / 2, len = 4800;
+        double err = 0.0;
+        for (size_t i = st; i < st + len; ++i) err = std::max (err, (double) std::abs (y[i] - x[i - lat]));
+        std::printf ("    듣기 + HQ 스펙트럴: 늦춘 입력과의 차이 최대 %.2g (레이턴시 %zu)\n", err, lat);
+        CHECK (lat > 0 && err < 1.0e-3, "audition not aligned with linear-phase latency (%.3g)", err);
+    }
+}
+
 int main (int argc, char** argv)
 {
    #ifdef _WIN32
@@ -2150,6 +2297,7 @@ int main (int argc, char** argv)
     testBandTubeRegions();
     testDynamicEq();
     testSpectral();
+    testDynamicAccuracy();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
