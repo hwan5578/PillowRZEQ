@@ -158,6 +158,12 @@ inline constexpr float  kThreshMin = -60.0f, kThreshMax = 0.0f;
 inline constexpr double kDynKneeDb = 6.0;          // 소프트 니 폭
 inline constexpr double kDynSlope = 0.5;           // 문턱 넘는 1 dB마다 0.5 dB (2:1)에서 시작해 RANGE에 부드럽게 닿음
 inline constexpr double kDynAutoMarginDb = 3.0;    // 자동 문턱 = 평소 레벨 + 3 dB
+inline constexpr double kDynGateDb = 20.0;         // 평소 레벨보다 이만큼 작으면 쉬는 중(쉼 · 무대 소음)으로 보고 평균을 그대로 둠
+inline constexpr double kDynPresenceDb = -72.0;    // 이보다 작으면 소리가 없는 것 (자동 문턱 평균을 배우지 않음)
+// ATTACK / RELEASE = 게인이 63 %까지 가는 실제 시간이 되도록: 감지(영역 필터 · 힐베르트 · 평균)가 늦는 만큼 필터를 줄임
+inline constexpr double kDynLagRegion = 0.5, kDynLagDetect = 0.5;          // 어택: 늦음 = 힐베르트 + 0.5 영역 + 0.5 평균
+inline constexpr double kDynRelLagRegion = 1.0, kDynRelLagDetect = 1.5;    // 릴리스: 레벨이 더 많이 내려가야 해서 더 늦음
+inline constexpr double kDynAttackFloor = 0.2, kDynReleaseFloor = 0.5;     // 설정의 이만큼 아래로는 줄이지 않음
 
 // 다이내믹 게인 (dB). over = 레벨 - 문턱. 니 아래는 0, 위로 갈수록 rangeDb에 다가감 (넘지 않음)
 inline double dynamicGainDb (double over, double rangeDb) noexcept
@@ -385,6 +391,19 @@ struct HilbertPair
         }
     }
 };
+
+// 그 주파수에서 두 갈래 군지연의 평균 (초): 포락선이 이만큼 늦게 따라옴 (100 Hz에서 약 2.6 ms = 0.26주기)
+inline double hilbertDelaySeconds (const HilbertPair& h, double hz, double fs) noexcept
+{
+    const double cw = std::cos (2.0 * kPi * std::clamp (hz, 1.0, 0.49 * fs) / fs);
+    double s = 0.0;
+    for (size_t i = 0; i < (size_t) HilbertPair::kSections; ++i)
+    {
+        s += (1.0 - h.ca[i] * h.ca[i]) / (1.0 + 2.0 * h.ca[i] * cw + h.ca[i] * h.ca[i]);   // (c + z^-1) / (1 + c z^-1)
+        s += (1.0 - h.cb[i] * h.cb[i]) / (1.0 + 2.0 * h.cb[i] * cw + h.cb[i] * h.cb[i]);
+    }
+    return 0.5 * s / fs;
+}
 
 struct HilbertState
 {
@@ -1756,6 +1775,32 @@ inline SvfCoeffs makeRegion (BandType t, double freq, double q, double fs) noexc
     return finishSvf (all);
 }
 
+// 감지 구간의 대표 주파수: 벨 · 틸트 = 밴드 주파수, 로우 셸프 = 한 옥타브 아래, 하이 셸프 = 한 옥타브 위
+inline double detectToneHz (BandType t, double hz, double fs) noexcept
+{
+    if (t == BandType::LowShelf)  return 0.5 * hz;
+    if (t == BandType::HighShelf) return std::min (2.0 * hz, 0.4 * fs);
+    return hz;
+}
+
+// 감지 영역 필터가 그 대표 주파수 소리의 포락선을 늦추는 정도 (초): 대역 통과 = 포락선 시상수 2Q / w0,
+// 셸프 (2차 버터워스) = 한 옥타브 안쪽에서의 군지연 (로우 0.265 / fc, 하이 0.066 / fc), 틸트 (전체) = 0
+inline double regionLagSeconds (BandType t, double hz, double q) noexcept
+{
+    const double f = std::max (hz, 1.0);
+    switch (t)
+    {
+        case BandType::Bell:
+        case BandType::Notch:     return std::clamp (q, (double) kQMin, (double) kQMax) / (kPi * f);
+        case BandType::LowShelf:
+        case BandType::HighCut:   return 0.265 / f;
+        case BandType::HighShelf:
+        case BandType::LowCut:    return 0.066 / f;
+        case BandType::Tilt:      break;
+    }
+    return 0.0;
+}
+
 inline std::complex<double> designResponse (const BandDesign& d, double f, double fs) noexcept
 {
     std::complex<double> h (1.0, 0.0);
@@ -1792,9 +1837,10 @@ public:
     void prepare (double sampleRate)
     {
         fs = sampleRate > 0.0 ? sampleRate : 48000.0;
-        subBlock = kSubBlockBase * std::max (1, (int) std::lround (fs / 48000.0));
+        baseSubBlock = kSubBlockBase * std::max (1, (int) std::lround (fs / 48000.0));
+        subBlock = baseSubBlock;
         fadeStep = 1.0 / std::max (1.0, kFadeSeconds * fs);
-        dynAvgCoeff = 1.0 - std::exp (-(double) subBlock / (kDynAutoSeconds * fs));
+        updateDynAvgCoeffs();
         hilbert.prepare (fs);
         for (auto& t : analog.tube) t.prepare (fs);
         for (auto& x : analog.xf)   x.prepare (fs);
@@ -2093,9 +2139,12 @@ private:
     //--------------------------------------------------------------------------
     //  다이내믹 EQ (스펙트럴이 아닌 밴드): 서브블록마다 게인 계산 -> 바뀌었으면 계수 다시 (기존 보간 그대로)
     //   감지 = EQ 전 입력을 이 밴드 영역(벨 = 밴드패스, 셸프 = 그쪽 절반, 틸트 = 전체)으로 걸러
-    //   힐베르트 포락선^2 (사인이면 진폭^2, 2f 출렁임 없음)을 짧게 평균 (밴드 주파수 1주기와 어택의 절반 중 짧은 쪽,
-    //   0.05 ~ 20 ms) -> 사인 기준 dB. 스테레오 밴드는 두 채널 중 큰 쪽
-    //   자동 문턱 = 느린 평균(1.5 s) + 3 dB. ATTACK/RELEASE는 게인(dB)에 거는 1차 스무딩
+    //   힐베르트 포락선^2 (사인이면 진폭^2, 2f 출렁임 없음)을 짧게 평균 (밴드 주파수 1주기와 어택의 1/4 중 짧은 쪽,
+    //   0.02 ~ 20 ms) -> 사인 기준 dB. 스테레오 밴드는 두 채널 중 큰 쪽
+    //   자동 문턱 = 소리가 나는 동안의 느린 평균(1.5 s) + 3 dB. 쉬는 동안(평균보다 20 dB 넘게 작음)이나
+    //   소리가 없을 때(-72 dB 아래)는 평균을 그대로 둠 -> 쉬었다가 다시 시작해도, 잡음 바닥에서 시작해도 처음을 누르지 않음
+    //   ATTACK/RELEASE는 게인(dB)에 거는 1차 스무딩. 감지(영역 필터 · 힐베르트 · 평균)가 늦는 만큼 줄여서 실제 63 % 시간 = 설정
+    //   어택이 짧으면 게인을 더 자주(최소 4샘플 @48k) 다시 계산
     //--------------------------------------------------------------------------
     static constexpr double kDynAutoSeconds = 1.5;
 
@@ -2133,22 +2182,30 @@ private:
             dyn.regionQ  = q;
             dyn.regionValid = true;
         }
-        if (! sameValue (hz, dyn.timeHz) || ! sameValue ((double) target.attack, dyn.timeAtt)
+        if (! sameValue (hz, dyn.timeHz) || ! sameValue (q, dyn.timeQ) || ! sameValue ((double) target.attack, dyn.timeAtt)
             || ! sameValue ((double) target.release, dyn.timeRel))
         {
             const double sb = (double) subBlock, attackSec = dynAttackSeconds (hz, target.attack);
-            dyn.aDet = 1.0 - std::exp (-1.0 / (std::clamp (std::min (1.0 / hz, 0.5 * attackSec), 0.00005, 0.02) * fs));
-            dyn.aAtt = 1.0 - std::exp (-sb / (attackSec * fs));
-            dyn.aRel = 1.0 - std::exp (-sb / (dynReleaseSeconds (hz, target.release) * fs));
+            const double detSec = std::clamp (std::min (1.0 / hz, 0.25 * attackSec), 0.00002, 0.02);
+            // 감지가 늦는 만큼 어택 필터를 짧게 -> 실제 63 % 시간이 설정에 가깝게 (가장 빠른 쪽은 감지 자체가 바닥)
+            const double hil = hilbertDelaySeconds (hilbert, detectToneHz (cfg.type, hz, fs), fs);
+            const double reg = regionLagSeconds (cfg.type, hz, q);
+            const double releaseSec = dynReleaseSeconds (hz, target.release);
+            dyn.attackSec = std::max (attackSec - (hil + kDynLagRegion * reg + kDynLagDetect * detSec), kDynAttackFloor * attackSec);
+            const double relInt = std::max (releaseSec - (hil + kDynRelLagRegion * reg + kDynRelLagDetect * detSec), kDynReleaseFloor * releaseSec);
+            dyn.aDet = 1.0 - std::exp (-1.0 / (detSec * fs));
+            dyn.aAtt = 1.0 - std::exp (-sb / (dyn.attackSec * fs));
+            dyn.aRel = 1.0 - std::exp (-sb / (relInt * fs));
             dyn.timeHz  = hz;
+            dyn.timeQ   = q;
             dyn.timeAtt = target.attack;
             dyn.timeRel = target.release;
         }
 
         const double msv = std::max (dyn.ms[0], dyn.ms[1]);   // 포락선^2: 사인이면 진폭^2
         const double level = 10.0 * std::log10 (msv + 1.0e-30);
-        if (msv > 2.0e-10)                          // 평소 레벨(dB 평균, 1.5 s). 무음(-97 dB 아래)에서는 그대로 둠
-        {
+        if (level > kDynPresenceDb)                 // 평소 레벨(dB 평균, 1.5 s). 소리가 없을 때(-72 dB 아래: 무음 · 잡음 바닥)는 그대로 둠
+        {                                           //   -> 마이크 잡음 바닥에서 평균을 배우고 시작해 첫 소절을 누르는 일이 없음
             if (! dyn.avgValid)
             {
                 // 감지가 자리 잡은 뒤(30 ms와 6주기 중 긴 쪽)의 레벨에서 평균을 시작 -> 올라오는 도중의 작은 값으로 시작하지 않음
@@ -2162,7 +2219,10 @@ private:
             }
             else
             {
-                dyn.avgDb += dynAvgCoeff * (level - dyn.avgDb);
+                // 쉬는 동안(지금 레벨이 평균보다 20 dB 넘게 작음 = 쉼 · 무대 소음만)은 평균을 그대로 둠
+                // -> 말 · 노래가 쉬었다가 (쉼이 길어도) 다시 시작할 때 처음을 누르지 않음
+                if (level > dyn.avgDb - kDynGateDb)
+                    dyn.avgDb += dynAvgCoeff * (level - dyn.avgDb);
             }
         }
 
@@ -2190,6 +2250,24 @@ private:
         if (ramping)
             cur = next;                 // 직전 서브블록의 끝 = 목표 계수
         ramping = false;
+
+        // 다이내믹 어택이 짧으면 게인을 더 자주 계산 (서브블록을 어택의 1/4 이하로, 최소 4샘플 @48k)
+        int wantSub = baseSubBlock;
+        if (dyn.live || dynamicWanted())
+        {
+            const double attackSamples = (dyn.attackSec > 0.0 ? dyn.attackSec : dynAttackSeconds (std::exp (sF.current), target.attack)) * fs;
+            const int minSub = std::max (2, baseSubBlock / 4);
+            while (wantSub > minSub && (double) (4 * wantSub) > attackSamples)
+                wantSub /= 2;
+        }
+        if (wantSub != subBlock)
+        {
+            subBlock = wantSub;
+            applySmoothing();
+            updateDynAvgCoeffs();
+            dyn.timeHz = -1.0;          // 어택 · 릴리스 계수를 새 서브블록으로 다시
+        }
+
         updateDynamics();
         const bool dynMoved = std::abs (dyn.gainDb - dyn.designedDb) > 0.005 || (! dyn.live && ! sameValue (dyn.designedDb, 0.0));
         if (! (sF.isSettled() && sG.isSettled() && sQ.isSettled()) || dynMoved)
@@ -2239,6 +2317,11 @@ private:
         out.tiltC.outGain  = b.tiltC.outGain + d.tiltC.outGain * t;
     }
 
+    void updateDynAvgCoeffs() noexcept
+    {
+        dynAvgCoeff     = 1.0 - std::exp (-(double) subBlock / (kDynAutoSeconds * fs));
+    }
+
     void applySmoothing() noexcept
     {
         const double rate = fs / subBlock;
@@ -2254,7 +2337,7 @@ private:
     Smoother sF, sG, sQ;
     BandDesign cur, next, base, step, live;
     std::array<ChannelState, 2> st {};
-    int subBlock = kSubBlockBase, subLeft = 0, rampPos = 0;
+    int baseSubBlock = kSubBlockBase, subBlock = kSubBlockBase, subLeft = 0, rampPos = 0;
     Analog analog;
     std::array<double, kMaxChunk> fadeTrace {};
     int traceIdx = 0;
@@ -2267,7 +2350,8 @@ private:
         std::array<double, 2> ms {};
         double avgDb = 0.0, gainDb = 0.0, designedDb = 0.0;
         double aDet = 0.0, aAtt = 0.0, aRel = 0.0;
-        double regionHz = 0.0, regionQ = 0.0, timeHz = 0.0, timeAtt = -1.0, timeRel = -1.0;
+        double regionHz = 0.0, regionQ = 0.0, timeHz = 0.0, timeQ = 0.0, timeAtt = -1.0, timeRel = -1.0;
+        double attackSec = 0.0;                     // 실제로 쓰는 어택 필터 시간 (감지가 늦는 만큼 줄인 값)
         int warmSamples = 0;
         bool live = false, regionValid = false, avgValid = false;
     };
@@ -2284,16 +2368,21 @@ public:
 
 
 //==============================================================================
-//  스펙트럴 다이내믹스 (v0.8) — 밴드 전체 대신 "문턱을 넘는 주파수만" (Pro-Q 4의 Spectral)
-//   분석: 마지막 N 샘플 FFT (홉 N/4). 밴드마다 그 모양(+6 dB 기준 dB 모양을 0..1로)으로 가중하고
-//         칸마다 레벨(그 칸과 양옆 칸 파워 합 = 사인이 칸 사이에 있어도 같은 값, 10 ms 평균)
-//         vs 문턱 (자동 = 주변 1/2옥타브의 로그 평균 + 6 dB, 수동 = dBFS 사인 기준)
-//         -> 게인(1:1에서 RANGE로), ATTACK / RELEASE, DENSITY(낮을수록 둘레로 퍼짐) -> 도메인(L · R · M · S)별 게인 지도
-//   합성:
-//    - 필터 뱅크 (ZERO LATENCY): 1/12옥타브 간격 최소 위상 피킹 필터들이 게인 지도를 따라감 -> 레이턴시 0
-//      (분석 창 때문에 조금 늦게 반응. 나이퀴스트 근처에서 좁아지는 폭(쌍선형 찌그러짐)은 필터마다 보정하고,
-//       겹침은 실제 디지털 응답으로 만든 이웃 영향 표로 빼는 반복 계산)
-//    - 선형 위상 (HQ): 게인 지도를 FFT 칸에 바로 곱하고 겹쳐 더하기 -> 정확, 레이턴시 = N (약 43 ms)
+//  스펙트럴 다이내믹스 — 밴드 전체 대신 "문턱을 넘는 주파수만" (Pro-Q 4의 Spectral)
+//   격자: 20 Hz부터 1/12옥타브 점 (ZERO LATENCY 필터 뱅크와 같은 점)
+//   자동 문턱 (v0.8.2) = 같은 순간 주변(±2/3옥타브, 격자 ±8점) 레벨의 아래쪽 30 % 값 + 6 dB -> 주변보다 튀어나온 것만.
+//     튀어나온 것 자체에는 끌려 올라가지 않고, 넓게 같이 커지는 소리(말 · 노래의 시작)에는 바로 따라 올라감
+//     (올라갈 때 바로, 내려갈 때 80 ms) -> 쉬었다가 다시 시작해도 처음을 누르지 않음
+//   ZERO LATENCY (v0.8.2): 격자 옥타브마다 FFT 길이를 따로 (칸 폭 ≈ 그 옥타브 아래 끝 주파수의 0.09배, 48k 기준 512 ~ 4096)
+//     -> 높은 소리는 짧은 창으로 빨리 (1.3 kHz 위 63 % 6 ms), 낮은 소리는 긴 창으로 정밀하게
+//     FFT는 창 없이 한 번, Hann 창과 그 미분 창은 주파수 쪽 3탭으로 (시간 쪽과 정확히 같음)
+//     칸마다 에너지를 "재배치"(창 미분으로 그 칸 에너지의 실제 주파수를 구해 그 격자점으로)
+//     -> 공진 · 사인은 창 폭과 상관없이 제 주파수의 격자점 하나(또는 둘)에만 모임 (사인이 어디 있든 진폭^2 그대로)
+//     게인 판단 = 재배치 레벨(±1/12옥타브에 모인 에너지), 자동 문턱 기준 = 칸 합 레벨(±1/24옥타브 + 양옆 칸)의 둘레 아래쪽 30 % 값
+//     -> 게인 지도 -> 1/12옥타브 최소 위상 필터 뱅크
+//     (나이퀴스트 근처에서 좁아지는 필터 폭은 필터마다 보정, 겹침은 실제 디지털 응답 표로 빼는 반복 계산, 이웃 ±8개)
+//   HQ: 선형 위상 FFT (48k 기준 2048): 칸마다 레벨(그 칸 + 양옆) · 게인을 칸에 바로 곱하고 겹쳐 더하기 (레이턴시 = N)
+//     칸 가중 (v0.8.2) = 그 칸 에너지의 재배치 주파수에서의 밴드 모양 -> 칸이 거친 낮은 쪽(50 ~ 150 Hz)도 정확
 //   밴드의 고정 게인(EQ 곡선)은 원래 필터 그대로, 여기서는 움직이는 부분만
 //==============================================================================
 class SpectralStage
@@ -2303,15 +2392,19 @@ public:
     enum Domain { DomL = 0, DomR, DomM, DomS, kNumDomains };
     enum Detect { DetLink = 0, DetL, DetR, DetM, DetS, kNumDetect };
 
-    static constexpr double kAutoMarginDb  = 6.0;
-    static constexpr double kSlope         = 1.0;     // 문턱 넘는 1 dB마다 1 dB에서 시작
-    static constexpr double kLevelSeconds  = 0.010;   // 칸 레벨 평균 (3칸 합이라 짧아도 안정)
-    static constexpr double kRefSeconds    = 0.400;   // 자동 문턱 기준 스펙트럼
-    static constexpr double kAttackBase    = 0.010, kReleaseBase = 0.150;
-    static constexpr double kBankQ         = 8.65;    // 1/6옥타브 폭 (격자는 1/12옥타브)
-    static constexpr double kSpecKneeDb    = 4.0;
-    static constexpr double kMinWeight     = 0.02;    // 밴드 모양 가중이 이보다 작은 칸은 건드리지 않음
-    static constexpr double kBankDeadDb    = 0.15;    // 필터 뱅크: 이보다 작은 변화는 0 (들리지 않음, 필터를 켜지 않음)
+    static constexpr double kAutoMarginDb    = 6.0;
+    static constexpr double kSlope           = 1.0;     // 문턱 넘는 1 dB마다 1 dB에서 시작
+    static constexpr double kLevelSecondsLin = 0.010;   // HQ: 칸 레벨 평균
+    static constexpr double kLevelSecondsZl  = 0.0015;  // ZL: 격자 레벨 평균 (짧은 창의 출렁임만 다듬음)
+    static constexpr double kRefFallSeconds  = 0.080;   // 자동 문턱 기준이 내려갈 때 (올라갈 때는 바로)
+    static constexpr int    kRefHalfWidth    = 8;       // 기준 = ±2/3옥타브 (격자 ±8점)의 아래쪽 30 % 값
+    static constexpr double kRefPercentile   = 0.30;
+    static constexpr double kAttackBase      = 0.003, kReleaseBase = 0.150;
+    static constexpr double kZlResolution    = 0.09;    // ZL: 칸 폭 / 그 옥타브 아래 끝 주파수
+    static constexpr double kBankQ           = 8.65;    // 1/6옥타브 폭 (격자는 1/12옥타브)
+    static constexpr double kSpecKneeDb      = 4.0;
+    static constexpr double kMinWeight       = 0.02;    // 밴드 모양 가중이 이보다 작은 곳은 건드리지 않음
+    static constexpr double kBankDeadDb      = 0.15;    // 필터 뱅크: 이보다 작은 변화는 0 (들리지 않음, 필터를 켜지 않음)
 
     SpectralStage() { prepare (48000.0, 2); }
 
@@ -2319,42 +2412,13 @@ public:
     {
         fs  = sampleRate > 0.0 ? sampleRate : 48000.0;
         nch = std::clamp (numChannels, 1, 2);
-        subBlock = 16 * std::max (1, (int) std::lround (fs / 48000.0));
-        nBank = std::clamp (nextPow2 ((int) std::lround (1024.0 * fs / 48000.0)), 512, 8192);
-        nLin  = linearLatencyFor (fs);
-        const int maxN = std::max (nBank, nLin), maxBins = maxN / 2 + 1;
-        ringMask = 2 * maxN - 1;
+        const int scale = std::max (1, (int) std::lround (fs / 48000.0));
+        subBlock = 16 * scale;
+        bankStride = subBlock;
+        ctrl = 2 * subBlock;
+        nLin = linearLatencyFor (fs);
 
-        fftBank.prepare (nBank);
-        fftLin.prepare (nLin);
-        for (int c = 0; c < 2; ++c)
-        {
-            inRing[(size_t) c].assign ((size_t) (2 * maxN), 0.0);
-            outAcc[(size_t) c].assign ((size_t) (2 * maxN), 0.0);
-            xr[(size_t) c].assign ((size_t) maxBins, 0.0);
-            xi[(size_t) c].assign ((size_t) maxBins, 0.0);
-        }
-        frameBuf.assign ((size_t) maxN, 0.0);
-        rawP.assign ((size_t) maxBins, 0.0);
-        tmpA.assign ((size_t) maxBins + 1, 0.0);
-        tmpB.assign ((size_t) maxBins, 0.0);
-        winBank.resize ((size_t) nBank);
-        for (int i = 0; i < nBank; ++i) winBank[(size_t) i] = 0.5 - 0.5 * std::cos (2.0 * kPi * i / nBank);   // Hann
-        winLin.resize ((size_t) nLin);
-        for (int i = 0; i < nLin; ++i) winLin[(size_t) i] = std::sin (kPi * i / nLin);                       // sqrt-Hann
-        for (auto& v : power)   v.assign ((size_t) maxBins, 0.0);
-        for (auto& v : levelDb) v.assign ((size_t) maxBins, 0.0);
-        for (auto& v : levelPw) v.assign ((size_t) maxBins, 0.0);
-        for (auto& v : refDb)   v.assign ((size_t) maxBins, 0.0);
-        for (auto& v : field)   v.assign ((size_t) maxBins, 0.0);
-        for (auto& b : bands)
-        {
-            b.w.assign ((size_t) maxBins, 0.0);
-            b.decay.assign ((size_t) maxBins, 0.0);
-            b.delta.assign ((size_t) maxBins, 0.0);
-        }
-
-        // 필터 뱅크 격자: 20 Hz부터 1/12옥타브, 20 kHz와 0.45 fs 중 낮은 쪽까지
+        // 격자 = 필터 뱅크 점: 20 Hz부터 1/12옥타브, 20 kHz와 0.45 fs 중 낮은 쪽까지
         bankHz.clear();
         for (int j = 0;; ++j)
         {
@@ -2362,10 +2426,11 @@ public:
             if (f > std::min (20000.0, 0.45 * fs)) break;
             bankHz.push_back (f);
         }
-        const size_t ng = bankHz.size();
-        bankG.resize (ng);
-        bankK.resize (ng);
-        for (size_t j = 0; j < ng; ++j)
+        ng = (int) bankHz.size();
+        const size_t ngz = (size_t) ng;
+        bankG.resize (ngz);
+        bankK.resize (ngz);
+        for (size_t j = 0; j < ngz; ++j)
         {
             const double th = kPi * bankHz[j] / fs;
             bankG[j] = std::tan (th);
@@ -2374,16 +2439,16 @@ public:
         }
         for (auto& d : bank)
         {
-            d.cur.assign (ng, 0.0);  d.step.assign (ng, 0.0);  d.tgt.assign (ng, 0.0);  d.want.assign (ng, 0.0);  d.goal.assign (ng, 0.0);
-            d.coef.assign (ng, SvfCoeffs {});  d.tcoef.assign (ng, SvfCoeffs {});  d.dcoef.assign (ng, SvfCoeffs {});
-            d.moving.assign (ng, 0);  d.on.assign (ng, 0);
-            d.st.assign (ng, SvfState {});
-            d.list.clear();  d.list.reserve (ng);
+            d.cur.assign (ngz, 0.0);  d.step.assign (ngz, 0.0);  d.tgt.assign (ngz, 0.0);  d.want.assign (ngz, 0.0);  d.goal.assign (ngz, 0.0);
+            d.coef.assign (ngz, SvfCoeffs {});  d.tcoef.assign (ngz, SvfCoeffs {});  d.dcoef.assign (ngz, SvfCoeffs {});
+            d.moving.assign (ngz, 0);  d.on.assign (ngz, 0);
+            d.st.assign (ngz, SvfState {});
+            d.list.clear();  d.list.reserve (ngz);
         }
         // 이웃 필터가 격자점에 주는 영향: 실제 디지털 응답으로 (-6 dB 필터의 dB / -6, 가운데 = 1)
-        influence.assign (ng * (size_t) (2 * kNeighbours + 1), 0.0);
-        influenceNorm.assign (ng, 1.0);
-        for (size_t j = 0; j < ng; ++j)
+        influence.assign (ngz * (size_t) (2 * kNeighbours + 1), 0.0);
+        influenceNorm.assign (ngz, 1.0);
+        for (size_t j = 0; j < ngz; ++j)
         {
             double rowSum = 0.0;
             for (int m = -kNeighbours; m <= kNeighbours; ++m)
@@ -2398,6 +2463,185 @@ public:
             influenceNorm[j] = 1.0 / std::max (1.0, rowSum);
         }
 
+        // ZERO LATENCY 해상도: 격자 옥타브마다 N = 2^올림(log2(fs / (0.09 * 그 옥타브 아래 끝))), 48k 기준 512 ~ 4096 (11 ~ 85 ms 창)
+        //   가장 짧은 창 512: 높은 쪽도 칸이 격자보다 좁아서 좁은 공진이 잡음 위로 잘 드러남 (반응 6 ms)
+        //   가장 긴 창 4096: 320 Hz 아래도 반응이 너무 늦지 않게 (정밀도는 재배치가 지킴)
+        const int minN = nextPow2 ((int) std::lround (512.0 * fs / 48000.0));
+        const int maxN = nextPow2 ((int) std::lround (4096.0 * fs / 48000.0));
+        zres.clear();
+        gRes.assign (ngz, 0);
+        for (int j = 0; j < ng; ++j)
+        {
+            const double fLow = 20.0 * std::exp2 (std::floor ((double) j / 12.0));
+            const int N = std::clamp (nextPow2 ((int) std::ceil (fs / (kZlResolution * fLow))), minN, maxN);
+            int r = -1;
+            for (size_t i = 0; i < zres.size(); ++i)
+                if (zres[i].N == N) r = (int) i;
+            if (r < 0)
+            {
+                zres.emplace_back();
+                zres.back().N = N;
+                r = (int) zres.size() - 1;
+            }
+            gRes[(size_t) j] = r;
+        }
+        int maxFrame = nLin;
+        for (size_t r = 0; r < zres.size(); ++r)
+        {
+            auto& z = zres[r];
+            z.jLo = ng;  z.jHi = -1;
+            for (int j = 0; j < ng; ++j)
+                if (gRes[(size_t) j] == (int) r) { z.jLo = std::min (z.jLo, j); z.jHi = std::max (z.jHi, j); }
+            // 기준 둘레: 격자 ±8점, 칸이 격자보다 넓은 해상도(낮은 쪽)는 ±5칸까지 넓힘 (사인이 번진 폭보다 넓게)
+            {
+                const double fLowest = bankHz[(size_t) std::max (0, z.jLo)];
+                const double binHz0 = fs / (double) z.N;
+                z.hw = std::max (kRefHalfWidth, (int) std::ceil (5.0 * binHz0 / (fLowest * (kGridStep - 1.0))));
+            }
+            z.hLo = std::max (0, z.jLo - z.hw);
+            z.hHi = std::min (ng - 1, z.jHi + z.hw);
+            // 홉 = N/4 (긴 창은 48k 기준 512샘플까지: 낮은 소리도 10 ms마다 새로 봄)
+            const int hopWant = std::min (z.N / 4, 512 * scale);
+            z.hop = ctrl * std::max (1, (hopWant + ctrl - 1) / ctrl);
+            z.fft.prepare (z.N);
+            double w2 = 0.0;
+            for (int i = 0; i < z.N; ++i)
+            {
+                const double w = 0.5 - 0.5 * std::cos (2.0 * kPi * i / z.N);    // Hann (주파수 쪽에서 곱함)
+                w2 += w * w;
+            }
+            z.calE   = 4.0 / ((double) z.N * w2);                                   // 파워 합 -> 사인 진폭^2 (Parseval)
+            z.aLevel = 1.0 - std::exp (-(double) z.hop / (kLevelSecondsZl * fs));
+            z.aFall  = 1.0 - std::exp (-(double) z.hop / (kRefFallSeconds * fs));
+            const int bins = z.N / 2 + 1;
+            for (int c = 0; c < 2; ++c)
+            {
+                z.re[(size_t) c].assign ((size_t) bins, 0.0);
+                z.im[(size_t) c].assign ((size_t) bins, 0.0);
+                z.dre[(size_t) c].assign ((size_t) bins, 0.0);
+                z.dim[(size_t) c].assign ((size_t) bins, 0.0);
+            }
+            const double binHz = fs / (double) z.N;
+            const int hn = z.hHi - z.hLo + 1;
+            z.b0.assign ((size_t) hn, 1);
+            z.b1.assign ((size_t) hn, 1);
+            for (int h = 0; h < hn; ++h)
+            {
+                const double f = bankHz[(size_t) (z.hLo + h)];
+                const int nearest = (int) std::lround (f / binHz);
+                int lo = std::min ((int) std::floor (f * kHalfStepDown / binHz), nearest - 1);
+                int hi = std::max ((int) std::ceil (f * kHalfStepUp / binHz), nearest + 1);
+                lo = std::clamp (lo, 1, bins - 1);
+                hi = std::clamp (hi, lo, bins - 1);
+                z.b0[(size_t) h] = lo;
+                z.b1[(size_t) h] = hi;
+            }
+            for (auto& v : z.lvl)  v.assign ((size_t) hn, 0.0);
+            for (auto& v : z.lvlB) v.assign ((size_t) hn, 0.0);
+            z.acc.assign ((size_t) hn, 0.0);
+            maxFrame = std::max (maxFrame, z.N);
+        }
+
+        // 링 (가장 긴 창 두 개)과 HQ 배열
+        const int ringSize = 2 * nextPow2 (maxFrame);
+        ringMask = ringSize - 1;
+        for (int c = 0; c < 2; ++c)
+        {
+            inRing[(size_t) c].assign ((size_t) ringSize, 0.0);
+            outAcc[(size_t) c].assign ((size_t) ringSize, 0.0);
+        }
+        frameBuf.assign ((size_t) maxFrame, 0.0);
+        for (int c = 0; c < 2; ++c)
+        {
+            rawRe[(size_t) c].assign ((size_t) (maxFrame / 2 + 1), 0.0);
+            rawIm[(size_t) c].assign ((size_t) (maxFrame / 2 + 1), 0.0);
+        }
+
+        hopLin   = nLin / 4;
+        binHzLin = fs / (double) nLin;
+        const int binsLin = nLin / 2 + 1;
+        fftLin.prepare (nLin);
+        winLin.resize ((size_t) nLin);
+        dwinLin.resize ((size_t) nLin);
+        for (int i = 0; i < nLin; ++i)
+        {
+            winLin[(size_t) i]  = std::sin (kPi * i / nLin);                     // sqrt-Hann (분석 · 합성)
+            dwinLin[(size_t) i] = (kPi / nLin) * std::cos (kPi * i / nLin);      // 그 미분 (재배치용)
+        }
+        {
+            double s1 = 0.0, w1r = 0.0, w1i = 0.0;
+            for (int i = 0; i < nLin; ++i)
+            {
+                s1  += winLin[(size_t) i];
+                w1r += winLin[(size_t) i] * std::cos (2.0 * kPi * i / nLin);
+                w1i -= winLin[(size_t) i] * std::sin (2.0 * kPi * i / nLin);
+            }
+            calLin = 4.0 / (s1 * s1);
+            // 칸 레벨 = 그 칸과 양옆 칸 파워의 합 / (1 + 2 r^2) -> 칸 사이의 사인도 같은 레벨
+            const double r1 = std::sqrt (w1r * w1r + w1i * w1i) / s1;
+            sumNormLin = 1.0 / (1.0 + 2.0 * r1 * r1);
+        }
+        aLevelLin = 1.0 - std::exp (-(double) hopLin / (kLevelSecondsLin * fs));
+        aFallLin  = 1.0 - std::exp (-(double) hopLin / (kRefFallSeconds * fs));
+        for (int c = 0; c < 2; ++c)
+        {
+            xr[(size_t) c].assign ((size_t) binsLin, 0.0);
+            dxr[(size_t) c].assign ((size_t) binsLin, 0.0);
+            dxi[(size_t) c].assign ((size_t) binsLin, 0.0);
+            xi[(size_t) c].assign ((size_t) binsLin, 0.0);
+        }
+        rawP.assign ((size_t) (std::max (binsLin, maxFrame / 2 + 1)), 0.0);
+        tmpB.assign ((size_t) std::max (binsLin, ng), 0.0);
+        for (auto& v : levelDb) v.assign ((size_t) binsLin, -300.0);
+        for (auto& v : levelPw) v.assign ((size_t) binsLin, 0.0);
+        for (auto& v : fHatLin) v.assign ((size_t) binsLin, 0.0);
+        for (auto& v : field)   v.assign ((size_t) binsLin, 0.0);
+        linB0.assign (ngz, 1);
+        linB1.assign (ngz, 1);
+        for (size_t j = 0; j < ngz; ++j)
+        {
+            const double f = bankHz[j];
+            const int nearest = (int) std::lround (f / binHzLin);
+            const int lo = std::clamp (std::min ((int) std::floor (f * kHalfStepDown / binHzLin), nearest), 1, binsLin - 1);
+            const int hi = std::clamp (std::max ((int) std::ceil (f * kHalfStepUp / binHzLin), nearest), lo, binsLin - 1);
+            linB0[j] = lo;
+            linB1[j] = hi;
+        }
+        gridPosLin.assign ((size_t) binsLin, 0.0);
+        for (int k = 0; k < binsLin; ++k)
+            gridPosLin[(size_t) k] = std::clamp (12.0 * std::log2 (std::max (1.0, (double) k) * binHzLin / 20.0), 0.0, (double) (ng - 1));
+
+        // 화면 점의 위치 (격자 / HQ 칸)
+        for (int p = 0; p < kDisplayPoints; ++p)
+        {
+            const double u = std::clamp (12.0 * std::log2 (displayHz (p) / 20.0), 0.0, (double) std::max (0, ng - 1));
+            dispJ[(size_t) p]  = std::clamp ((int) u, 0, std::max (0, ng - 2));
+            dispFr[(size_t) p] = std::clamp (u - (double) dispJ[(size_t) p], 0.0, 1.0);
+            const double kc = displayHz (p) / binHzLin;
+            dispK[(size_t) p] = std::clamp ((int) kc, 0, binsLin - 2);
+            dispU[(size_t) p] = std::clamp (kc - (double) dispK[(size_t) p], 0.0, 1.0);
+        }
+
+        // 격자 배열
+        for (auto& v : gDb)  v.assign (ngz, -300.0);
+        for (auto& v : gRef) v.assign (ngz, -300.0);
+        for (auto& v : gField) v.assign (ngz, 0.0);
+        gTmp.assign (ngz, 0.0);
+        hdb.assign (ngz, -300.0);
+        refWin.assign (ngz + 1, 0.0);
+        tpad.assign (ngz + (size_t) (2 * kNeighbours), 0.0);
+        for (auto& v : blk) v.assign ((size_t) bankStride, 0.0);
+        for (auto& b : bands)
+        {
+            b.w.assign ((size_t) binsLin, 0.0);
+            b.fw.assign ((size_t) kFineN, 0.0);
+            b.decay.assign ((size_t) binsLin, 0.0);
+            b.delta.assign ((size_t) binsLin, 0.0);
+            b.gw.assign (ngz, 0.0);
+            b.gdelta.assign (ngz, 0.0);
+            b.wValid = b.dValid = b.cValid = b.gwValid = b.gdValid = b.gcValid = false;
+        }
+
         setLinearPhase (false);
     }
 
@@ -2405,33 +2649,11 @@ public:
     void setLinearPhase (bool on) noexcept
     {
         linear = on;
-        curN = linear ? nLin : nBank;
-        hop  = curN / 4;
-        bankStride = std::max (subBlock, hop / 4);       // 필터 뱅크 계수는 홉마다 4번 (게인을 직선으로)
-        binHz = fs / (double) curN;
-        // 사인 기준 레벨 보정: 진폭 1 사인 = 0 dB (창 합 S1 -> 4 / S1^2)
-        double s1 = 0.0, w1r = 0.0, w1i = 0.0;
-        const auto& w = linear ? winLin : winBank;
-        for (int i = 0; i < curN; ++i)
-        {
-            s1 += w[(size_t) i];
-            w1r += w[(size_t) i] * std::cos (2.0 * kPi * i / curN);
-            w1i -= w[(size_t) i] * std::sin (2.0 * kPi * i / curN);
-        }
-        cal = 4.0 / (s1 * s1);
-        // 칸 레벨 = 그 칸과 양옆 칸 파워의 합 / (1 + 2 r^2), r = 이웃 칸에서의 창 응답 / 가운데 (Hann 0.5)
-        // -> 칸 가운데 사인은 그 칸 값과 같고, 칸 사이에 있어도 거의 같음 (스캘럽 손실 없음)
-        const double r1 = std::sqrt (w1r * w1r + w1i * w1i) / s1;
-        sumNorm = 1.0 / (1.0 + 2.0 * r1 * r1);
-        const double frameRate = fs / (double) hop;
-        aLevel = 1.0 - std::exp (-1.0 / (kLevelSeconds * frameRate));
-        aRef   = 1.0 - std::exp (-1.0 / (kRefSeconds * frameRate));
-        for (auto& b : bands) { b.wN = 0; b.dN = 0; b.cN = 0; }
         reset();
     }
 
     bool isLinearPhase() const noexcept { return linear; }
-    int  latencySamples() const noexcept { return linear ? curN : 0; }
+    int  latencySamples() const noexcept { return linear ? nLin : 0; }
 
     // 선형 위상일 때의 FFT 크기 = 레이턴시 (처리 레이트 샘플): 48k 기준 2048 (약 43 ms, 칸 23 Hz)
     static int linearLatencyFor (double processingRate) noexcept
@@ -2446,11 +2668,11 @@ public:
             std::fill (inRing[(size_t) c].begin(), inRing[(size_t) c].end(), 0.0);
             std::fill (outAcc[(size_t) c].begin(), outAcc[(size_t) c].end(), 0.0);
         }
-        for (auto& v : levelPw) std::fill (v.begin(), v.end(), 0.0);
-        refValid.fill (false);
+        clearLevels();
         for (auto& b : bands)
         {
             std::fill (b.delta.begin(), b.delta.end(), 0.0);
+            std::fill (b.gdelta.begin(), b.gdelta.end(), 0.0);
             b.live = false;
             b.display.store (0.0f, std::memory_order_relaxed);
         }
@@ -2469,6 +2691,7 @@ public:
         for (auto& dom : display) for (auto& v : dom) v.store (0.0f, std::memory_order_relaxed);
         t = 0;
         anyLive = false;
+        anyBank = false;
     }
 
     // 쉬고 있다가 다시 쓰기 시작할 때: 오래된 입력 · 레벨 없이 (무음에서 시작한 것처럼)
@@ -2476,8 +2699,7 @@ public:
     {
         for (int c = 0; c < 2; ++c)
             std::fill (inRing[(size_t) c].begin(), inRing[(size_t) c].end(), 0.0);
-        for (auto& v : levelPw) std::fill (v.begin(), v.end(), 0.0);
-        refValid.fill (false);
+        clearLevels();
     }
 
     // 블록마다 (오디오 스레드)
@@ -2523,56 +2745,85 @@ public:
     {
         hz = bankHz;  cur = bank[(size_t) dom].cur;  want = bank[(size_t) dom].want;
     }
-    double bandGainAtHz (int band, double hz) const noexcept
+    int zeroLatencyWindow (double hz) const noexcept     // 그 주파수의 ZL 분석 창 길이 (샘플)
     {
-        const auto& b = bands[(size_t) band];
-        const int k = std::clamp ((int) std::lround (hz / binHz), 0, curN / 2);
-        return b.delta[(size_t) k] * b.w[(size_t) k];
+        const int j = std::clamp ((int) std::lround (12.0 * std::log2 (std::max (hz, 20.0) / 20.0)), 0, ng - 1);
+        return zres[(size_t) gRes[(size_t) j]].N;
     }
 
-    // L, R (모노면 R = nullptr): 그 자리에서
+    // L, R (모노면 R = nullptr): 그 자리에서. 다음 경계(HQ 홉 / 뱅크 구간)까지 묶어서 (샘플마다와 같은 계산)
     void process (float* L, float* R, int nc, int n) noexcept
     {
         const bool two = nc > 1 && R != nullptr;
-        for (int i = 0; i < n; ++i)
+        int i = 0;
+        while (i < n)
         {
-            const size_t slot = (size_t) (t & (std::uint64_t) ringMask);
-            inRing[0][slot] = L[i];
-            if (two) inRing[1][slot] = R[i];
+            const std::uint64_t period = (std::uint64_t) (linear ? hopLin : bankStride);
+            const int len = std::min (n - i, (int) (period - t % period));
+            for (int k = 0; k < len; ++k)
+            {
+                const size_t slot = (size_t) ((t + (std::uint64_t) k) & (std::uint64_t) ringMask);
+                inRing[0][slot] = L[i + k];
+                if (two) inRing[1][slot] = R[i + k];
+            }
 
             if (linear)
             {
-                const size_t o = (size_t) ((t - (std::uint64_t) curN) & (std::uint64_t) ringMask);
-                L[i] = (float) outAcc[0][o];  outAcc[0][o] = 0.0;
-                if (two) { R[i] = (float) outAcc[1][o];  outAcc[1][o] = 0.0; }
+                for (int k = 0; k < len; ++k)
+                {
+                    const size_t o = (size_t) ((t + (std::uint64_t) k - (std::uint64_t) nLin) & (std::uint64_t) ringMask);
+                    L[i + k] = (float) outAcc[0][o];  outAcc[0][o] = 0.0;
+                    if (two) { R[i + k] = (float) outAcc[1][o];  outAcc[1][o] = 0.0; }
+                }
             }
             else if (anyBank)
             {
-                double l = L[i], r = two ? (double) R[i] : 0.0;
-                if (bank[DomL].any) l = runBank (bank[DomL], l);
-                if (two && bank[DomR].any) r = runBank (bank[DomR], r);
+                double* l = blk[0].data();
+                double* r = blk[1].data();
+                for (int k = 0; k < len; ++k) { l[k] = L[i + k];  r[k] = two ? (double) R[i + k] : 0.0; }
+                if (bank[DomL].any) runBank (bank[DomL], l, len);
+                if (two && bank[DomR].any) runBank (bank[DomR], r, len);
                 if (two && (bank[DomM].any || bank[DomS].any))
                 {
-                    double m = 0.5 * (l + r), s = 0.5 * (l - r);
-                    if (bank[DomM].any) m = runBank (bank[DomM], m);
-                    if (bank[DomS].any) s = runBank (bank[DomS], s);
-                    l = m + s;
-                    r = m - s;
+                    double* m = blk[2].data();
+                    double* sd = blk[3].data();
+                    for (int k = 0; k < len; ++k) { m[k] = 0.5 * (l[k] + r[k]);  sd[k] = 0.5 * (l[k] - r[k]); }
+                    if (bank[DomM].any) runBank (bank[DomM], m, len);
+                    if (bank[DomS].any) runBank (bank[DomS], sd, len);
+                    for (int k = 0; k < len; ++k) { l[k] = m[k] + sd[k];  r[k] = m[k] - sd[k]; }
                 }
-                L[i] = (float) l;
-                if (two) R[i] = (float) r;
+                for (int k = 0; k < len; ++k)
+                {
+                    L[i + k] = (float) l[k];
+                    if (two) R[i + k] = (float) r[k];
+                }
             }
 
-            ++t;
-            if (! linear && (t % (std::uint64_t) bankStride) == 0)
-                bankSubBlock();
-            if ((t % (std::uint64_t) hop) == 0)
-                frame (two);
+            t += (std::uint64_t) len;
+            i += len;
+            if (linear)
+            {
+                if ((t % (std::uint64_t) hopLin) == 0)
+                    linFrame (two);
+            }
+            else
+            {
+                if ((t % (std::uint64_t) bankStride) == 0)
+                    bankSubBlock();
+                if ((t % (std::uint64_t) ctrl) == 0)
+                    zlControl (two);
+            }
         }
     }
 
 private:
-    static constexpr int kNeighbours = 4;
+    static constexpr int kNeighbours = 8;                 // 뱅크 계획: 이웃 필터 ±8개(±2/3옥타브)의 겹침까지
+    static constexpr double kHalfStepDown = 0.97153194115360586;   // 2^(-1/24)
+    static constexpr double kHalfStepUp   = 1.02930223664349207;   // 2^(+1/24)
+    static constexpr double kGridStep     = 1.05946309435929526;   // 2^(1/12)
+    // HQ: 칸(23.4 Hz)보다 1/48옥타브가 좁은 곳(1.6 kHz 아래)은 가중을 1/48옥타브 표에서, 위는 칸 값 사이를 보간
+    static constexpr double kFineBase = 10.0, kFineTop = 1600.0, kFinePerOct = 48.0;
+    static constexpr int    kFineN = 354;                            // 48 * log2(1600 / 10) = 351.5 -> + 여유
 
     struct Band
     {
@@ -2580,11 +2831,19 @@ private:
         BandType type = BandType::Bell;
         Placement place = Placement::Stereo;
         double freq = 1000.0, q = 1.0, range = 0.0, thresh = -24.0, attack = 0.5, release = 0.5, density = 0.5;
+        // HQ: FFT 칸마다
         std::vector<double> w, decay, delta;
+        std::vector<double> fw;                         // 낮은 쪽(10 Hz ~ 1.6 kHz) 모양 가중, 1/48옥타브 (칸이 모양보다 거친 곳)
         int k0 = 1, k1 = 0;
         BandType wType = BandType::Bell;
         double wFreq = -1.0, wQ = -1.0, dDensity = -1.0, cAtt = -1.0, cRel = -1.0, aAtt = 0.0, aRel = 0.0;
-        int wN = 0, dN = 0, cN = 0;
+        bool wValid = false, dValid = false, cValid = false;
+        // ZL: 격자점마다 (HQ에서도 기준을 구할 범위로 씀)
+        std::vector<double> gw, gdelta;
+        int g0 = 1, g1 = 0;
+        BandType gwType = BandType::Bell;
+        double gwFreq = -1.0, gwQ = -1.0, gDensity = -1.0, gDecay = 0.0, gcAtt = -1.0, gcRel = -1.0, gaAtt = 0.0, gaRel = 0.0;
+        bool gwValid = false, gdValid = false, gcValid = false;
         std::atomic<float> display { 0.0f };
     };
 
@@ -2596,6 +2855,20 @@ private:
         std::vector<SvfState> st;
         std::vector<int> list;     // 지금 쓰는 필터
         bool any = false;
+    };
+
+    // ZL 해상도 하나: 이 길이의 FFT가 맡는 격자점들 [jLo, jHi] (+ 기준용 둘레 [hLo, hHi])
+    struct ZRes
+    {
+        int N = 0, hop = 0, jLo = 0, jHi = -1, hLo = 0, hHi = -1, hw = kRefHalfWidth;
+        RealFft fft;
+        double calE = 1.0, aLevel = 1.0, aFall = 1.0;
+        std::array<std::vector<double>, 2> re, im, dre, dim;   // Hann 창 · 창 미분 스펙트럼 (쓰는 칸만)
+        std::vector<int> b0, b1;                              // 둘레 점마다 더할 칸 범위 (기준용 칸 합)
+        std::array<std::vector<double>, kNumDetect> lvl;     // 둘레 점마다 재배치 레벨 (사인 진폭^2, 평균) -> 게인 판단
+        std::array<std::vector<double>, kNumDetect> lvlB;    // 둘레 점마다 칸 합 레벨 -> 자동 문턱 기준
+        std::vector<double> acc;                              // 재배치 모으기
+        std::array<bool, kNumDetect> refValid {};
     };
 
     static int nextPow2 (int v) noexcept { int p = 1; while (p < v) p <<= 1; return p; }
@@ -2615,64 +2888,141 @@ private:
         return 10.0 * std::log10 (A * A * (low ? p / r : r / p));
     }
 
-    void updateWeights (Band& b) noexcept
+    // 밴드 모양 가중 (+6 dB 모양의 dB / 6, 0..1, 작으면 0)
+    static double shapeWeight (const Band& b, double f) noexcept
     {
-        if (b.wN == curN && b.wType == b.type && sameValue (b.wFreq, b.freq) && sameValue (b.wQ, b.q))
+        const double x = f / b.freq;
+        double w = 0.0;
+        if (b.type == BandType::Bell)          w = bellShapeAt (x, b.q, 6.0) / 6.0;
+        else if (b.type == BandType::LowShelf) w = shelfShapeAt (true,  x, b.q * kButterworthQ, 6.0) / 6.0;
+        else                                   w = shelfShapeAt (false, x, b.q * kButterworthQ, 6.0) / 6.0;
+        w = std::clamp (w, 0.0, 1.0);
+        return w < kMinWeight ? 0.0 : w;
+    }
+
+    void clearLevels() noexcept
+    {
+        for (auto& v : levelPw) std::fill (v.begin(), v.end(), 0.0);
+        for (auto& v : levelDb) std::fill (v.begin(), v.end(), -300.0);
+        for (auto& z : zres)
+        {
+            for (auto& v : z.lvl)  std::fill (v.begin(), v.end(), 0.0);
+            for (auto& v : z.lvlB) std::fill (v.begin(), v.end(), 0.0);
+            z.refValid.fill (false);
+        }
+        for (auto& v : gDb)  std::fill (v.begin(), v.end(), -300.0);
+        for (auto& v : gRef) std::fill (v.begin(), v.end(), -300.0);
+        linRefValid.fill (false);
+    }
+
+    //--------------------------------------------------------------------------
+    //  밴드 모양 · 시간 (캐시)
+    //--------------------------------------------------------------------------
+    void updateWeightsLin (Band& b) noexcept
+    {
+        if (b.wValid && b.wType == b.type && sameValue (b.wFreq, b.freq) && sameValue (b.wQ, b.q))
             return;
-        const int bins = curN / 2 + 1;
+        const int bins = nLin / 2 + 1;
         b.k0 = bins;  b.k1 = 0;
+        b.w[0] = 0.0;
         for (int k = 1; k < bins; ++k)
         {
-            const double x = (double) k * binHz / b.freq;
-            double w = 0.0;
-            if (b.type == BandType::Bell)          w = bellShapeAt (x, b.q, 6.0) / 6.0;
-            else if (b.type == BandType::LowShelf) w = shelfShapeAt (true,  x, b.q * kButterworthQ, 6.0) / 6.0;
-            else                                   w = shelfShapeAt (false, x, b.q * kButterworthQ, 6.0) / 6.0;
-            w = std::clamp (w, 0.0, 1.0);
-            if (w < kMinWeight) w = 0.0;
+            const double w = shapeWeight (b, (double) k * binHzLin);
             b.w[(size_t) k] = w;
             if (w > 0.0) { b.k0 = std::min (b.k0, k); b.k1 = std::max (b.k1, k); }
         }
-        b.w[0] = 0.0;
-        b.wN = curN;  b.wType = b.type;  b.wFreq = b.freq;  b.wQ = b.q;
+        if (b.k1 >= b.k0)
+        {
+            b.k0 = std::max (1, b.k0 - 2);                 // 밴드 끝 바로 밖의 칸에도 밴드 안 소리가 번져 있음 (재배치 가중이 정함)
+            b.k1 = std::min (bins - 1, b.k1 + 2);
+        }
+        for (int u = 0; u < kFineN; ++u)
+            b.fw[(size_t) u] = shapeWeight (b, kFineBase * std::exp2 ((double) u / kFinePerOct));
+        b.wType = b.type;  b.wFreq = b.freq;  b.wQ = b.q;  b.wValid = true;
     }
 
-    void updateDecay (Band& b) noexcept
+    void updateDecayLin (Band& b) noexcept
     {
-        if (b.dN == curN && sameValue (b.dDensity, b.density))
+        if (b.dValid && sameValue (b.dDensity, b.density))
             return;
         const double spreadOct = (1.0 - b.density) * 0.5;          // 0 = 1/2옥타브까지 퍼짐, 1 = 안 퍼짐
-        const int bins = curN / 2 + 1;
+        const int bins = nLin / 2 + 1;
         for (int k = 1; k < bins; ++k)
             b.decay[(size_t) k] = spreadOct < 1.0e-4 ? 0.0
                                 : std::exp (-std::log2 ((double) (k + 1) / (double) k) * 2.302585 / spreadOct);   // spreadOct 옥타브에서 1/10
-        b.dN = curN;  b.dDensity = b.density;
+        b.dDensity = b.density;  b.dValid = true;
     }
 
-    void updateTimes (Band& b) noexcept
+    void updateTimesLin (Band& b) noexcept
     {
-        if (b.cN == curN && sameValue (b.cAtt, b.attack) && sameValue (b.cRel, b.release))
+        if (b.cValid && sameValue (b.cAtt, b.attack) && sameValue (b.cRel, b.release))
             return;
-        const double frameRate = fs / (double) hop;
-        b.aAtt = 1.0 - std::exp (-1.0 / (kAttackBase  * dynTimeScale (b.attack)  * frameRate));
-        b.aRel = 1.0 - std::exp (-1.0 / (kReleaseBase * dynTimeScale (b.release) * frameRate));
-        b.cN = curN;  b.cAtt = b.attack;  b.cRel = b.release;
+        b.aAtt = 1.0 - std::exp (-(double) hopLin / (kAttackBase  * dynTimeScale (b.attack)  * fs));
+        b.aRel = 1.0 - std::exp (-(double) hopLin / (kReleaseBase * dynTimeScale (b.release) * fs));
+        b.cAtt = b.attack;  b.cRel = b.release;  b.cValid = true;
     }
 
-    // 샘플마다: 움직이는 필터는 계수를 직선으로 (지퍼 소리 없이), 그다음 SVF
-    static double runBank (BankDomain& d, double x) noexcept
+    void updateWeightsGrid (Band& b) noexcept
+    {
+        if (b.gwValid && b.gwType == b.type && sameValue (b.gwFreq, b.freq) && sameValue (b.gwQ, b.q))
+            return;
+        b.g0 = ng;  b.g1 = -1;
+        for (int j = 0; j < ng; ++j)
+        {
+            const double w = shapeWeight (b, bankHz[(size_t) j]);
+            b.gw[(size_t) j] = w;
+            if (w > 0.0) { b.g0 = std::min (b.g0, j); b.g1 = std::max (b.g1, j); }
+        }
+        b.gwType = b.type;  b.gwFreq = b.freq;  b.gwQ = b.q;  b.gwValid = true;
+    }
+
+    void updateDecayGrid (Band& b) noexcept
+    {
+        if (b.gdValid && sameValue (b.gDensity, b.density))
+            return;
+        const double spreadOct = (1.0 - b.density) * 0.5;
+        b.gDecay = spreadOct < 1.0e-4 ? 0.0 : std::exp (-(1.0 / 12.0) * 2.302585 / spreadOct);   // 격자 한 칸(1/12옥타브)마다
+        b.gDensity = b.density;  b.gdValid = true;
+    }
+
+    void updateTimesGrid (Band& b) noexcept
+    {
+        if (b.gcValid && sameValue (b.gcAtt, b.attack) && sameValue (b.gcRel, b.release))
+            return;
+        b.gaAtt = 1.0 - std::exp (-(double) ctrl / (kAttackBase  * dynTimeScale (b.attack)  * fs));
+        b.gaRel = 1.0 - std::exp (-(double) ctrl / (kReleaseBase * dynTimeScale (b.release) * fs));
+        b.gcAtt = b.attack;  b.gcRel = b.release;  b.gcValid = true;
+    }
+
+    //--------------------------------------------------------------------------
+    //  필터 뱅크
+    //--------------------------------------------------------------------------
+    // 구간 하나(뱅크 구간 경계를 넘지 않음): 필터마다 그 구간 샘플 전부 (직렬 연결이라 순서만 바뀌고 계산은 같음)
+    //   움직이는 필터는 샘플마다 계수를 직선으로 (지퍼 소리 없이), 그다음 SVF
+    static void runBank (BankDomain& d, double* x, int len) noexcept
     {
         for (int j : d.list)
         {
             auto& c = d.coef[(size_t) j];
+            auto& st = d.st[(size_t) j];
             if (d.moving[(size_t) j] != 0)
             {
                 const auto& dc = d.dcoef[(size_t) j];
-                c.a1 += dc.a1;  c.a2 += dc.a2;  c.a3 += dc.a3;  c.m1 += dc.m1;
+                for (int k = 0; k < len; ++k)
+                {
+                    c.a1 += dc.a1;  c.a2 += dc.a2;  c.a3 += dc.a3;  c.m1 += dc.m1;
+                    x[k] = svfTick (c, st, x[k]);
+                }
             }
-            x = svfTick (c, d.st[(size_t) j], x);
+            else
+            {
+                const SvfCoeffs cc = c;
+                SvfState ss = st;
+                for (int k = 0; k < len; ++k)
+                    x[k] = svfTick (cc, ss, x[k]);
+                st = ss;
+            }
         }
-        return x;
     }
 
     SvfCoeffs bankCoeffs (size_t j, double gainDb) const noexcept
@@ -2687,7 +3037,7 @@ private:
         return finishSvf (c);
     }
 
-    // 몇 서브블록마다(bankStride): 게인을 한 걸음 -> 그 끝의 계수를 목표로, 이번 구간 동안 샘플마다 직선 보간
+    // 서브블록마다(bankStride): 게인을 한 걸음 -> 그 끝의 계수를 목표로, 이번 구간 동안 샘플마다 직선 보간
     void bankSubBlock() noexcept
     {
         anyBank = false;
@@ -2708,7 +3058,7 @@ private:
                     d.cur[j] += d.step[j];
                     if ((d.step[j] > 0.0 && d.cur[j] >= d.goal[j] - 1.0e-9) || (d.step[j] < 0.0 && d.cur[j] <= d.goal[j] + 1.0e-9))
                     {
-                        d.cur[j] = d.goal[j];             // 목표 도착: 다음 프레임까지 그대로
+                        d.cur[j] = d.goal[j];             // 목표 도착: 다음 계획까지 그대로
                         d.step[j] = 0.0;
                     }
                     if (d.on[j] == 0)                      // 새로 켜짐: 0 dB 계수 · 빈 상태에서 시작
@@ -2742,119 +3092,79 @@ private:
         return false;
     }
 
-    // 프레임: 분석 -> 밴드별 감지 -> 도메인별 게인 지도 -> 합성
-    void frame (bool two) noexcept
+    // 격자의 게인 지도 -> 필터마다 게인: 이웃 겹침을 빼는 반복 -> 다음 제어 간격 동안 직선 이동
+    void planBank (const std::array<bool, kNumDomains>& touched) noexcept
     {
-        bool anyWant = false;
-        for (auto& b : bands) anyWant = anyWant || b.want || b.live;
-        if (! anyWant && ! linear)
+        const double steps = (double) std::max (1, ctrl / bankStride);
+        anyBank = false;
+        for (int dom = 0; dom < kNumDomains; ++dom)
         {
-            if (anyLive || anyBank)                  // 남은 필터를 0 dB로 돌려놓기 (몇 홉)
+            auto& d = bank[(size_t) dom];
+            // 할 일이 있는 범위 (목표 또는 지금 게인이 0이 아닌 곳 + 이웃)
+            int lo = ng, hi = -1;
+            for (int j = 0; j < ng; ++j)
             {
-                clearFields();
-                const std::array<bool, kNumDomains> none {};
-                planBank (none);
-                publishDisplay (none);
-            }
-            anyLive = false;
-            return;
-        }
-
-        const int N = curN, bins = N / 2 + 1;
-        RealFft& fft = linear ? fftLin : fftBank;
-        const auto& win = linear ? winLin : winBank;
-        const std::uint64_t start = t - (std::uint64_t) N;
-        for (int c = 0; c < (two ? 2 : 1); ++c)
-        {
-            for (int i = 0; i < N; ++i)
-                frameBuf[(size_t) i] = inRing[(size_t) c][(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)] * win[(size_t) i];
-            fft.forward (frameBuf.data(), xr[(size_t) c].data(), xi[(size_t) c].data());
-        }
-
-        // 필요한 감지 도메인과 칸 범위 (밴드 영역 + 자동 문턱 창)
-        std::array<bool, kNumDetect> needDet {};
-        std::array<int, kNumDetect> detLo {}, detHi {};
-        detLo.fill (bins);  detHi.fill (-1);
-        std::array<bool, kNumDomains> touched {};
-        for (auto& b : bands)
-            if (b.want || b.live)
-            {
-                const int d = detectDomain (b.place, two);
-                if (d < 0) continue;
-                updateWeights (b);
-                needDet[(size_t) d] = true;
-                detLo[(size_t) d] = std::min (detLo[(size_t) d], b.k0);
-                detHi[(size_t) d] = std::max (detHi[(size_t) d], b.k1);
-            }
-        for (int d = 0; d < kNumDetect; ++d)
-            if (needDet[(size_t) d] && detHi[(size_t) d] >= detLo[(size_t) d])
-                analyse (d, bins, two, detLo[(size_t) d], detHi[(size_t) d]);
-
-        clearFields();
-        anyLive = false;
-        fieldLo = bins;  fieldHi = -1;
-        for (size_t bi = 0; bi < bands.size(); ++bi)
-        {
-            auto& b = bands[bi];
-            if (! (b.want || b.live)) continue;
-            const int det = detectDomain (b.place, two);
-            if (det < 0) { b.live = false; b.display.store (0.0f, std::memory_order_relaxed); continue; }
-            updateWeights (b);
-            updateDecay (b);
-            updateTimes (b);
-            fieldLo = std::min (fieldLo, b.k0);
-            fieldHi = std::max (fieldHi, b.k1);
-
-            double maxAbs = 0.0;
-            const auto& lev = levelDb[(size_t) det];
-            const auto& ref = refDb[(size_t) det];
-            for (int k = b.k0; k <= b.k1; ++k)
-            {
-                double tgt = 0.0;
-                if (b.want)
+                const size_t z = (size_t) j;
+                d.want[z] = touched[(size_t) dom] ? gField[(size_t) dom][z] : 0.0;
+                if (! sameValue (d.want[z], 0.0) || ! sameValue (d.tgt[z], 0.0) || ! sameValue (d.cur[z], 0.0))
                 {
-                    const double th = b.autoTh ? ref[(size_t) k] + kAutoMarginDb : b.thresh;
-                    tgt = spectralGainDb (lev[(size_t) k] - th, b.range);
+                    lo = std::min (lo, j);
+                    hi = std::max (hi, j);
                 }
-                double& dl = b.delta[(size_t) k];
-                dl += (std::abs (tgt) > std::abs (dl) ? b.aAtt : b.aRel) * (tgt - dl);
-                maxAbs = std::max (maxAbs, std::abs (dl));
             }
-            b.live = b.want || maxAbs > 1.0e-4;
-            if (! b.live)
+            if (hi < lo)
             {
-                std::fill (b.delta.begin(), b.delta.end(), 0.0);
-                b.display.store (0.0f, std::memory_order_relaxed);
+                d.any = d.any && hasPendingSteps (d);
+                anyBank = anyBank || d.any;
                 continue;
             }
-            anyLive = true;
+            lo = std::max (0, lo - kNeighbours);
+            hi = std::min (ng - 1, hi + kNeighbours);
 
-            // DENSITY: 둘레로 퍼뜨리기 (크기 기준 팽창, 상수 Q 감쇠)
-            auto& e = tmpB;
-            for (int k = b.k0; k <= b.k1; ++k) e[(size_t) k] = std::abs (b.delta[(size_t) k]);
-            for (int k = b.k0 + 1; k <= b.k1; ++k)
-                e[(size_t) k] = std::max (e[(size_t) k], e[(size_t) (k - 1)] * b.decay[(size_t) (k - 1)]);
-            for (int k = b.k1 - 1; k >= b.k0; --k)
-                e[(size_t) k] = std::max (e[(size_t) k], e[(size_t) (k + 1)] * b.decay[(size_t) k]);
-
-            const double sign = b.range < 0.0 ? -1.0 : 1.0;
-            double shown = 0.0;
-            for (int k = b.k0; k <= b.k1; ++k)
+            // 반복 (이전 목표에서 시작): g += (want - S g) / (그 줄의 합)
+            //   tpad[j + K] = tgt[j], 범위 밖은 0 (영향 표도 배열 밖은 0) -> 경계 검사 없이 더함
+            constexpr int K = kNeighbours;
+            double* tp = tpad.data();
+            for (int j = lo - K; j <= hi + K; ++j)
+                tp[j + K] = (j >= lo && j <= hi) ? d.tgt[(size_t) j] : 0.0;
+            for (int it = 0; it < 2; ++it)
             {
-                const double v = sign * e[(size_t) k] * b.w[(size_t) k];
-                if (std::abs (v) > std::abs (shown)) shown = v;
-                forEachTarget (b.place, two, [&] (int dom) { field[(size_t) dom][(size_t) k] += v; touched[(size_t) dom] = true; });
+                for (int j = lo; j <= hi; ++j)
+                {
+                    const double* inf = influence.data() + (size_t) j * (size_t) (2 * K + 1);
+                    const double* g = tp + j;                       // g[m + K] = tgt[j + m]
+                    double sg = 0.0;
+                    for (int m = 0; m <= 2 * K; ++m)
+                        sg += inf[m] * g[m];
+                    tmpB[(size_t) j] = tp[j + K] + (d.want[(size_t) j] - sg) * influenceNorm[(size_t) j];
+                }
+                for (int j = lo; j <= hi; ++j)
+                    tp[j + K] = std::clamp (tmpB[(size_t) j], -30.0, 30.0);
             }
-            b.display.store ((float) shown, std::memory_order_relaxed);
-        }
+            for (int j = lo; j <= hi; ++j)
+                d.tgt[(size_t) j] = tp[j + K];
 
-        if (linear)
-            synthesise (bins, two, touched);
-        else
-            planBank (touched);
-        publishDisplay (touched);
+            bool any = false;
+            for (int j = lo; j <= hi; ++j)                       // 범위 밖은 모두 0 (cur · tgt · want · step)
+            {
+                const size_t z = (size_t) j;
+                if (std::abs (d.tgt[z]) < 1.0e-4) d.tgt[z] = 0.0;
+                // 아주 작은 변화는 0으로: 잡음 때문에 필터들이 계속 켜져 있지 않게
+                double g = std::abs (d.tgt[z]) < kBankDeadDb && std::abs (d.want[z]) < kBankDeadDb ? 0.0 : d.tgt[z];
+                if (! sameValue (g, 0.0) && std::abs (g - d.cur[z]) < 0.003)
+                    g = d.cur[z];                                    // 계수를 다시 만들 만큼 바뀌지 않음
+                d.goal[z] = g;
+                d.step[z] = sameValue (g, d.cur[z]) ? 0.0 : (g - d.cur[z]) / steps;
+                any = any || ! sameValue (d.step[z], 0.0) || ! sameValue (d.cur[z], 0.0);
+            }
+            d.any = any;
+            anyBank = anyBank || any;
+        }
     }
 
+    //--------------------------------------------------------------------------
+    //  공통
+    //--------------------------------------------------------------------------
     // 문턱부터 4 dB에 걸친 니 (문턱 아래는 0: 잡음의 작은 출렁임으로 칸들이 움직이지 않게)
     static double spectralGainDb (double over, double rangeDb) noexcept
     {
@@ -2894,68 +3204,476 @@ private:
         }
     }
 
-    void analyse (int d, int bins, bool two, int kLo, int kHi) noexcept
+    // 한 칸의 파워 (감지 도메인)
+    static double binPower (int d, bool two, const std::vector<double>& lr, const std::vector<double>& li,
+                            const std::vector<double>& rr, const std::vector<double>& ri, size_t z) noexcept
     {
-        // 자동 문턱 창(+-1/4옥타브)까지 넓혀서 그 범위만
-        const int lo0 = std::max (1, (int) std::floor ((double) kLo * 0.8409) - 1);
-        const int hi0 = std::min (bins - 1, (int) std::ceil ((double) kHi * 1.1892) + 1);
-        const int pLo = std::max (0, lo0 - 1), pHi = std::min (bins - 1, hi0 + 1);
-        auto& P = power[(size_t) d];
-        const auto& lr = xr[0];  const auto& li = xi[0];
-        const auto& rr = xr[1];  const auto& ri = xi[1];
+        const double pl = lr[z] * lr[z] + li[z] * li[z];
+        if (! two) return pl;
+        const double pr = rr[z] * rr[z] + ri[z] * ri[z];
+        if (d == DetLink) return std::max (pl, pr);
+        if (d == DetL)    return pl;
+        if (d == DetR)    return pr;
+        const double sg = d == DetM ? 1.0 : -1.0;
+        const double a = 0.5 * (lr[z] + sg * rr[z]), b = 0.5 * (li[z] + sg * ri[z]);
+        return a * a + b * b;
+    }
+
+    static double safeDb (double power) noexcept
+    {
+        const double v = 10.0 * std::log10 (power + 1.0e-30);
+        return v > -300.0 ? std::min (v, 300.0) : -300.0;          // NaN도 -300 (정렬이 깨지지 않게)
+    }
+
+    // 정렬된 작은 배열에 넣기 / 빼기 (값은 늘 그 배열에 있던 것)
+    static void sortedInsert (double* s, int& n, double v) noexcept
+    {
+        const int pos = (int) (std::upper_bound (s, s + n, v) - s);
+        for (int i = n; i > pos; --i) s[i] = s[i - 1];
+        s[pos] = v;
+        ++n;
+    }
+    static void sortedRemove (double* s, int& n, double v) noexcept
+    {
+        int pos = (int) (std::lower_bound (s, s + n, v) - s);
+        if (pos >= n || ! sameValue (s[pos], v))
+            pos = n - 1;                                         // (일어나지 않음) 그래도 개수는 맞게
+        for (int i = pos; i < n - 1; ++i) s[i] = s[i + 1];
+        --n;
+    }
+
+    // 자동 문턱 기준 (격자): 둘레 ±hw점의 아래쪽 30 % 값, 올라갈 때 바로 / 내려갈 때 aFall
+    //   창이 한 점씩 밀리므로 정렬된 창에서 빠지는 값 · 들어오는 값만 바꿈
+    void updateReference (int d, const double* levels, int lvLo, int lvHi, int jLo, int jHi, int hw, double aFall, bool& valid) noexcept
+    {
+        auto& ref = gRef[(size_t) d];
+        double* s = refWin.data();
+        int n = 0, a = 0, e = -1;
+        for (int j = jLo; j <= jHi; ++j)
+        {
+            const int na = std::max (lvLo, j - hw), ne = std::min (lvHi, j + hw);
+            if (j == jLo)
+            {
+                for (int k = na; k <= ne; ++k) sortedInsert (s, n, levels[k - lvLo]);
+            }
+            else
+            {
+                for (int k = a; k < na; ++k)     sortedRemove (s, n, levels[k - lvLo]);
+                for (int k = e + 1; k <= ne; ++k) sortedInsert (s, n, levels[k - lvLo]);
+            }
+            a = na;  e = ne;
+            const double med = s[std::clamp ((int) std::lround (kRefPercentile * (double) (n - 1)), 0, n - 1)];
+            double& r = ref[(size_t) j];
+            r = (! valid || med > r) ? med : r + aFall * (med - r);
+        }
+        valid = true;
+    }
+
+    //--------------------------------------------------------------------------
+    //  ZERO LATENCY: 제어 간격(48k에서 32샘플)마다
+    //--------------------------------------------------------------------------
+    void zlControl (bool two) noexcept
+    {
+        bool anyWant = false;
+        for (auto& b : bands) anyWant = anyWant || b.want || b.live;
+        if (! anyWant)
+        {
+            if (anyLive || anyBank)                  // 남은 필터를 0 dB로 돌려놓기
+            {
+                for (auto& f : gField) std::fill (f.begin(), f.end(), 0.0);
+                const std::array<bool, kNumDomains> none {};
+                planBank (none);
+                publishDisplayGrid (none);
+            }
+            anyLive = false;
+            return;
+        }
+
+        // 필요한 감지 도메인과 격자 범위 (밴드 영역 + 기준 둘레)
+        std::array<bool, kNumDetect> needDet {};
+        int needLo = ng, needHi = -1;
+        for (auto& b : bands)
+            if (b.want || b.live)
+            {
+                const int d = detectDomain (b.place, two);
+                if (d < 0) continue;
+                updateWeightsGrid (b);
+                if (b.g1 < b.g0) continue;
+                needDet[(size_t) d] = true;
+                needLo = std::min (needLo, b.g0 - kRefHalfWidth);
+                needHi = std::max (needHi, b.g1 + kRefHalfWidth);
+            }
+
+        // 해상도마다: 그 홉이 됐고 필요한 범위에 걸치면 FFT -> 격자 레벨 -> 기준
+        const std::uint64_t tick = t / (std::uint64_t) ctrl;
+        for (auto& z : zres)
+            if (z.jHi >= needLo && z.jLo <= needHi && (tick % (std::uint64_t) (z.hop / ctrl)) == 0)
+                refreshResolution (z, two, needDet);
+
+        // 밴드마다 게인 (ATTACK / RELEASE), DENSITY, 도메인별 지도
+        for (auto& f : gField) std::fill (f.begin(), f.end(), 0.0);
+        std::array<bool, kNumDomains> touched {};
+        anyLive = false;
+        for (auto& b : bands)
+        {
+            if (! (b.want || b.live)) continue;
+            const int det = detectDomain (b.place, two);
+            if (det < 0) { b.live = false; b.display.store (0.0f, std::memory_order_relaxed); continue; }
+            updateWeightsGrid (b);
+            updateDecayGrid (b);
+            updateTimesGrid (b);
+            if (b.g1 < b.g0) { b.live = false; b.display.store (0.0f, std::memory_order_relaxed); continue; }
+
+            double maxAbs = 0.0;
+            const auto& lev = gDb[(size_t) det];
+            const auto& ref = gRef[(size_t) det];
+            for (int j = b.g0; j <= b.g1; ++j)
+            {
+                const size_t z = (size_t) j;
+                double tgt = 0.0;
+                if (b.want)
+                {
+                    const double th = b.autoTh ? ref[z] + kAutoMarginDb : b.thresh;
+                    tgt = spectralGainDb (lev[z] - th, b.range);
+                }
+                double& dl = b.gdelta[z];
+                dl += (std::abs (tgt) > std::abs (dl) ? b.gaAtt : b.gaRel) * (tgt - dl);
+                maxAbs = std::max (maxAbs, std::abs (dl));
+            }
+            b.live = b.want || maxAbs > 1.0e-4;
+            if (! b.live)
+            {
+                std::fill (b.gdelta.begin(), b.gdelta.end(), 0.0);
+                b.display.store (0.0f, std::memory_order_relaxed);
+                continue;
+            }
+            anyLive = true;
+
+            // DENSITY: 둘레로 퍼뜨리기 (크기 기준 팽창, 1/12옥타브마다 같은 비율로 줄어듦)
+            auto& e = gTmp;
+            for (int j = b.g0; j <= b.g1; ++j) e[(size_t) j] = std::abs (b.gdelta[(size_t) j]);
+            for (int j = b.g0 + 1; j <= b.g1; ++j)
+                e[(size_t) j] = std::max (e[(size_t) j], e[(size_t) (j - 1)] * b.gDecay);
+            for (int j = b.g1 - 1; j >= b.g0; --j)
+                e[(size_t) j] = std::max (e[(size_t) j], e[(size_t) (j + 1)] * b.gDecay);
+
+            const double sign = b.range < 0.0 ? -1.0 : 1.0;
+            double shown = 0.0;
+            for (int j = b.g0; j <= b.g1; ++j)
+            {
+                const double v = sign * e[(size_t) j] * b.gw[(size_t) j];
+                if (std::abs (v) > std::abs (shown)) shown = v;
+                forEachTarget (b.place, two, [&] (int dom) { gField[(size_t) dom][(size_t) j] += v; touched[(size_t) dom] = true; });
+            }
+            b.display.store ((float) shown, std::memory_order_relaxed);
+        }
+
+        planBank (touched);
+        publishDisplayGrid (touched);
+    }
+
+    // 한 칸: 감지 도메인의 파워와 Im(X_dh conj X_h) (재배치용). Link = 두 채널 중 큰 쪽, M/S = (L ± R) / 2
+    static void binPowerCross (int d, bool two, const ZRes& z, size_t k, double& p, double& cross) noexcept
+    {
+        double ar = z.re[0][k], ai = z.im[0][k], br = z.dre[0][k], bi = z.dim[0][k];
+        if (two && d != DetL)
+        {
+            const double cr = z.re[1][k], ci = z.im[1][k], er = z.dre[1][k], ei = z.dim[1][k];
+            if (d == DetR || (d == DetLink && cr * cr + ci * ci > ar * ar + ai * ai))
+            {
+                ar = cr;  ai = ci;  br = er;  bi = ei;
+            }
+            else if (d == DetM || d == DetS)
+            {
+                const double sg = d == DetM ? 1.0 : -1.0;
+                ar = 0.5 * (ar + sg * cr);  ai = 0.5 * (ai + sg * ci);
+                br = 0.5 * (br + sg * er);  bi = 0.5 * (bi + sg * ei);
+            }
+        }
+        p = ar * ar + ai * ai;
+        cross = bi * ar - br * ai;
+    }
+
+    // 한 해상도: 마지막 N 샘플 FFT (창 · 창 미분) -> 둘레 점마다 칸 합 레벨(기준용) · 재배치 레벨(게인 판단용) -> 맡은 점의 레벨 · 기준
+    void refreshResolution (ZRes& z, bool two, const std::array<bool, kNumDetect>& needDet) noexcept
+    {
+        const int N = z.N, bins = N / 2 + 1;
+        const int hn = z.hHi - z.hLo + 1;
+        const double binHz = fs / (double) N, toBins = (double) N / (2.0 * kPi);
+        const int kA = std::max (1, z.b0[0] - 2), kB = std::min (bins - 2, z.b1[(size_t) (hn - 1)] + 2);
+        const std::uint64_t start = t - (std::uint64_t) N;
+        // FFT 한 번 (창 없이) -> 주파수 쪽에서 Hann = 0.5 X(k) - 0.25 (X(k-1) + X(k+1)),
+        //   창 미분 (pi/N) sin(2 pi n/N) = (pi/N) (X(k-1) - X(k+1)) / 2i  (시간 쪽 창 둘과 정확히 같음)
+        const double dScale = 0.5 * kPi / (double) N;
+        for (int c = 0; c < (two ? 2 : 1); ++c)
+        {
+            const auto& ring = inRing[(size_t) c];
+            for (int i = 0; i < N; ++i)
+                frameBuf[(size_t) i] = ring[(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)];
+            auto& fr = rawRe[(size_t) c];
+            auto& fi = rawIm[(size_t) c];
+            z.fft.forward (frameBuf.data(), fr.data(), fi.data());
+            auto& re = z.re[(size_t) c];
+            auto& im = z.im[(size_t) c];
+            auto& dre = z.dre[(size_t) c];
+            auto& dim = z.dim[(size_t) c];
+            for (int k = kA; k <= kB; ++k)
+            {
+                const size_t u = (size_t) k;
+                const double pr = fr[u - 1], pim = fi[u - 1], nr = fr[u + 1], nim = fi[u + 1];
+                re[u]  = 0.5 * fr[u] - 0.25 * (pr + nr);
+                im[u]  = 0.5 * fi[u] - 0.25 * (pim + nim);
+                dre[u] = dScale * (pim - nim);
+                dim[u] = -dScale * (pr - nr);
+            }
+        }
+        for (int d = 0; d < kNumDetect; ++d)
+        {
+            if (! needDet[(size_t) d]) continue;
+
+            // 재배치: 칸마다 에너지를 그 실제 주파수의 격자 위치로 (두 점에 나눠서)
+            std::fill (z.acc.begin(), z.acc.end(), 0.0);
+            for (int k = kA; k <= kB; ++k)
+            {
+                double pk = 0.0, cross = 0.0;
+                binPowerCross (d, two, z, (size_t) k, pk, cross);
+                rawP[(size_t) k] = pk;
+                if (! (pk > 1.0e-30)) continue;                       // (NaN · Inf 입력도 여기서 걸러짐: 비교를 이렇게 씀)
+                const double kh = std::clamp ((double) k - toBins * cross / pk, (double) k - 2.0, (double) k + 2.0);
+                if (! (kh > 0.0)) continue;
+                const double u = 12.0 * std::log2 (kh * binHz / 20.0) - (double) z.hLo;
+                if (! (u >= 0.0 && u <= (double) (hn - 1))) continue;
+                const int i0 = std::min ((int) u, hn - 1);
+                const double fr = u - (double) i0;
+                z.acc[(size_t) i0] += pk * (1.0 - fr);
+                if (i0 + 1 < hn) z.acc[(size_t) i0 + 1] += pk * fr;
+            }
+
+            auto& lv = z.lvl[(size_t) d];
+            auto& lb = z.lvlB[(size_t) d];
+            for (int h = 0; h < hn; ++h)
+            {
+                double sum = 0.0;
+                for (int k = z.b0[(size_t) h]; k <= z.b1[(size_t) h]; ++k)
+                    sum += rawP[(size_t) k];
+                lb[(size_t) h] += z.aLevel * (z.calE * sum - lb[(size_t) h]);
+                // 게인 판단 레벨 = 그 점 ±1 격자(±1/12옥타브 = 뱅크 필터 폭)에 모인 에너지: 두 점 사이의 사인도 진폭^2 그대로
+                const double e3 = z.acc[(size_t) h] + (h > 0 ? z.acc[(size_t) (h - 1)] : 0.0) + (h + 1 < hn ? z.acc[(size_t) (h + 1)] : 0.0);
+                lv[(size_t) h] += z.aLevel * (z.calE * e3 - lv[(size_t) h]);
+                hdb[(size_t) h] = safeDb (lb[(size_t) h]);
+            }
+            for (int j = z.jLo; j <= z.jHi; ++j)
+                gDb[(size_t) d][(size_t) j] = 10.0 * std::log10 (lv[(size_t) (j - z.hLo)] + 1.0e-30);
+            updateReference (d, hdb.data(), z.hLo, z.hHi, z.jLo, z.jHi, z.hw, z.aFall, z.refValid[(size_t) d]);
+        }
+    }
+
+    void publishDisplayGrid (const std::array<bool, kNumDomains>& touched) noexcept
+    {
+        for (int dom = 0; dom < kNumDomains; ++dom)
+        {
+            const auto& f = gField[(size_t) dom];
+            for (int p = 0; p < kDisplayPoints; ++p)
+            {
+                float v = 0.0f;
+                if (touched[(size_t) dom] && ng > 1)
+                {
+                    const size_t j = (size_t) dispJ[(size_t) p];
+                    v = (float) (f[j] + dispFr[(size_t) p] * (f[j + 1] - f[j]));
+                }
+                display[(size_t) dom][(size_t) p].store (v, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    //  HQ (선형 위상): 홉(N/4)마다 분석 -> 칸마다 게인 -> 합성
+    //--------------------------------------------------------------------------
+    void linFrame (bool two) noexcept
+    {
+        const int N = nLin, bins = N / 2 + 1;
+        const std::uint64_t start = t - (std::uint64_t) N;
+        bool anyWantLin = false;                         // 밴드가 없으면 분석 FFT 하나만 (지나가기만)
+        for (auto& b : bands) anyWantLin = anyWantLin || b.want || b.live;
+        for (int c = 0; c < (two ? 2 : 1); ++c)
+        {
+            for (int i = 0; i < N; ++i)
+                frameBuf[(size_t) i] = inRing[(size_t) c][(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)] * winLin[(size_t) i];
+            fftLin.forward (frameBuf.data(), xr[(size_t) c].data(), xi[(size_t) c].data());
+            if (anyWantLin)
+            {
+                for (int i = 0; i < N; ++i)
+                    frameBuf[(size_t) i] = inRing[(size_t) c][(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)] * dwinLin[(size_t) i];
+                fftLin.forward (frameBuf.data(), dxr[(size_t) c].data(), dxi[(size_t) c].data());
+            }
+        }
+
+        // 필요한 감지 도메인과 범위 (밴드 영역 + 기준 둘레, 격자로)
+        std::array<bool, kNumDetect> needDet {};
+        std::array<int, kNumDetect> gLo {}, gHi {};
+        gLo.fill (ng);  gHi.fill (-1);
+        for (auto& b : bands)
+            if (b.want || b.live)
+            {
+                const int d = detectDomain (b.place, two);
+                if (d < 0) continue;
+                updateWeightsLin (b);
+                updateWeightsGrid (b);
+                if (b.k1 < b.k0) continue;
+                needDet[(size_t) d] = true;
+                gLo[(size_t) d] = std::min (gLo[(size_t) d], std::max (0, std::min (b.g0, (int) gridPosLin[(size_t) b.k0]) - kRefHalfWidth));
+                gHi[(size_t) d] = std::max (gHi[(size_t) d], std::min (ng - 1, std::max (b.g1, (int) gridPosLin[(size_t) b.k1] + 1) + kRefHalfWidth));
+            }
+        for (int d = 0; d < kNumDetect; ++d)
+            if (needDet[(size_t) d] && gHi[(size_t) d] >= gLo[(size_t) d])
+                analyseLin (d, bins, two, gLo[(size_t) d], gHi[(size_t) d]);
+
+        for (auto& f : field) std::fill (f.begin(), f.begin() + bins, 0.0);
+        std::array<bool, kNumDomains> touched {};
+        anyLive = false;
+        fieldLo = bins;  fieldHi = -1;
+        for (auto& b : bands)
+        {
+            if (! (b.want || b.live)) continue;
+            const int det = detectDomain (b.place, two);
+            if (det < 0) { b.live = false; b.display.store (0.0f, std::memory_order_relaxed); continue; }
+            updateWeightsLin (b);
+            updateDecayLin (b);
+            updateTimesLin (b);
+            if (b.k1 < b.k0) { b.live = false; b.display.store (0.0f, std::memory_order_relaxed); continue; }
+            fieldLo = std::min (fieldLo, b.k0);
+            fieldHi = std::max (fieldHi, b.k1);
+
+            double maxAbs = 0.0;
+            const auto& lev = levelDb[(size_t) det];
+            const auto& ref = gRef[(size_t) det];
+            for (int k = b.k0; k <= b.k1; ++k)
+            {
+                double tgt = 0.0;
+                if (b.want)
+                {
+                    double th = b.thresh;
+                    if (b.autoTh)
+                    {
+                        // 격자 기준을 이 칸의 주파수로 (로그 주파수에서 직선 보간)
+                        const double u = gridPosLin[(size_t) k];
+                        const int j = std::min ((int) u, ng - 2);
+                        const double fr = u - (double) j;
+                        th = ref[(size_t) j] + fr * (ref[(size_t) j + 1] - ref[(size_t) j]) + kAutoMarginDb;
+                    }
+                    tgt = spectralGainDb (lev[(size_t) k] - th, b.range);
+                }
+                double& dl = b.delta[(size_t) k];
+                dl += (std::abs (tgt) > std::abs (dl) ? b.aAtt : b.aRel) * (tgt - dl);
+                maxAbs = std::max (maxAbs, std::abs (dl));
+            }
+            b.live = b.want || maxAbs > 1.0e-4;
+            if (! b.live)
+            {
+                std::fill (b.delta.begin(), b.delta.end(), 0.0);
+                b.display.store (0.0f, std::memory_order_relaxed);
+                continue;
+            }
+            anyLive = true;
+
+            // DENSITY: 둘레로 퍼뜨리기 (크기 기준 팽창, 상수 Q 감쇠)
+            auto& e = tmpB;
+            for (int k = b.k0; k <= b.k1; ++k) e[(size_t) k] = std::abs (b.delta[(size_t) k]);
+            for (int k = b.k0 + 1; k <= b.k1; ++k)
+                e[(size_t) k] = std::max (e[(size_t) k], e[(size_t) (k - 1)] * b.decay[(size_t) (k - 1)]);
+            for (int k = b.k1 - 1; k >= b.k0; --k)
+                e[(size_t) k] = std::max (e[(size_t) k], e[(size_t) (k + 1)] * b.decay[(size_t) k]);
+
+            const double sign = b.range < 0.0 ? -1.0 : 1.0;
+            double shown = 0.0;
+            const auto& fh = fHatLin[(size_t) det];
+            for (int k = b.k0; k <= b.k1; ++k)
+            {
+                // 가중 = 그 칸 에너지의 실제 주파수(재배치)에서의 밴드 모양: 낮은 쪽 칸 사이의 사인도 제 주파수만큼
+                const double v = sign * e[(size_t) k] * weightAtLin (b, fh[(size_t) k]);
+                if (std::abs (v) > std::abs (shown)) shown = v;
+                forEachTarget (b.place, two, [&] (int dom) { field[(size_t) dom][(size_t) k] += v; touched[(size_t) dom] = true; });
+            }
+            b.display.store ((float) shown, std::memory_order_relaxed);
+        }
+
+        synthesise (bins, two, touched);
+        publishDisplayLin (touched);
+    }
+
+    // HQ 분석: 칸 레벨 (그 칸 + 양옆, 10 ms 평균) · 재배치 주파수 -> 격자 레벨 (±1/24옥타브 칸 평균) -> 기준 (격자 아래쪽 30 %)
+    void analyseLin (int d, int bins, bool two, int gLo, int gHi) noexcept
+    {
+        const int kLo = std::max (1, linB0[(size_t) gLo] - 1), kHi = std::min (bins - 1, linB1[(size_t) gHi] + 1);
+        const int pLo = std::max (0, kLo - 1), pHi = std::min (bins - 1, kHi + 1);
+        auto& fh = fHatLin[(size_t) d];
+        const double toBins = (double) nLin / (2.0 * kPi);
         for (int k = pLo; k <= pHi; ++k)
         {
-            const size_t z = (size_t) k;
-            const double pl = lr[z] * lr[z] + li[z] * li[z];
-            double v = pl;
-            if (two)
-            {
-                const double pr = rr[z] * rr[z] + ri[z] * ri[z];
-                if (d == DetLink)  v = std::max (pl, pr);
-                else if (d == DetR) v = pr;
-                else if (d == DetM || d == DetS)
-                {
-                    const double sg = d == DetM ? 1.0 : -1.0;
-                    const double a = 0.5 * (lr[z] + sg * rr[z]), b = 0.5 * (li[z] + sg * ri[z]);
-                    v = a * a + b * b;
-                }
-            }
-            rawP[z] = v;
+            double pk = 0.0, cross = 0.0;
+            binPowerCrossLin (d, two, (size_t) k, pk, cross);
+            rawP[(size_t) k] = pk;
+            const double kh = pk > 1.0e-30 ? std::clamp ((double) k - toBins * cross / pk, (double) k - 1.5, (double) k + 1.5) : (double) k;
+            fh[(size_t) k] = (kh > 0.0 ? kh : (kh >= 0.0 ? 0.0 : (double) k)) * binHzLin;   // NaN -> 칸 가운데
         }
-        for (int k = lo0; k <= hi0; ++k)          // 그 칸 + 양옆 칸 (칸 사이의 사인도 같은 레벨)
+        auto& pw = levelPw[(size_t) d];
+        auto& lev = levelDb[(size_t) d];
+        for (int k = kLo; k <= kHi; ++k)
         {
             const double sum = rawP[(size_t) k] + (k - 1 >= pLo ? rawP[(size_t) (k - 1)] : 0.0)
                              + (k + 1 <= pHi ? rawP[(size_t) (k + 1)] : 0.0);
-            P[(size_t) k] = sum * sumNorm;
+            pw[(size_t) k] += aLevelLin * (sum * sumNormLin - pw[(size_t) k]);
+            lev[(size_t) k] = 10.0 * std::log10 (calLin * pw[(size_t) k] + 1.0e-30);
         }
-        // 칸 레벨: 20 ms 평균(파워) -> 사인 기준 dB
-        auto& pw = levelPw[(size_t) d];
-        auto& lev = levelDb[(size_t) d];
-        for (int k = lo0; k <= hi0; ++k)
+        // 격자 레벨 = 그 점 ±1/24옥타브 칸들의 평균 파워 (dB)
+        for (int j = gLo; j <= gHi; ++j)
         {
-            pw[(size_t) k] += aLevel * (P[(size_t) k] - pw[(size_t) k]);
-            lev[(size_t) k] = 10.0 * std::log10 (cal * pw[(size_t) k] + 1.0e-30);
+            double s = 0.0;
+            const int a = linB0[(size_t) j], e = linB1[(size_t) j];
+            for (int k = a; k <= e; ++k) s += pw[(size_t) k];
+            hdb[(size_t) (j - gLo)] = safeDb (calLin * s / (double) (e - a + 1));
         }
-        // 자동 문턱 기준: 주변 1/2옥타브(+-1/4)의 로그 평균, 400 ms 평균 (누적 합으로 칸마다 O(1))
-        auto& cs = tmpA;
-        cs[(size_t) lo0] = 0.0;
-        for (int k = lo0; k <= hi0; ++k) cs[(size_t) k + 1] = cs[(size_t) k] + lev[(size_t) k];
-        auto& ref = refDb[(size_t) d];
-        const bool init = ! refValid[(size_t) d];
-        for (int k = std::max (1, kLo); k <= std::min (bins - 1, kHi); ++k)
-        {
-            const int lo = std::max (lo0, (int) std::floor ((double) k * 0.8409));
-            const int hi = std::min (hi0, (int) std::ceil ((double) k * 1.1892));
-            const double avg = (cs[(size_t) hi + 1] - cs[(size_t) lo]) / (double) (hi - lo + 1);
-            ref[(size_t) k] = init ? avg : ref[(size_t) k] + aRef * (avg - ref[(size_t) k]);
-        }
-        refValid[(size_t) d] = true;
+        updateReference (d, hdb.data(), gLo, gHi, gLo, gHi, kRefHalfWidth, aFallLin, linRefValid[(size_t) d]);
     }
 
-    void clearFields() noexcept
+    // HQ 한 칸: 감지 도메인의 파워와 Im(X_dw conj X_w) (sqrt-Hann과 그 미분)
+    void binPowerCrossLin (int d, bool two, size_t k, double& p, double& cross) const noexcept
     {
-        const int bins = curN / 2 + 1;
-        for (auto& f : field) std::fill (f.begin(), f.begin() + bins, 0.0);
+        double ar = xr[0][k], ai = xi[0][k], br = dxr[0][k], bi = dxi[0][k];
+        if (two && d != DetL)
+        {
+            const double cr = xr[1][k], ci = xi[1][k], er = dxr[1][k], ei = dxi[1][k];
+            if (d == DetR || (d == DetLink && cr * cr + ci * ci > ar * ar + ai * ai))
+            {
+                ar = cr;  ai = ci;  br = er;  bi = ei;
+            }
+            else if (d == DetM || d == DetS)
+            {
+                const double sg = d == DetM ? 1.0 : -1.0;
+                ar = 0.5 * (ar + sg * cr);  ai = 0.5 * (ai + sg * ci);
+                br = 0.5 * (br + sg * er);  bi = 0.5 * (bi + sg * ei);
+            }
+        }
+        p = ar * ar + ai * ai;
+        cross = bi * ar - br * ai;
+    }
+
+    // 밴드 모양 가중을 주파수 f에서: 1.6 kHz 아래는 1/48옥타브 표, 위는 칸 값 사이 보간
+    double weightAtLin (const Band& b, double f) const noexcept
+    {
+        if (! (f >= 0.0 && f < 1.0e9)) return 0.0;               // (일어나지 않음) NaN · Inf
+        if (f < kFineTop)
+        {
+            const double u = kFinePerOct * std::log2 (std::max (f, kFineBase) / kFineBase);
+            const int i = std::min ((int) u, kFineN - 2);
+            const double fr = u - (double) i;
+            return b.fw[(size_t) i] + fr * (b.fw[(size_t) i + 1] - b.fw[(size_t) i]);
+        }
+        const int bins = nLin / 2 + 1;
+        const double kk = f / binHzLin;
+        const int i = std::clamp ((int) kk, 0, bins - 2);
+        const double fr = std::clamp (kk - (double) i, 0.0, 1.0);
+        return b.w[(size_t) i] + fr * (b.w[(size_t) i + 1] - b.w[(size_t) i]);
     }
 
     // 선형 위상: X * 10^(G/20), M/S 지도는 M/S로 바꿔 곱하고 되돌림 -> 역FFT -> sqrt-Hann -> 겹쳐 더하기
@@ -2976,113 +3694,57 @@ private:
                 xr[1][z] = mr - sr;  xi[1][z] = mi - si;
             }
         }
-        const std::uint64_t start = t - (std::uint64_t) curN;
+        const std::uint64_t start = t - (std::uint64_t) nLin;
         for (int c = 0; c < (two ? 2 : 1); ++c)
         {
             fftLin.inverse (xr[(size_t) c].data(), xi[(size_t) c].data(), frameBuf.data());
             auto& acc = outAcc[(size_t) c];
-            for (int i = 0; i < curN; ++i)
+            for (int i = 0; i < nLin; ++i)
                 acc[(size_t) ((start + (std::uint64_t) i) & (std::uint64_t) ringMask)] += 0.5 * frameBuf[(size_t) i] * winLin[(size_t) i];
         }
     }
 
-    // 필터 뱅크: 격자점마다 원하는 dB (그 둘레 칸 중 변화가 가장 큰 값) -> 이웃 겹침을 빼는 반복 -> 다음 홉 동안 직선 이동
-    void planBank (const std::array<bool, kNumDomains>& touched) noexcept
+    void publishDisplayLin (const std::array<bool, kNumDomains>& touched) noexcept
     {
-        const int bins = curN / 2 + 1;
-        const size_t ng = bankHz.size();
-        const double steps = (double) std::max (1, hop / bankStride);
-        anyBank = false;
         for (int dom = 0; dom < kNumDomains; ++dom)
         {
-            auto& d = bank[(size_t) dom];
             const auto& f = field[(size_t) dom];
-            if (! touched[(size_t) dom])
-                std::fill (d.want.begin(), d.want.end(), 0.0);
-            else
-                for (size_t j = 0; j < ng; ++j)
-                {
-                    const double kc = bankHz[j] / binHz;
-                    const int lo = std::max (1, (int) std::floor (kc * 0.9715)), hi = std::min (bins - 1, (int) std::ceil (kc * 1.0293));
-                    double v = 0.0;
-                    if (hi < lo || hi - lo < 1)
-                    {
-                        const int k = std::clamp ((int) kc, 1, bins - 2);
-                        const double u = std::clamp (kc - (double) k, 0.0, 1.0);
-                        v = f[(size_t) k] + u * (f[(size_t) k + 1] - f[(size_t) k]);
-                    }
-                    else
-                        for (int k = lo; k <= hi; ++k)
-                            if (std::abs (f[(size_t) k]) > std::abs (v)) v = f[(size_t) k];
-                    d.want[j] = v;
-                }
-
-            // 반복 (이전 목표에서 시작): g += (want - S g) / (그 줄의 합)
-            //  넓게 퍼진 목표(모든 필터가 같이 내려감)도 한 번에 맞고, 좁은 목표도 출렁이지 않고 다가감
-            for (int it = 0; it < 4; ++it)
-            {
-                for (size_t j = 0; j < ng; ++j)
-                {
-                    double sg = 0.0;
-                    const double* inf = influence.data() + j * (size_t) (2 * kNeighbours + 1);
-                    for (int m = -kNeighbours; m <= kNeighbours; ++m)
-                    {
-                        const long jj = (long) j + m;
-                        if (jj < 0 || jj >= (long) ng) continue;
-                        sg += inf[m + kNeighbours] * d.tgt[(size_t) jj];
-                    }
-                    tmpB[j] = d.tgt[j] + (d.want[j] - sg) * influenceNorm[j];
-                }
-                for (size_t j = 0; j < ng; ++j)
-                    d.tgt[j] = std::clamp (tmpB[j], -30.0, 30.0);
-            }
-
-            bool any = false;
-            for (size_t j = 0; j < ng; ++j)
-            {
-                if (std::abs (d.tgt[j]) < 1.0e-4) d.tgt[j] = 0.0;
-                // 아주 작은 변화는 0으로: 잡음 때문에 필터들이 계속 켜져 있지 않게
-                double g = std::abs (d.tgt[j]) < kBankDeadDb && std::abs (d.want[j]) < kBankDeadDb ? 0.0 : d.tgt[j];
-                if (! sameValue (g, 0.0) && std::abs (g - d.cur[j]) < 0.003)
-                    g = d.cur[j];                                    // 계수를 다시 만들 만큼 바뀌지 않음
-                d.goal[j] = g;
-                d.step[j] = sameValue (g, d.cur[j]) ? 0.0 : (g - d.cur[j]) / steps;
-                any = any || ! sameValue (d.step[j], 0.0) || ! sameValue (d.cur[j], 0.0);
-            }
-            d.any = any;
-            anyBank = anyBank || any;
-        }
-    }
-
-    void publishDisplay (const std::array<bool, kNumDomains>& touched) noexcept
-    {
-        const int bins = curN / 2 + 1;
-        for (int dom = 0; dom < kNumDomains; ++dom)
             for (int p = 0; p < kDisplayPoints; ++p)
             {
                 float v = 0.0f;
                 if (touched[(size_t) dom])
                 {
-                    const double kc = displayHz (p) / binHz;
-                    const int k = std::clamp ((int) kc, 0, bins - 2);
-                    const double u = std::clamp (kc - (double) k, 0.0, 1.0);
-                    v = (float) (field[(size_t) dom][(size_t) k] + u * (field[(size_t) dom][(size_t) k + 1] - field[(size_t) dom][(size_t) k]));
+                    const size_t k = (size_t) dispK[(size_t) p];
+                    v = (float) (f[k] + dispU[(size_t) p] * (f[k + 1] - f[k]));
                 }
                 display[(size_t) dom][(size_t) p].store (v, std::memory_order_relaxed);
             }
+        }
     }
 
-    double fs = 48000.0, binHz = 46.875, cal = 1.0, sumNorm = 1.0 / 1.5, aLevel = 0.5, aRef = 0.05;
-    int nch = 2, subBlock = 16, bankStride = 64, nBank = 1024, nLin = 2048, curN = 1024, hop = 256, ringMask = 4095;
+    double fs = 48000.0, binHzLin = 23.4375, calLin = 1.0, sumNormLin = 1.0 / 1.5, aLevelLin = 0.5, aFallLin = 0.1;
+    int nch = 2, subBlock = 16, bankStride = 16, ctrl = 32, nLin = 2048, hopLin = 512, ringMask = 4095, ng = 0;
     bool linear = false, anyLive = false, anyBank = false;
-    int fieldLo = 0, fieldHi = -1;                       // 게인 지도가 0이 아닐 수 있는 칸 범위
+    int fieldLo = 0, fieldHi = -1;                       // HQ: 게인 지도가 0이 아닐 수 있는 칸 범위
     std::uint64_t t = 0;
-    RealFft fftBank, fftLin;
+    RealFft fftLin;
     std::array<std::vector<double>, 2> inRing, outAcc, xr, xi;
-    std::vector<double> frameBuf, rawP, tmpA, tmpB, winBank, winLin;
-    std::array<std::vector<double>, kNumDetect> power, levelDb, levelPw, refDb;
-    std::array<bool, kNumDetect> refValid {};
+    std::vector<double> frameBuf, rawP, tmpB, winLin, dwinLin, gridPosLin;
+    std::array<std::vector<double>, 2> dxr, dxi;           // HQ: 창 미분 스펙트럼
+    std::array<std::vector<double>, kNumDetect> fHatLin;   // HQ: 칸마다 재배치 주파수 (Hz)
+    std::vector<int> linB0, linB1;                       // HQ: 격자점마다 평균할 칸 범위
+    std::array<std::vector<double>, kNumDetect> levelDb, levelPw;
+    std::array<bool, kNumDetect> linRefValid {};
     std::array<std::vector<double>, kNumDomains> field;
+    std::vector<ZRes> zres;
+    std::vector<int> gRes;                               // 격자점마다 ZL 해상도
+    std::array<std::vector<double>, kNumDetect> gDb, gRef;
+    std::array<std::vector<double>, kNumDomains> gField;
+    std::vector<double> gTmp, hdb, refWin, tpad;
+    std::array<std::vector<double>, 2> rawRe, rawIm;      // ZL: 창 없는 FFT (해상도마다 다시 씀)
+    std::array<std::vector<double>, 4> blk;               // ZL 뱅크: 한 구간의 L, R, M, S
+    std::array<int, kDisplayPoints> dispJ {}, dispK {};
+    std::array<double, kDisplayPoints> dispFr {}, dispU {};
     std::array<Band, kMaxBands> bands;
     std::vector<double> bankHz, bankG, bankK, influence, influenceNorm;   // influence: 격자점마다 이웃 필터(-K..K)의 영향
     std::array<BankDomain, kNumDomains> bank;

@@ -1450,6 +1450,46 @@ static void testRobustness()
         for (float v : y) finite = finite && std::isfinite (v);
         CHECK (finite, "tube must recover after reset");
     }
+
+    // 5) NaN · Inf 입력 (다이내믹 · 스펙트럴 ZL · HQ): 그 블록에서 망가지지 않고 (배열 밖 접근 없음), reset 뒤에는 처음과 같음
+    {
+        bool sameAfter = true, finiteAfter = true;
+        for (int lin = 0; lin < 2; ++lin)
+        {
+            Params p; p.xfAll = false;
+            p.bands[0] = makeBand (BandType::Bell, 2500.0, 0.0, 0.7);
+            p.bands[0].dyn = true; p.bands[0].spectral = true; p.bands[0].dynRange = -12.0f;
+            p.bands[1] = makeBand (BandType::LowShelf, 150.0, 0.0, 1.0);
+            p.bands[1].dyn = true; p.bands[1].spectral = true; p.bands[1].dynRange = -6.0f;
+            p.bands[2] = makeBand (BandType::Bell, 800.0, 0.0, 1.0);
+            p.bands[2].dyn = true; p.bands[2].dynRange = -6.0f;
+            auto runIt = [&] (Engine& e, std::vector<float>& L, std::vector<float>& R)
+            {
+                for (size_t s0 = 0; s0 < L.size(); s0 += 256)
+                {
+                    float* ch[2] = { L.data() + s0, R.data() + s0 };
+                    e.process (ch, 2, (int) std::min<size_t> (256, L.size() - s0));
+                }
+            };
+            Engine e;  e.prepare (fs, 2, 256);  e.setSpectralLinearPhase (lin == 1);  e.setParams (p);  e.reset();
+            auto L = sine (fs, 2500.0, 0.3, 24000), R = L;
+            L[5000] = std::numeric_limits<float>::quiet_NaN();
+            R[9000] = std::numeric_limits<float>::infinity();
+            L[13000] = -std::numeric_limits<float>::infinity();
+            runIt (e, L, R);
+            e.reset();
+            auto L2 = sine (fs, 2500.0, 0.3, 24000), R2 = L2;
+            runIt (e, L2, R2);
+            Engine f;  f.prepare (fs, 2, 256);  f.setSpectralLinearPhase (lin == 1);  f.setParams (p);  f.reset();
+            auto L3 = sine (fs, 2500.0, 0.3, 24000), R3 = L3;
+            runIt (f, L3, R3);
+            for (size_t i = 0; i < L2.size(); ++i)
+                finiteAfter = finiteAfter && std::isfinite (L2[i]) && std::isfinite (R2[i]);
+            sameAfter = sameAfter && L2 == L3 && R2 == R3;
+        }
+        std::printf ("    NaN · Inf 입력 (다이내믹 · 스펙트럴 ZL · HQ): reset 뒤 유한 %d, 처음과 같음 %d\n", (int) finiteAfter, (int) sameAfter);
+        CHECK (finiteAfter && sameAfter, "dynamic / spectral must survive NaN / Inf input and recover after reset");
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -2229,7 +2269,8 @@ static void testDynamicAccuracy()
         for (int lin = 0; lin < 2; ++lin)
         {
             const double fs = 48000.0;
-            const double binHz = fs / (lin ? 2048.0 : 1024.0);
+            SpectralStage probe;  probe.prepare (fs, 1);
+            const double binHz = fs / (double) (lin ? SpectralStage::linearLatencyFor (fs) : probe.zeroLatencyWindow (1000.0));
             for (double off : { 0.0, 0.5 })
             {
                 const double f = (std::round (1000.0 / binHz) + off) * binHz;
@@ -2266,6 +2307,281 @@ static void testDynamicAccuracy()
     }
 }
 
+//------------------------------------------------------------------------------
+// v0.8.2: ZERO LATENCY 반응 시간 (옥타브마다 창), 저역 정확도 (ZL · HQ), 쉼 뒤 시작 (자동 문턱), 어택 · 릴리스 = 설정, 잡음
+static void testLimitsV082()
+{
+    std::printf ("[22] v0.8.2 한계 개선 (ZL 반응 · 저역 정확도 · 쉼 뒤 시작 · 어택 시간 · 잡음)\n");
+    const double fs = 48000.0;
+    auto toneAmp = [&fs] (const std::vector<float>& y, double f, size_t start, size_t len)
+    {
+        std::complex<double> acc (0.0, 0.0);
+        double ws = 0.0;
+        for (size_t i = 0; i < len; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos (2.0 * kPi * (double) i / (double) len);
+            const double ph = 2.0 * kPi * f * (double) (start + i) / fs;
+            acc += w * (double) y[start + i] * std::complex<double> (std::cos (ph), -std::sin (ph));
+            ws += w;
+        }
+        return 2.0 * std::abs (acc) / ws;
+    };
+    auto runMono = [] (Engine& e, std::vector<float>& x, size_t block)
+    {
+        for (size_t s0 = 0; s0 < x.size(); s0 += block)
+        {
+            float* c[1] = { x.data() + s0 };
+            e.process (c, 1, (int) std::min (block, x.size() - s0));
+        }
+    };
+    auto specTheory = [] (double over)
+    {
+        const double knee = SpectralStage::kSpecKneeDb;
+        if (over <= 0.0) return 0.0;
+        const double o = over < knee ? over * over / (2.0 * knee) : over - 0.5 * knee;
+        return -12.0 * std::tanh (o / 12.0);
+    };
+    auto specBand = [] (double f, double q, bool autoTh)
+    {
+        BandParams b = makeBand (BandType::Bell, f, 0.0, q);
+        b.dyn = true; b.spectral = true; b.dynRange = -12.0f; b.autoTh = autoTh; b.thresh = -40.0f;
+        return b;
+    };
+
+    // 1) ZERO LATENCY 반응: -60 -> -10 dBFS 계단, 문턱 -40, RANGE -12. 출력 쪽 3주기 창으로 63 % / 90 % 도달
+    {
+        double t63s[3] = {}, t90s[3] = {};
+        bool ok = true;
+        int idx = 0;
+        struct R { double f, lim63; };
+        for (const R r : { R { 150.0, 0.030 }, R { 1000.0, 0.013 }, R { 5000.0, 0.008 } })
+        {
+            Params p; p.xfAll = false; p.bands[0] = specBand (r.f, 1.0, false);
+            Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+            const size_t n = (size_t) (fs * 1.5), step = (size_t) fs;
+            std::vector<float> x (n);
+            for (size_t i = 0; i < n; ++i) x[i] = (float) ((i < step ? 0.001 : 0.316) * std::sin (2.0 * kPi * r.f * (double) i / fs));
+            auto y = x;
+            runMono (e, y, 64);
+            const size_t win = (size_t) std::max (96.0, 3.0 * fs / r.f);
+            const double fin = 20.0 * std::log10 (toneAmp (y, r.f, n - 4 * win, 4 * win) / toneAmp (x, r.f, n - 4 * win, 4 * win));
+            double t63 = 1.0, t90 = 1.0;
+            for (size_t at = step; at + win < n; at += 12)
+            {
+                const double g = 20.0 * std::log10 (toneAmp (y, r.f, at, win) / toneAmp (x, r.f, at, win));
+                if (t63 > 0.5 && g <= 0.632 * fin) t63 = (double) (at - step) / fs;
+                if (g <= 0.9 * fin) { t90 = (double) (at - step) / fs; break; }
+            }
+            t63s[idx] = t63;  t90s[idx] = t90;  ++idx;
+            ok = ok && t63 < r.lim63 && std::abs (fin - specTheory (30.0)) < 0.5;
+        }
+        std::printf ("    ZL 반응 63 %% / 90 %%: 150 Hz %.1f / %.1f ms, 1 kHz %.1f / %.1f ms, 5 kHz %.1f / %.1f ms\n"
+                     "      (v0.8.1: 150 Hz 10.8 / 24.2 ms (끝 게인 0.6 dB 틀림), 1 kHz 19.2 / 32.8 ms, 5 kHz 20.0 / 33.5 ms)\n",
+                     t63s[0] * 1000.0, t90s[0] * 1000.0, t63s[1] * 1000.0, t90s[1] * 1000.0, t63s[2] * 1000.0, t90s[2] * 1000.0);
+        CHECK (ok, "zero-latency spectral reaction %.1f / %.1f / %.1f ms", t63s[0] * 1000.0, t63s[1] * 1000.0, t63s[2] * 1000.0);
+    }
+
+    // 2) 저역 정확도: 50 / 80 / 150 Hz 벨 스펙트럴, 사인이 칸 가운데 · 칸 사이, 레벨 -34 / -20 / -10 dBFS (문턱 -40)
+    {
+        double worst[2] = { 0.0, 0.0 };
+        SpectralStage probe;  probe.prepare (fs, 1);
+        for (int lin = 0; lin < 2; ++lin)
+            for (double fc : { 50.0, 80.0, 150.0 })
+            {
+                const double binHz = fs / (double) (lin ? SpectralStage::linearLatencyFor (fs) : probe.zeroLatencyWindow (fc));
+                for (double off : { 0.0, 0.5 })
+                {
+                    const double f = (std::round (fc / binHz) + off) * binHz;
+                    for (double lvl : { -34.0, -20.0, -10.0 })
+                    {
+                        Params p; p.xfAll = false; p.bands[0] = specBand (f, 1.0, false);
+                        Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (lin == 1); e.setParams (p); e.reset();
+                        const size_t n = (size_t) (fs * 1.5);
+                        auto x = sine (fs, f, std::pow (10.0, lvl / 20.0), (int) n);
+                        auto y = x;
+                        runMono (e, y, 512);
+                        const size_t len = (size_t) (0.25 * fs), lat = (size_t) e.getLatencySamples();
+                        const double got = 20.0 * std::log10 (toneAmp (y, f, n - len, len) / toneAmp (x, f, n - len - lat, len));
+                        worst[lin] = std::max (worst[lin], std::abs (got - specTheory (lvl + 40.0)));
+                    }
+                }
+            }
+        std::printf ("    저역 (50 / 80 / 150 Hz, 칸 가운데 · 사이, 문턱 근처 ~ 깊게): 계산과 최대 ZL %.2f dB, HQ %.2f dB (v0.8.1: ZL 2.3 dB, HQ 1.8 dB)\n",
+                     worst[0], worst[1]);
+        CHECK (worst[0] < 0.35 && worst[1] < 0.35, "low-frequency spectral accuracy ZL %.2f HQ %.2f dB", worst[0], worst[1]);
+    }
+
+    // 3) 쉼 뒤 시작 (자동 문턱): 1.2 s 소리(분홍 잡음) / 1 s 쉼(잡음 -70 dBFS) x 4.
+    //    첫 소절 · 마지막 소절의 처음 300 ms가 눌리지 않음 (v0.8.1: -5 ~ -6 dB)
+    {
+        double worst = 0.0;
+        double show[3] = {};
+        for (int mode = 0; mode < 3; ++mode)          // 0 = 스펙트럴 ZL, 1 = 스펙트럴 HQ, 2 = 보통 다이내믹
+        {
+            Params p; p.xfAll = false;
+            p.bands[0] = makeBand (BandType::Bell, 2000.0, 0.0, 1.0);
+            p.bands[0].dyn = true; p.bands[0].spectral = mode < 2; p.bands[0].dynRange = -12.0f; p.bands[0].autoTh = true;
+            Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (mode == 1); e.setParams (p); e.reset();
+            std::mt19937 rng (5);
+            std::normal_distribution<float> nd (0.0f, 1.0f);
+            std::vector<float> x;
+            float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+            std::vector<size_t> starts;
+            for (int rep = 0; rep < 4; ++rep)
+            {
+                for (size_t i = 0; i < (size_t) fs; ++i) x.push_back (0.0003f * nd (rng));
+                starts.push_back (x.size());
+                for (size_t i = 0; i < (size_t) (1.2 * fs); ++i)
+                {
+                    const float w = 0.1f * nd (rng);
+                    b0 = 0.99765f * b0 + w * 0.0990460f;  b1 = 0.96300f * b1 + w * 0.2965164f;  b2 = 0.57000f * b2 + w * 1.0526913f;
+                    x.push_back (b0 + b1 + b2 + w * 0.1848f);
+                }
+            }
+            auto y = x;
+            runMono (e, y, 256);
+            const size_t lat = (size_t) e.getLatencySamples();
+            const auto region = makeRegion (BandType::Bell, 2000.0, 1.0, fs);
+            for (size_t a : { starts.front(), starts.back() })
+            {
+                SvfState sx, sy;
+                double ex = 0.0, ey = 0.0;
+                for (size_t i = a - 2000; i < a + (size_t) (0.3 * fs); ++i)
+                {
+                    const double rx = svfTick (region, sx, x[i]), ry = svfTick (region, sy, y[i + lat]);
+                    if (i >= a) { ex += rx * rx; ey += ry * ry; }
+                }
+                const double d = 10.0 * std::log10 (ey / ex);
+                worst = std::min (worst, d);
+                show[mode] = std::min (show[mode], d);
+            }
+        }
+        std::printf ("    쉼 뒤 소절 시작 (처음 300 ms, 첫 · 마지막 소절): 스펙트럴 ZL %+.2f, HQ %+.2f, 보통 %+.2f dB (v0.8.1: -5 ~ -6 dB)\n",
+                     show[0], show[1], show[2]);
+        CHECK (worst > -1.0, "auto threshold presses phrase starts after pauses (%.2f dB)", worst);
+    }
+
+    // 4) 보통 다이내믹 어택 · 릴리스 = 설정 (감지가 늦는 만큼 줄임): 벨 Q 1, -50 <-> -10 dBFS 계단 (문턱 -30, RANGE -12)
+    {
+        double worstAuto = 0.0, fastest100 = 0.0;
+        for (double f : { 100.0, 1000.0 })
+            for (double knob : { 0.0, 0.5 })
+            {
+                Params p; p.xfAll = false;
+                p.bands[0] = makeBand (BandType::Bell, f, 0.0, 1.0);
+                p.bands[0].dyn = true; p.bands[0].dynRange = -12.0f; p.bands[0].autoTh = false; p.bands[0].thresh = -30.0f;
+                p.bands[0].attack = (float) knob; p.bands[0].release = (float) knob;
+                Engine e; e.prepare (fs, 1, 512); e.setParams (p); e.reset();
+                const double tAtt = dynAttackSeconds (f, knob), tRel = dynReleaseSeconds (f, knob);
+                const size_t seg = (size_t) (fs * std::max (0.4, 8.0 * tRel));
+                std::vector<float> x (3 * seg);
+                for (size_t i = 0; i < x.size(); ++i)
+                    x[i] = (float) ((i >= seg && i < 2 * seg ? 0.316 : 0.00316) * std::sin (2.0 * kPi * f * (double) i / fs));
+                std::vector<double> g;
+                for (size_t i = 0; i < x.size(); i += 4)
+                {
+                    float* c[1] = { x.data() + i };
+                    e.process (c, 1, 4);
+                    g.push_back (e.getBand (0).currentDynamicGainDb());
+                }
+                const double fin = g[(2 * seg) / 4 - 1];
+                double ta = 1.0, tr = 1.0;
+                for (size_t k = seg / 4; k < g.size(); ++k) if (g[k] <= 0.632 * fin) { ta = (double) ((k + 1) * 4 - seg) / fs; break; }
+                for (size_t k = (2 * seg) / 4; k < g.size(); ++k) if (g[k] >= 0.368 * fin) { tr = (double) ((k + 1) * 4 - 2 * seg) / fs; break; }
+                if (knob > 0.25)
+                    worstAuto = std::max ({ worstAuto, std::abs (ta / tAtt - 1.0), std::abs (tr / tRel - 1.0) });
+                else if (f < 500.0)
+                    fastest100 = ta;
+            }
+        std::printf ("    어택 · 릴리스 (자동): 실제 63 %% 시간 / 설정 차이 최대 %.0f %% (v0.8.1: 어택 31 ~ 36 %%, 릴리스 10 %%), 100 Hz 가장 빠른 어택 %.1f ms (v0.8.1: 9.8 ms)\n",
+                     worstAuto * 100.0, fastest100 * 1000.0);
+        CHECK (worstAuto < 0.12 && fastest100 < 0.007, "attack / release timing (auto off by %.0f %%, fastest 100 Hz %.1f ms)", worstAuto * 100.0, fastest100 * 1000.0);
+    }
+
+    // 5) 잡음만 (자동 문턱): 300 Hz / 1 kHz / 5 kHz 벨 스펙트럴에 분홍 잡음 -> 밴드 안 에너지가 거의 그대로 (ZL · HQ)
+    {
+        double worst = 0.0;
+        for (int lin = 0; lin < 2; ++lin)
+            for (double f0 : { 300.0, 1000.0, 5000.0 })
+            {
+                Params p; p.xfAll = false; p.bands[0] = specBand (f0, 1.0, true);
+                Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (lin == 1); e.setParams (p); e.reset();
+                const size_t n = (size_t) (fs * 4.0);
+                std::mt19937 rng (5);
+                std::normal_distribution<float> nd (0.0f, 0.1f);
+                std::vector<float> x (n);
+                float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+                for (auto& v : x)
+                {
+                    const float w = nd (rng);
+                    b0 = 0.99765f * b0 + w * 0.0990460f;  b1 = 0.96300f * b1 + w * 0.2965164f;  b2 = 0.57000f * b2 + w * 1.0526913f;
+                    v = b0 + b1 + b2 + w * 0.1848f;
+                }
+                auto y = x;
+                runMono (e, y, 256);
+                const size_t lat = (size_t) e.getLatencySamples();
+                const auto region = makeRegion (BandType::Bell, f0, 1.0, fs);
+                SvfState sx, sy;
+                double ex = 0.0, ey = 0.0;
+                for (size_t i = 0; i + lat < n; ++i)
+                {
+                    const double rx = svfTick (region, sx, x[i]), ry = svfTick (region, sy, y[i + lat]);
+                    if (i > (size_t) (1.5 * fs)) { ex += rx * rx; ey += ry * ry; }
+                }
+                worst = std::min (worst, 10.0 * std::log10 (ey / ex));
+            }
+        std::printf ("    잡음만 (분홍 잡음, 자동 문턱, 300 Hz ~ 5 kHz, ZL · HQ): 밴드 안 변화 최대 %+.2f dB\n", worst);
+        CHECK (worst > -0.3, "spectral pumps plain noise (%.2f dB)", worst);
+    }
+
+    // 6) 자동 문턱이 공진을 잡음: 분홍 잡음에 1/6옥타브 폭 +14 dB 공진 (1 / 3 / 6 kHz) -> 그 부분이 내려감 (ZL · HQ)
+    {
+        double least = -100.0;
+        double show[2][3] = {};
+        for (int lin = 0; lin < 2; ++lin)
+            for (int fi = 0; fi < 3; ++fi)
+            {
+                const double f0 = fi == 0 ? 1000.0 : fi == 1 ? 3000.0 : 6000.0;
+                const double q = std::sqrt (std::exp2 (1.0 / 6.0)) / (std::exp2 (1.0 / 6.0) - 1.0);
+                const auto res = makeBell (f0, q, 14.0, fs);
+                Params p; p.xfAll = false; p.bands[0] = specBand (f0, 1.0, true);
+                Engine e; e.prepare (fs, 1, 512); e.setSpectralLinearPhase (lin == 1); e.setParams (p); e.reset();
+                std::mt19937 rng (7);
+                std::normal_distribution<float> nd (0.0f, 0.1f);
+                const size_t n = (size_t) (fs * 3.0);
+                std::vector<float> x (n);
+                float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+                SvfState rs;
+                for (auto& v : x)
+                {
+                    const float w = nd (rng);
+                    b0 = 0.99765f * b0 + w * 0.0990460f;  b1 = 0.96300f * b1 + w * 0.2965164f;  b2 = 0.57000f * b2 + w * 1.0526913f;
+                    v = (float) svfTick (res, rs, b0 + b1 + b2 + w * 0.1848f);
+                }
+                auto y = x;
+                runMono (e, y, 256);
+                const size_t lat = (size_t) e.getLatencySamples();
+                SvfCoeffs bp;
+                bp.g = std::tan (kPi * f0 / fs);  bp.k = 1.0 / q;  bp.m0 = 0.0;  bp.m1 = bp.k;  bp.m2 = 0.0;
+                bp = finishSvf (bp);
+                SvfState sx, sy;
+                double ex = 0.0, ey = 0.0;
+                for (size_t i = 0; i + lat < n; ++i)
+                {
+                    const double rx = svfTick (bp, sx, x[i]), ry = svfTick (bp, sy, y[i + lat]);
+                    if (i > (size_t) fs) { ex += rx * rx; ey += ry * ry; }
+                }
+                const double d = 10.0 * std::log10 (ey / ex);
+                show[lin][fi] = d;
+                least = std::max (least, d);
+            }
+        std::printf ("    분홍 잡음 위 1/6옥타브 +14 dB 공진 (자동 문턱, RANGE -12): ZL %+.1f / %+.1f / %+.1f dB, HQ %+.1f / %+.1f / %+.1f dB (1 / 3 / 6 kHz)"
+                     " (v0.8.1: ZL -0.9 / -2.0 / -2.5, HQ -1.8 / -2.3 / -2.8)\n",
+                     show[0][0], show[0][1], show[0][2], show[1][0], show[1][1], show[1][2]);
+        CHECK (least < -3.0, "auto spectral threshold misses a resonance in noise (%.1f dB)", least);
+    }
+}
+
 int main (int argc, char** argv)
 {
    #ifdef _WIN32
@@ -2298,6 +2614,7 @@ int main (int argc, char** argv)
     testDynamicEq();
     testSpectral();
     testDynamicAccuracy();
+    testLimitsV082();
 
     std::printf ("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
